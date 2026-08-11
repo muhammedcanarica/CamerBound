@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from dataclasses import dataclass
+
+import cv2
+from PySide6.QtCore import QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QImage, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -15,8 +19,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.auth import Role, SessionUser
-from app.camera import Camera, CameraService, Direction
+from app.auth import Role, SessionUser, ValidationError
+from app.camera import Camera, CameraService, CameraStatus, Direction
 from app.plate_service import PlateRecord, PlateService
 from ui.admin_widget import CameraSettingsWidget, UsersAdminWidget
 from ui.records_widget import (
@@ -27,6 +31,14 @@ from ui.records_widget import (
 )
 
 
+@dataclass(slots=True)
+class CameraCardWidgets:
+    preview: QLabel
+    status: QLabel
+    details: QLabel
+    last_plate: QLabel
+
+
 class DashboardHome(QWidget):
     def __init__(
         self, plate_service: PlateService, camera_service: CameraService, user: SessionUser
@@ -35,8 +47,13 @@ class DashboardHome(QWidget):
         self.plate_service = plate_service
         self.camera_service = camera_service
         self.user = user
-        self.camera_details: dict[Direction, tuple[QLabel, QLabel]] = {}
+        self.camera_cards: dict[Direction, CameraCardWidgets] = {}
+        self.camera_directions: dict[int, Direction] = {}
+        self._latest_images: dict[Direction, QImage] = {}
         self._build_ui()
+        self.camera_service.frame_ready.connect(self._show_frame)
+        self.camera_service.status_changed.connect(self._show_status)
+        QTimer.singleShot(0, self._start_enabled_cameras)
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -88,7 +105,12 @@ class DashboardHome(QWidget):
         card_layout.addWidget(status)
         card_layout.addWidget(details)
         card_layout.addWidget(last_plate)
-        self.camera_details[direction] = (details, last_plate)
+        self.camera_cards[direction] = CameraCardWidgets(
+            preview=preview,
+            status=status,
+            details=details,
+            last_plate=last_plate,
+        )
         return card
 
     def refresh(self) -> None:
@@ -99,14 +121,133 @@ class DashboardHome(QWidget):
             QMessageBox.warning(self, "Dashboard yenilenemedi", str(exc))
             return
 
-        for direction, (details_label, plate_label) in self.camera_details.items():
+        self.camera_directions = {camera.id: camera.direction for camera in cameras}
+        for direction, card in self.camera_cards.items():
             camera = next((item for item in cameras if item.direction is direction), None)
             latest = next((item for item in records if item.direction is direction), None)
-            details_label.setText(self._camera_description(camera))
-            plate_label.setText(
+            card.details.setText(self._camera_description(camera))
+            card.last_plate.setText(
                 f"Son okunan plaka: {latest.plate}" if latest else "Son okunan plaka: -"
             )
+            if camera is None:
+                self._set_card_status(direction, CameraStatus.ERROR, "Kamera kaydı bulunamadı")
+            elif not camera.enabled:
+                self._set_card_status(direction, CameraStatus.STOPPED, "Kamera pasif")
+            elif not camera.stream_url:
+                self._set_card_status(direction, CameraStatus.ERROR, "Kamera URL'si tanımlı değil")
+            else:
+                self._set_card_status(
+                    direction,
+                    self.camera_service.get_status(camera.id),
+                )
         self._populate_recent(records)
+
+    @Slot()
+    def _start_enabled_cameras(self) -> None:
+        try:
+            cameras = self.camera_service.list_cameras()
+        except ValueError:
+            return
+
+        self.camera_directions = {camera.id: camera.direction for camera in cameras}
+        for camera in cameras:
+            if not camera.enabled or not camera.stream_url:
+                continue
+            try:
+                self.camera_service.start_camera(camera.id)
+            except ValidationError as exc:
+                self._set_card_status(camera.direction, CameraStatus.ERROR, str(exc))
+
+    @Slot(int, object)
+    def _show_frame(self, camera_id: int, frame: object) -> None:
+        direction = self.camera_directions.get(camera_id)
+        if direction is None or direction not in self.camera_cards:
+            return
+
+        try:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            height, width, channels = rgb_frame.shape
+            if channels != 3:
+                return
+            image = QImage(
+                rgb_frame.data,
+                width,
+                height,
+                channels * width,
+                QImage.Format.Format_RGB888,
+            ).copy()
+        except (AttributeError, TypeError, ValueError, cv2.error):
+            return
+
+        self._latest_images[direction] = image
+        self._display_image(direction, image)
+
+    @Slot(int, object, str)
+    def _show_status(
+        self,
+        camera_id: int,
+        status: CameraStatus,
+        message: str,
+    ) -> None:
+        direction = self.camera_directions.get(camera_id)
+        if direction is None:
+            return
+        self._set_card_status(direction, CameraStatus(status), tooltip=message)
+
+    def _set_card_status(
+        self,
+        direction: Direction,
+        status: CameraStatus,
+        text: str | None = None,
+        tooltip: str = "",
+    ) -> None:
+        card = self.camera_cards[direction]
+        status_texts = {
+            CameraStatus.STOPPED: "● Bağlı değil",
+            CameraStatus.CONNECTING: "Bağlanıyor...",
+            CameraStatus.CONNECTED: "● Bağlı",
+            CameraStatus.RECONNECTING: "Yeniden bağlanılıyor...",
+            CameraStatus.ERROR: "● Bağlantı kesildi",
+        }
+        status_colors = {
+            CameraStatus.STOPPED: "#b42318",
+            CameraStatus.CONNECTING: "#b76e00",
+            CameraStatus.CONNECTED: "#16803a",
+            CameraStatus.RECONNECTING: "#b76e00",
+            CameraStatus.ERROR: "#b42318",
+        }
+        card.status.setText(text or status_texts[status])
+        card.status.setToolTip(tooltip or text or "")
+        card.status.setStyleSheet(f"color:{status_colors[status]}; font-weight:600;")
+
+        if status is CameraStatus.STOPPED:
+            self._clear_preview(direction, text or "Kamera görüntüsü bekleniyor")
+        elif status is CameraStatus.ERROR and direction not in self._latest_images:
+            self._clear_preview(direction, text or "Kamera bağlantısı kurulamadı")
+
+    def _display_image(self, direction: Direction, image: QImage) -> None:
+        preview = self.camera_cards[direction].preview
+        target_size = preview.contentsRect().size()
+        if target_size.width() <= 0 or target_size.height() <= 0:
+            return
+        pixmap = QPixmap.fromImage(image).scaled(
+            target_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        preview.setText("")
+        preview.setPixmap(pixmap)
+
+    def _clear_preview(self, direction: Direction, message: str) -> None:
+        self._latest_images.pop(direction, None)
+        preview = self.camera_cards[direction].preview
+        preview.clear()
+        preview.setText(message)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        for direction, image in self._latest_images.items():
+            self._display_image(direction, image)
 
     @staticmethod
     def _camera_description(camera: Camera | None) -> str:
@@ -147,6 +288,7 @@ class DashboardWindow(QMainWindow):
         self.camera_service = camera_service
         self.pages: list[QWidget] = []
         self.nav_buttons: list[QPushButton] = []
+        self._camera_shutdown_started = False
         self.setWindowTitle("Plaka Takip Sistemi")
         self.setMinimumSize(1080, 700)
         self.resize(1280, 820)
@@ -186,10 +328,15 @@ class DashboardWindow(QMainWindow):
         sidebar_layout.addSpacing(12)
 
         self.stack = QStackedWidget()
+        self.dashboard_home = DashboardHome(
+            self.plate_service,
+            self.camera_service,
+            self.user,
+        )
         self._add_page(
             sidebar_layout,
             "Dashboard",
-            DashboardHome(self.plate_service, self.camera_service, self.user),
+            self.dashboard_home,
         )
         self._add_page(
             sidebar_layout,
@@ -239,3 +386,9 @@ class DashboardWindow(QMainWindow):
         refresh = getattr(page, "refresh", None)
         if callable(refresh):
             refresh()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if not self._camera_shutdown_started:
+            self._camera_shutdown_started = True
+            self.camera_service.stop_all()
+        super().closeEvent(event)
