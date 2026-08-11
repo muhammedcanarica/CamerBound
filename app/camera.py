@@ -96,9 +96,16 @@ class CameraService(QObject):
         camera_id: int,
         name: str,
         stream_url: str,
-        direction: Direction,
+        direction: Direction | str,
         enabled: bool,
     ) -> Camera:
+        try:
+            normalized_direction = (
+                direction if isinstance(direction, Direction) else Direction(direction)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("Kamera yönü ENTRY veya EXIT olmalıdır.") from exc
+
         AuthService.require_admin(actor)
         normalized_name = name.strip()
         if not normalized_name:
@@ -111,7 +118,13 @@ class CameraService(QObject):
                 SET name = ?, stream_url = ?, direction = ?, enabled = ?
                 WHERE id = ?
                 """,
-                (normalized_name, stream_url.strip(), direction.value, int(enabled), camera_id),
+                (
+                    normalized_name,
+                    stream_url.strip(),
+                    normalized_direction.value,
+                    int(enabled),
+                    camera_id,
+                ),
             )
             if cursor.rowcount == 0:
                 raise ValidationError("Kamera bulunamadı.")

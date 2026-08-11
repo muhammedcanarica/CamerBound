@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from app.auth import AuthService, ValidationError
-from app.camera import CameraService, CameraStatus
+from app.camera import CameraService, CameraStatus, Direction
 from app.database import Database
 
 
@@ -137,6 +137,47 @@ class CameraServiceLifecycleTests(unittest.TestCase):
         self.assertIsNot(snapshot, frame)
         snapshot[0, 0, 0] = 255
         self.assertEqual(self.camera_service.get_latest_frame(camera_id)[0, 0, 0], 0)
+
+    def test_update_camera_accepts_direction_enum_and_string_values(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        cases = (
+            (Direction.ENTRY, Direction.ENTRY),
+            ("ENTRY", Direction.ENTRY),
+            (Direction.EXIT, Direction.EXIT),
+            ("EXIT", Direction.EXIT),
+        )
+
+        for value, expected in cases:
+            with self.subTest(value=value):
+                updated = self.camera_service.update_camera(
+                    self.admin,
+                    camera.id,
+                    camera.name,
+                    camera.stream_url,
+                    value,
+                    camera.enabled,
+                )
+                with self.database.connection() as connection:
+                    stored_direction = connection.execute(
+                        "SELECT direction FROM cameras WHERE id = ?",
+                        (camera.id,),
+                    ).fetchone()["direction"]
+
+                self.assertIs(updated.direction, expected)
+                self.assertEqual(stored_direction, expected.value)
+
+    def test_update_camera_rejects_invalid_direction(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+
+        with self.assertRaisesRegex(ValidationError, "ENTRY veya EXIT"):
+            self.camera_service.update_camera(
+                self.admin,
+                camera.id,
+                camera.name,
+                camera.stream_url,
+                "INVALID",
+                camera.enabled,
+            )
 
     def _configure_camera(self, index: int, stream_url: str) -> int:
         camera = self.camera_service.list_cameras()[index]

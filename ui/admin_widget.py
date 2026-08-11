@@ -183,15 +183,16 @@ class CameraSettingsWidget(QWidget):
     def _save_camera(self, camera_id: int) -> None:
         name, url, direction, enabled = self._editors[camera_id]
         try:
+            normalized_direction = Direction(direction.currentData())
             self.camera_service.update_camera(
                 self.user,
                 camera_id,
                 name.text(),
                 url.text(),
-                direction.currentData(),
+                normalized_direction,
                 enabled.isChecked(),
             )
-        except (ValidationError, PermissionError) as exc:
+        except (TypeError, ValueError, ValidationError, PermissionError) as exc:
             QMessageBox.warning(self, "Kamera kaydedilemedi", str(exc))
             return
         QMessageBox.information(
