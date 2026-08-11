@@ -7,6 +7,13 @@ QWidget {
 QMainWindow, QWidget#appRoot, QWidget#loginRoot {
     background: #f4f7fb;
 }
+QDialog, QMessageBox, QInputDialog {
+    background: #f4f7fb;
+}
+QMessageBox QLabel, QInputDialog QLabel {
+    background: transparent;
+    color: #172033;
+}
 QWidget#cameraSettingsViewport, QWidget#cameraSettingsContent {
     background: #f4f7fb;
 }

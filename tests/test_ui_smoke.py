@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QGroupBox,
+    QInputDialog,
+    QLabel,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -285,6 +287,38 @@ class LoginFlowSmokeTest(unittest.TestCase):
             popup_palette.color(popup_palette.ColorRole.HighlightedText).name(),
             "#ffffff",
         )
+
+    def test_confirmation_dialogs_have_readable_light_theme(self) -> None:
+        self.application.setStyleSheet(APP_STYLESHEET)
+        dialogs = (
+            QMessageBox(
+                QMessageBox.Icon.Warning,
+                "Tüm kayıtları temizle",
+                "Tüm plaka hareket kayıtları kalıcı olarak silinecek.",
+            ),
+            QInputDialog(),
+        )
+        dialogs[1].setLabelText("Devam etmek için TEMIZLE yazın:")
+
+        for dialog in dialogs:
+            with self.subTest(dialog=type(dialog).__name__):
+                dialog.ensurePolished()
+                dialog.show()
+                self.application.processEvents()
+                label = next(
+                    child
+                    for child in dialog.findChildren(QLabel)
+                    if child.text()
+                )
+                self.assertEqual(
+                    dialog.palette().color(dialog.palette().ColorRole.Window).name(),
+                    "#f4f7fb",
+                )
+                self.assertEqual(
+                    label.palette().color(label.palette().ColorRole.WindowText).name(),
+                    "#172033",
+                )
+                dialog.close()
 
 
 if __name__ == "__main__":
