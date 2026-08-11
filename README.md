@@ -83,48 +83,22 @@ CameraService frame
 
 OCR inference ayrı bir `QThread` üzerinde çalışır. Kamera başına yalnızca en güncel frame tutulur; OCR yavaşladığında biriken, sınırsız bir frame kuyruğu oluşmaz. Model bulunmazsa login, Dashboard ve kamera preview çalışmaya devam eder; kartta `OCR: Kullanılamıyor` gösterilir.
 
-### İlk OCR Kurulumu
+### OCR model hazırlama altyapısı
 
-Uygulama çalışma anında model indirmez ve PaddleX model-source ağ kontrolünü kapatır. ONNX Runtime ile uyumlu PaddleOCR detection ve recognition model dizinleri şu konumlarda bulunmalıdır:
+Repository model binary dosyalarını içermez. Development hazırlık scripti [PaddleOCR resmî model listesindeki](https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/OCR.html) `PP-OCRv5_mobile_det` ve `en_PP-OCRv5_mobile_rec` modellerini Paddle'ın resmî model artefact sunucusundan indirir, `build/ocr-model-downloads/` altında cache'ler ve ONNX'e dönüştürür. Bu adım internet bağlantısı gerektirir.
 
-```text
-models/ocr/detection/
-models/ocr/recognition/
-```
+Normal uygulama çalışması hiçbir zaman model indirmez ve internet gerektirmez. Model yoksa Dashboard'daki `OCR: Kullanılamıyor` davranışı korunur.
 
-Her iki klasörde de dosya adları tam olarak `inference.onnx` ve `inference.yml` olmalıdır. Repository bu büyük binary model dosyalarını içermez; yeni clone sonrasında OCR'ın `Kullanılamıyor` görünmesi bu nedenle beklenen davranıştır.
-
-Elinizde hazır ONNX PaddleOCR model klasörleri varsa kopyalayıp doğrulayın:
-
-Önceden indirilmiş/çıkarılmış model dizinlerini hazırlamak için:
+Hazırlık seçenekleri:
 
 ```powershell
-python scripts/setup_ocr_models.py `
-  --detection-source "C:\models\paddle-det" `
-  --recognition-source "C:\models\paddle-rec"
+python scripts/prepare_default_ocr_models.py --dry-run
+python scripts/prepare_default_ocr_models.py --force
 ```
 
-```powershell
-python scripts/verify_ocr_models.py
-```
+`--dry-run` dosya değiştirmeden yolları gösterir. `--force` indirme cache'ini ve üretilmiş model çıktılarını baştan hazırlar. Resmî artefactlar için dokümante edilmiş checksum yayımlanmadığından sahte checksum kullanılmaz; indirme uzunluğu, güvenli archive extraction, Paddle model yapısı ve ONNX Runtime yüklemesi doğrulanır.
 
-Elinizde `inference.json`/`inference.pdmodel`, `inference.pdiparams` ve `inference.yml` içeren Paddle inference modelleri varsa dönüşüm araçlarını uygulama runtime'ından ayrı kurun:
-
-```powershell
-python -m pip install -r requirements-model-tools.txt
-python -m paddlex --install paddle2onnx -y
-python scripts/convert_paddle_models.py `
-  --detection-source "C:\models\paddle-det" `
-  --recognition-source "C:\models\paddle-rec"
-python scripts/setup_ocr_models.py `
-  --detection-source "build\ocr-onnx\detection" `
-  --recognition-source "build\ocr-onnx\recognition"
-python scripts/verify_ocr_models.py
-```
-
-`verify_ocr_models.py`; sabitlenmiş paket sürümlerini, iki modelin gerçek dosyalarını, `CPUExecutionProvider` ile ONNX session açılmasını ve son olarak PaddleOCR provider başlangıcını kontrol eder. Başarılıysa `0`, bir sorun varsa `1` ile çıkar.
-
-Model binary dosyaları `.gitignore` kapsamındadır. Production paketine `models/ocr/` klasörü ayrıca dahil edilmelidir.
+İleri seviye/manual dönüşüm için mevcut `convert_paddle_models.py` ve `setup_ocr_models.py` scriptleri kullanılabilir. Final klasörlerde `inference.onnx` ve `inference.yml` bulunur; `models/ocr/model-info.json` kullanılan resmî model adlarını kaydeder. Binary dosyalar `.gitignore` kapsamındadır.
 
 ### ROI ve tanıma ayarları
 
@@ -163,26 +137,29 @@ python scripts/test_pipeline.py "C:\test-data\plates" --direction ENTRY --sample
 
 OCR model dosyaları repository içinde bulunmaz; geliştirme ortamında ayrıca hazırlanmalıdır.
 
-1. `models/ocr/detection/` ve `models/ocr/recognition/` klasörlerine ilgili `inference.onnx` ve `inference.yml` dosyalarını yerleştirin veya yukarıdaki `setup_ocr_models.py` akışını kullanın.
-2. Hazırlığı doğrulayın:
+Önerilen development akışı:
 
-   ```powershell
-   python scripts/verify_ocr_models.py
-   ```
+```powershell
+python -m pip install -r requirements-model-tools.txt
+python scripts/prepare_default_ocr_models.py
+python scripts/verify_ocr_models.py
+```
 
-3. Bir plaka görseliyle lokal OCR'ı deneyin:
+Hazırlık tamamlandıktan sonra:
+
+1. Bir plaka görseliyle lokal OCR'ı deneyin:
 
    ```powershell
    python scripts/test_plate_ocr.py "C:\test-data\plate.jpg" --direction ENTRY
    ```
 
-4. Uygulamayı başlatın:
+2. Uygulamayı başlatın:
 
    ```powershell
    python main.py
    ```
 
-5. Dashboard kamera kartlarında `OCR: Aktif` durumunu kontrol edin.
+3. Dashboard kamera kartlarında `OCR: Aktif` durumunu kontrol edin.
 
 `verify_ocr_models.py` model yoksa exit code `1` ve `OCR status: NOT READY`; modeller ve runtime hazırsa exit code `0` ve `OCR status: READY` döndürür. Production runtime internetten model indirmez.
 
@@ -231,6 +208,8 @@ CamerBound/
 ├── models/ocr/                # Lokal detection/recognition modelleri (binary'ler ignore edilir)
 ├── scripts/
 │   ├── setup_ocr_models.py
+│   ├── prepare_default_ocr_models.py
+│   ├── verify_ocr_models.py
 │   └── test_plate_ocr.py
 └── tests/
     ├── test_camera_service.py

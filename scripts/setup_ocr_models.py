@@ -16,6 +16,22 @@ from app.ocr_models import OcrModelError, validate_model_directory, validate_ocr
 MODEL_ROOT = PROJECT_ROOT / "models" / "ocr"
 
 
+def install_models(
+    sources: dict[str, tuple[Path, str]],
+    model_root: Path = MODEL_ROOT,
+) -> None:
+    for source, label in sources.values():
+        validate_model_directory(source, label, load_onnx=True)
+
+    for name, (source, _label) in sources.items():
+        target = model_root / name
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / "inference.onnx", target / "inference.onnx")
+        shutil.copy2(source / "inference.yml", target / "inference.yml")
+
+    validate_ocr_models(model_root, load_onnx=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Hazır inference.onnx + inference.yml model klasörlerini uygulamaya kopyalar."
@@ -29,19 +45,14 @@ def main() -> int:
         "recognition": (args.recognition_source.resolve(), "Recognition"),
     }
     try:
-        for source, label in sources.values():
-            validate_model_directory(source, label, load_onnx=True)
+        install_models(sources)
     except OcrModelError as exc:
         parser.error(str(exc))
 
     for name, (source, _label) in sources.items():
         target = MODEL_ROOT / name
-        target.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source / "inference.onnx", target / "inference.onnx")
-        shutil.copy2(source / "inference.yml", target / "inference.yml")
         print(f"{name}: {source} -> {target}")
 
-    validate_ocr_models(MODEL_ROOT, load_onnx=True)
     print("OCR modelleri hazır ve ONNX Runtime ile yüklenebiliyor.")
     return 0
 

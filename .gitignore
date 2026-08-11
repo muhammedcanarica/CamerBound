@@ -12,6 +12,7 @@ build/
 dist/
 *.spec
 models/ocr/**
+!models/ocr/model-info.json
 !models/ocr/detection/
 !models/ocr/detection/.gitkeep
 !models/ocr/recognition/
