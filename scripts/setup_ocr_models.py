@@ -2,36 +2,47 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import sys
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.ocr_models import OcrModelError, validate_model_directory, validate_ocr_models
+
+
 MODEL_ROOT = PROJECT_ROOT / "models" / "ocr"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Önceden indirilmiş PaddleOCR model dizinlerini uygulamaya hazırlar."
+        description="Hazır inference.onnx + inference.yml model klasörlerini uygulamaya kopyalar."
     )
     parser.add_argument("--detection-source", type=Path, required=True)
     parser.add_argument("--recognition-source", type=Path, required=True)
     args = parser.parse_args()
 
     sources = {
-        "detection": args.detection_source.resolve(),
-        "recognition": args.recognition_source.resolve(),
+        "detection": (args.detection_source.resolve(), "Detection"),
+        "recognition": (args.recognition_source.resolve(), "Recognition"),
     }
-    for name, source in sources.items():
-        if not source.is_dir() or not any(item.is_file() for item in source.rglob("*")):
-            parser.error(f"{name} model dizini bulunamadı veya boş: {source}")
+    try:
+        for source, label in sources.values():
+            validate_model_directory(source, label, load_onnx=True)
+    except OcrModelError as exc:
+        parser.error(str(exc))
 
-    for name, source in sources.items():
+    for name, (source, _label) in sources.items():
         target = MODEL_ROOT / name
         target.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source, target, dirs_exist_ok=True)
+        shutil.copy2(source / "inference.onnx", target / "inference.onnx")
+        shutil.copy2(source / "inference.yml", target / "inference.yml")
         print(f"{name}: {source} -> {target}")
 
-    print("OCR modelleri hazır. Bu klasörleri production paketine dahil edin.")
+    validate_ocr_models(MODEL_ROOT, load_onnx=True)
+    print("OCR modelleri hazır ve ONNX Runtime ile yüklenebiliyor.")
     return 0
 
 

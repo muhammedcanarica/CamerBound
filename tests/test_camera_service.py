@@ -5,6 +5,8 @@ import threading
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from app.auth import AuthService, ValidationError
 from app.camera import CameraService, CameraStatus
 from app.database import Database
@@ -121,6 +123,20 @@ class CameraServiceLifecycleTests(unittest.TestCase):
         self.assertEqual(self.camera_service._runtimes, {})
         for camera_id in camera_ids:
             self.assertEqual(self.camera_service.get_status(camera_id), CameraStatus.STOPPED)
+
+    def test_latest_delivered_frame_is_a_copy(self) -> None:
+        camera_id = self._configure_camera(0, "rtsp://example.invalid/entry")
+        self.camera_service.start_camera(camera_id)
+        self.assertTrue(self.capture_factory.created.wait(1.0))
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        with self.camera_service._lock:
+            self.camera_service._latest_frames[camera_id] = frame
+        self.camera_service._flush_latest_frame(camera_id)
+
+        snapshot = self.camera_service.get_latest_frame(camera_id)
+        self.assertIsNot(snapshot, frame)
+        snapshot[0, 0, 0] = 255
+        self.assertEqual(self.camera_service.get_latest_frame(camera_id)[0, 0, 0], 0)
 
     def _configure_camera(self, index: int, stream_url: str) -> int:
         camera = self.camera_service.list_cameras()[index]

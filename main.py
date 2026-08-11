@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import logging
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -8,6 +9,7 @@ from app.auth import AuthService, SessionUser
 from app.camera import CameraService
 from app.config import load_config
 from app.database import Database
+from app.logging_config import configure_logging
 from app.plate_recognition import PlateRecognitionService
 from app.plate_service import PlateService
 from ui.dashboard_window import DashboardWindow
@@ -74,11 +76,14 @@ def build_services() -> tuple[
         camera_service,
         plate_service,
         config.plate_recognition,
+        settings_path=config.settings_path,
     )
     return auth_service, plate_service, camera_service, recognition_service
 
 
 def main() -> int:
+    log_path = configure_logging()
+    logging.getLogger(__name__).info("Application startup log_path=%s", log_path)
     application = QApplication(sys.argv)
     application.setApplicationName("Plaka Takip Sistemi")
     application.setStyle("Fusion")
@@ -97,6 +102,9 @@ def main() -> int:
     controller = ApplicationController(*services)
     application.aboutToQuit.connect(services[2].stop_all)
     application.aboutToQuit.connect(services[3].stop)
+    application.aboutToQuit.connect(
+        lambda: logging.getLogger(__name__).info("Application shutdown")
+    )
     controller.show_login()
     return application.exec()
 

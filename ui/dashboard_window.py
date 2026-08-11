@@ -444,7 +444,11 @@ class DashboardWindow(QMainWindow):
             self._add_page(
                 sidebar_layout,
                 "Ayarlar",
-                CameraSettingsWidget(self.camera_service, self.user),
+                CameraSettingsWidget(
+                    self.camera_service,
+                    self.user,
+                    self.recognition_service,
+                ),
             )
 
         sidebar_layout.addStretch()

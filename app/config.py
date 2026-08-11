@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -88,6 +90,59 @@ def load_config(settings_path: Path | None = None) -> AppConfig:
     )
 
 
+def update_plate_roi(
+    settings_path: Path,
+    direction: object,
+    roi: NormalizedRoi,
+) -> PlateRecognitionConfig:
+    """Atomically update one ROI while preserving unknown settings fields."""
+    if not _is_valid_roi(roi):
+        raise ConfigError("ROI 0-1 aralığında ve frame sınırları içinde olmalıdır.")
+    direction_value = getattr(direction, "value", str(direction))
+    if direction_value not in {"ENTRY", "EXIT"}:
+        raise ConfigError(f"Geçersiz kamera yönü: {direction_value}")
+
+    settings_path = settings_path.resolve()
+    try:
+        raw = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"Ayar dosyası güncellenemedi: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError("Ayar dosyasının kökü JSON nesnesi olmalıdır.")
+
+    plate_detection = raw.setdefault("plate_detection", {})
+    if not isinstance(plate_detection, dict):
+        plate_detection = {}
+        raw["plate_detection"] = plate_detection
+    roi_settings = plate_detection.setdefault("roi", {})
+    if not isinstance(roi_settings, dict):
+        roi_settings = {}
+        plate_detection["roi"] = roi_settings
+    roi_settings[direction_value] = {
+        "x": roi.x,
+        "y": roi.y,
+        "width": roi.width,
+        "height": roi.height,
+    }
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=settings_path.parent, delete=False, suffix=".tmp"
+        ) as handle:
+            json.dump(raw, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = Path(handle.name)
+        os.replace(temporary_path, settings_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+    return load_config(settings_path).plate_recognition
+
+
 def _load_plate_recognition(
     raw: dict[str, Any],
     root: Path,
@@ -168,14 +223,19 @@ def _parse_roi(
         warnings.append(f"{direction} ROI eksik/geçersiz; varsayılan ROI kullanıldı.")
         return DEFAULT_ROI
     x, y, width, height = numbers
-    if (
-        x < 0
-        or y < 0
-        or width <= 0
-        or height <= 0
-        or x + width > 1
-        or y + height > 1
-    ):
+    roi = NormalizedRoi(x=x, y=y, width=width, height=height)
+    if not _is_valid_roi(roi):
         warnings.append(f"{direction} ROI frame dışında; varsayılan ROI kullanıldı.")
         return DEFAULT_ROI
-    return NormalizedRoi(x=x, y=y, width=width, height=height)
+    return roi
+
+
+def _is_valid_roi(roi: NormalizedRoi) -> bool:
+    return (
+        roi.x >= 0
+        and roi.y >= 0
+        and roi.width > 0
+        and roi.height > 0
+        and roi.x + roi.width <= 1
+        and roi.y + roi.height <= 1
+    )

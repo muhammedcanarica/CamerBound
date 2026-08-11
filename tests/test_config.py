@@ -5,7 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.config import DEFAULT_ROI, load_config
+from app.camera import Direction
+from app.config import DEFAULT_ROI, NormalizedRoi, load_config, update_plate_roi
 
 
 class PlateRecognitionConfigTests(unittest.TestCase):
@@ -32,6 +33,30 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(config.entry_roi, DEFAULT_ROI)
         self.assertEqual(config.exit_roi.x, 0.1)
         self.assertTrue(config.warnings)
+
+    def test_roi_update_is_atomic_preserves_unknown_fields_and_reloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            settings_path = Path(temp_directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "database_path": "test.db",
+                        "unknown_root": {"keep": True},
+                        "plate_detection": {"custom": "keep-me", "roi": {}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            expected = NormalizedRoi(0.2, 0.25, 0.6, 0.5)
+
+            config = update_plate_roi(settings_path, Direction.ENTRY, expected)
+            raw = json.loads(settings_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(config.entry_roi, expected)
+            self.assertEqual(load_config(settings_path).plate_recognition.entry_roi, expected)
+            self.assertEqual(raw["unknown_root"], {"keep": True})
+            self.assertEqual(raw["plate_detection"]["custom"], "keep-me")
+            self.assertEqual(list(Path(temp_directory).glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from threading import RLock
+import logging
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 
@@ -16,6 +17,9 @@ from app.camera_worker import (
 )
 from app.config import application_root
 from app.database import Database
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class Direction(StrEnum):
@@ -61,6 +65,7 @@ class CameraService(QObject):
         self._statuses: dict[int, CameraStatus] = {}
         self._runtimes: dict[int, _CameraRuntime] = {}
         self._latest_frames: dict[int, object] = {}
+        self._last_delivered_frames: dict[int, object] = {}
         self._frame_notifications_pending: set[int] = set()
         self._lock = RLock()
         self._frame_available.connect(
@@ -211,6 +216,14 @@ class CameraService(QObject):
         with self._lock:
             return self._statuses.get(camera_id, CameraStatus.STOPPED)
 
+    def get_latest_frame(self, camera_id: int) -> object | None:
+        """Return a safe snapshot of the latest delivered camera frame."""
+        self.get_camera(camera_id)
+        with self._lock:
+            frame = self._last_delivered_frames.get(camera_id)
+            copier = getattr(frame, "copy", None)
+            return copier() if callable(copier) else frame
+
     @Slot(int, object)
     def _on_frame_ready(self, camera_id: int, frame: object) -> None:
         with self._lock:
@@ -231,6 +244,11 @@ class CameraService(QObject):
                 return
             frame = self._latest_frames.pop(camera_id, None)
         if frame is not None:
+            with self._lock:
+                copier = getattr(frame, "copy", None)
+                self._last_delivered_frames[camera_id] = (
+                    copier() if callable(copier) else frame
+                )
             self.frame_ready.emit(camera_id, frame)
 
     @Slot(int, object, str)
@@ -273,6 +291,8 @@ class CameraService(QObject):
         with self._lock:
             self._statuses[camera_id] = status
         self.status_changed.emit(camera_id, status, message)
+        log = LOGGER.warning if status is CameraStatus.ERROR else LOGGER.info
+        log("Camera status camera_id=%s status=%s message=%s", camera_id, status, message)
 
     def _discard_frame(self, camera_id: int) -> None:
         self._latest_frames.pop(camera_id, None)

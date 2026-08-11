@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+from PySide6.QtCore import Qt
 
 from app.auth import AuthService
 from app.camera import CameraService, Direction
@@ -23,7 +26,10 @@ from app.plate_recognition import (
     correct_plate_candidate,
     normalize_plate_text,
     select_best_candidate,
+    RecognitionStatus,
 )
+from app.ocr_models import OcrModelInvalid, OcrModelNotFound as ModelNotFound, validate_model_directory
+from app.ocr_debug import save_debug_images
 from app.plate_service import PlateService
 
 
@@ -34,6 +40,18 @@ class FakeOcrProvider:
 
     def recognize(self, _images: object) -> list[OcrSegment]:
         return [OcrSegment(self.text, self.confidence, (0.0, 0.0, 100.0, 30.0))]
+
+
+class RecoveringOcrProvider(FakeOcrProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def recognize(self, images: object) -> list[OcrSegment]:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("temporary")
+        return super().recognize(images)
 
 
 def recognition_config(model_root: Path, confirmations: int = 2) -> PlateRecognitionConfig:
@@ -140,8 +158,64 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(worker.pending_frame_count, 2)
 
     def test_missing_model_is_reported_without_importing_paddle(self) -> None:
-        with self.assertRaisesRegex(OcrModelNotFound, "OCR modeli bulunamadı"):
+        with self.assertRaisesRegex(OcrModelNotFound, "Detection model"):
             PaddleOcrProvider(Path(self.temp_directory.name) / "missing-models")
+
+    def test_empty_and_invalid_model_directories_are_rejected(self) -> None:
+        empty = Path(self.temp_directory.name) / "empty"
+        empty.mkdir()
+        with self.assertRaises(ModelNotFound):
+            validate_model_directory(empty, "Detection")
+
+        invalid = Path(self.temp_directory.name) / "invalid"
+        invalid.mkdir()
+        (invalid / "inference.onnx").write_bytes(b"not-onnx")
+        (invalid / "inference.yml").write_text("[]", encoding="utf-8")
+        with self.assertRaises(OcrModelInvalid):
+            validate_model_directory(invalid, "Detection")
+
+    def test_worker_returns_active_after_transient_inference_error(self) -> None:
+        config = recognition_config(Path(self.temp_directory.name), confirmations=1)
+        config = PlateRecognitionConfig(
+            recognition_interval_ms=100,
+            min_confidence=config.min_confidence,
+            confirmations_required=config.confirmations_required,
+            confirmation_window_seconds=config.confirmation_window_seconds,
+            duplicate_cooldown_seconds=config.duplicate_cooldown_seconds,
+            entry_roi=config.entry_roi,
+            exit_roi=config.exit_roi,
+            model_root=config.model_root,
+        )
+        worker = PlateRecognitionWorker(
+            self.plate_service, config, provider_factory=RecoveringOcrProvider
+        )
+        statuses: list[RecognitionStatus] = []
+        worker.status_changed.connect(
+            lambda status, _message: statuses.append(status),
+            Qt.ConnectionType.DirectConnection,
+        )
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        worker.submit_frame(1, Direction.ENTRY, frame)
+        time.sleep(0.15)
+        worker.submit_frame(1, Direction.ENTRY, frame)
+        time.sleep(0.2)
+        worker.request_stop()
+        thread.join(1.0)
+
+        error_index = statuses.index(RecognitionStatus.ERROR)
+        self.assertIn(RecognitionStatus.ACTIVE, statuses[error_index + 1 :])
+
+    def test_debug_output_paths_are_created(self) -> None:
+        output = Path(self.temp_directory.name) / "debug"
+        image = np.zeros((30, 100, 3), dtype=np.uint8)
+        segments = [OcrSegment("34ABC123", 0.9, (1, 1, 80, 20))]
+
+        paths = save_debug_images(output, image, image, [image], segments)
+
+        self.assertGreaterEqual(len(paths), 4)
+        self.assertTrue(all(path.is_file() for path in paths))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from functools import partial
+import threading
+
+from PySide6.QtCore import Signal, Slot
 
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -21,6 +24,10 @@ from PySide6.QtWidgets import (
 
 from app.auth import AuthService, Role, SessionUser, UserExistsError, ValidationError
 from app.camera import Camera, CameraService, Direction
+from app.config import ConfigError, update_plate_roi
+from app.ocr_models import collect_model_diagnostics
+from app.plate_recognition import PlateRecognitionService
+from ui.roi_calibration_dialog import RoiCalibrationDialog
 from ui.records_widget import display_timestamp, prepare_table
 
 
@@ -96,13 +103,22 @@ class UsersAdminWidget(QWidget):
 
 
 class CameraSettingsWidget(QWidget):
-    def __init__(self, camera_service: CameraService, user: SessionUser) -> None:
+    diagnostics_ready = Signal(str)
+
+    def __init__(
+        self,
+        camera_service: CameraService,
+        user: SessionUser,
+        recognition_service: PlateRecognitionService | None = None,
+    ) -> None:
         super().__init__()
         self.camera_service = camera_service
         self.user = user
+        self.recognition_service = recognition_service
         self._editors: dict[int, tuple[QLineEdit, QLineEdit, QComboBox, QCheckBox]] = {}
         self._camera_layout: QVBoxLayout
         self._build_ui()
+        self.diagnostics_ready.connect(self._show_diagnostics)
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -117,6 +133,15 @@ class CameraSettingsWidget(QWidget):
         )
         self._camera_layout = QVBoxLayout()
         layout.addLayout(self._camera_layout)
+        diagnostics_group = QGroupBox("OCR Tanılama")
+        diagnostics_layout = QVBoxLayout(diagnostics_group)
+        self.diagnostics_label = QLabel("Model durumu kontrol edilmedi.")
+        self.diagnostics_label.setWordWrap(True)
+        diagnostics_button = QPushButton("Modelleri Kontrol Et")
+        diagnostics_button.clicked.connect(self._run_diagnostics)
+        diagnostics_layout.addWidget(self.diagnostics_label)
+        diagnostics_layout.addWidget(diagnostics_button)
+        layout.addWidget(diagnostics_group)
         layout.addStretch()
 
     def refresh(self) -> None:
@@ -143,11 +168,15 @@ class CameraSettingsWidget(QWidget):
         enabled_input.setChecked(camera.enabled)
         save_button = QPushButton("Kaydet")
         save_button.clicked.connect(partial(self._save_camera, camera.id))
+        roi_button = QPushButton("Plaka Alanını Kalibre Et")
+        roi_button.setEnabled(self.recognition_service is not None)
+        roi_button.clicked.connect(partial(self._calibrate_roi, camera.id))
         form.addRow("Ad", name_input)
         form.addRow("RTSP URL", url_input)
         form.addRow("Yön", direction_input)
         form.addRow("Durum", enabled_input)
         form.addRow("", save_button)
+        form.addRow("", roi_button)
         self._camera_layout.addWidget(group)
         self._editors[camera.id] = (name_input, url_input, direction_input, enabled_input)
 
@@ -171,3 +200,60 @@ class CameraSettingsWidget(QWidget):
             "Kamera ayarları kaydedildi. Değişikliğin canlı akışa uygulanması için "
             "Dashboard oturumunu yeniden açın.",
         )
+
+    def _calibrate_roi(self, camera_id: int) -> None:
+        if self.recognition_service is None:
+            return
+        frame = self.camera_service.get_latest_frame(camera_id)
+        if frame is None:
+            QMessageBox.information(
+                self,
+                "Görüntü yok",
+                "Kalibrasyon için kamerayı Dashboard'da başlatıp bir görüntü bekleyin.",
+            )
+            return
+        camera = self.camera_service.get_camera(camera_id)
+        dialog = RoiCalibrationDialog(
+            frame,
+            self.recognition_service.config.roi_for(camera.direction),
+            self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        try:
+            config = update_plate_roi(
+                self.recognition_service.settings_path,
+                camera.direction,
+                dialog.selected_roi(),
+            )
+            self.recognition_service.apply_config(config)
+        except ConfigError as exc:
+            QMessageBox.warning(self, "ROI kaydedilemedi", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "ROI kaydedildi",
+            "Yeni plaka alanı OCR'a uygulandı; kamera önizlemesi çalışmaya devam ediyor.",
+        )
+
+    def _run_diagnostics(self) -> None:
+        if self.recognition_service is None:
+            self.diagnostics_label.setText("OCR servisi bu ekrana bağlı değil.")
+            return
+        self.diagnostics_label.setText("ONNX modelleri arka planda kontrol ediliyor...")
+        model_root = self.recognition_service.config.model_root
+
+        def check() -> None:
+            checks = collect_model_diagnostics(model_root, load_onnx=True)
+            lines = [
+                f"{'✓' if item.ok else '✗'} {item.name}: {item.message}"
+                for item in checks
+            ]
+            lines.append(f"Servis: {self.recognition_service.get_status().value}")
+            self.diagnostics_ready.emit("\n".join(lines))
+
+        threading.Thread(target=check, name="ocr-diagnostics", daemon=True).start()
+
+    @Slot(str)
+    def _show_diagnostics(self, message: str) -> None:
+        self.diagnostics_label.setText(message)

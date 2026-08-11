@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -22,12 +23,19 @@ from app.plate_recognition import (
     preprocess_variants,
     select_best_candidate,
 )
+from app.ocr_debug import save_debug_images
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Tek görselde lokal plaka OCR testi.")
     parser.add_argument("image")
     parser.add_argument("--direction", choices=("ENTRY", "EXIT"), default="ENTRY")
+    parser.add_argument(
+        "--save-debug",
+        type=Path,
+        metavar="DIR",
+        help="ROI, ön işleme varyantları ve OCR kutularını bu klasöre kaydeder.",
+    )
     args = parser.parse_args()
 
     image = cv2.imread(args.image)
@@ -45,7 +53,20 @@ def main() -> int:
     except OcrModelNotFound as exc:
         print(str(exc))
         return 2
-    segments = provider.recognize(preprocess_variants(crop))
+    variants = preprocess_variants(crop)
+    started_at = time.perf_counter()
+    segments = provider.recognize(variants)
+    inference_ms = (time.perf_counter() - started_at) * 1000
+    print(
+        f"image={Path(args.image).resolve()} direction={direction.value} "
+        f"source={image.shape[1]}x{image.shape[0]} roi={crop.shape[1]}x{crop.shape[0]} "
+        f"variants={len(variants)} inference_ms={inference_ms:.1f}"
+    )
+    if args.save_debug:
+        paths = save_debug_images(args.save_debug.resolve(), image, crop, variants, segments)
+        print("debug_files:")
+        for path in paths:
+            print(f"  {path}")
     if not segments:
         print("OCR sonucu bulunamadı.")
         return 1
@@ -56,11 +77,17 @@ def main() -> int:
         print(
             f"raw={segment.text!r} normalized={normalized!r} "
             f"corrected={corrected!r} valid={bool(corrected and TurkishPlateValidator.is_valid(corrected))} "
-            f"confidence={segment.confidence:.3f}"
+            f"confidence={segment.confidence:.3f} variant={segment.variant_index} box={segment.box}"
         )
 
     best = select_best_candidate(segments, camera_id=0)
-    print(f"best={best}")
+    if best is None:
+        print("best=NONE (Türk plaka formatına uyan aday yok)")
+    else:
+        print(
+            f"best={best.plate} confidence={best.confidence:.3f} "
+            f"raw={best.raw_text!r}"
+        )
     return 0 if best is not None else 1
 
 

@@ -83,7 +83,7 @@ CameraService frame
 
 OCR inference ayrı bir `QThread` üzerinde çalışır. Kamera başına yalnızca en güncel frame tutulur; OCR yavaşladığında biriken, sınırsız bir frame kuyruğu oluşmaz. Model bulunmazsa login, Dashboard ve kamera preview çalışmaya devam eder; kartta `OCR: Kullanılamıyor` gösterilir.
 
-### Lokal modeller
+### İlk OCR Kurulumu
 
 Uygulama çalışma anında model indirmez ve PaddleX model-source ağ kontrolünü kapatır. ONNX Runtime ile uyumlu PaddleOCR detection ve recognition model dizinleri şu konumlarda bulunmalıdır:
 
@@ -92,6 +92,10 @@ models/ocr/detection/
 models/ocr/recognition/
 ```
 
+Her iki klasörde de dosya adları tam olarak `inference.onnx` ve `inference.yml` olmalıdır. Repository bu büyük binary model dosyalarını içermez; yeni clone sonrasında OCR'ın `Kullanılamıyor` görünmesi bu nedenle beklenen davranıştır.
+
+Elinizde hazır ONNX PaddleOCR model klasörleri varsa kopyalayıp doğrulayın:
+
 Önceden indirilmiş/çıkarılmış model dizinlerini hazırlamak için:
 
 ```powershell
@@ -99,6 +103,26 @@ python scripts/setup_ocr_models.py `
   --detection-source "C:\models\paddle-det" `
   --recognition-source "C:\models\paddle-rec"
 ```
+
+```powershell
+python scripts/verify_ocr_models.py
+```
+
+Elinizde `inference.json`/`inference.pdmodel`, `inference.pdiparams` ve `inference.yml` içeren Paddle inference modelleri varsa dönüşüm araçlarını uygulama runtime'ından ayrı kurun:
+
+```powershell
+python -m pip install -r requirements-model-tools.txt
+python -m paddlex --install paddle2onnx -y
+python scripts/convert_paddle_models.py `
+  --detection-source "C:\models\paddle-det" `
+  --recognition-source "C:\models\paddle-rec"
+python scripts/setup_ocr_models.py `
+  --detection-source "build\ocr-onnx\detection" `
+  --recognition-source "build\ocr-onnx\recognition"
+python scripts/verify_ocr_models.py
+```
+
+`verify_ocr_models.py`; sabitlenmiş paket sürümlerini, iki modelin gerçek dosyalarını, `CPUExecutionProvider` ile ONNX session açılmasını ve son olarak PaddleOCR provider başlangıcını kontrol eder. Başarılıysa `0`, bir sorun varsa `1` ile çıkar.
 
 Model binary dosyaları `.gitignore` kapsamındadır. Production paketine `models/ocr/` klasörü ayrıca dahil edilmelidir.
 
@@ -115,15 +139,25 @@ Model binary dosyaları `.gitignore` kapsamındadır. Production paketine `model
 
 Geçersiz ROI uygulamayı kapatmaz; varsayılan ROI kullanılır ve OCR durum mesajında uyarı gösterilir. Dashboard preview üzerindeki yeşil çerçeve OCR'ın taradığı alanı belirtir.
 
+Admin kullanıcı **Ayarlar → Plaka Alanını Kalibre Et** ile son kamera frame'i üzerinde ROI çizebilir. Ayar atomik kaydedilir ve kamera preview kapanmadan OCR'a uygulanır. Aynı sayfadaki **Modelleri Kontrol Et** işlemi ağır ONNX doğrulamasını arka planda çalıştırır.
+
 ### Tek görsel OCR testi
 
 Model kalitesini gerçek kamera olmadan kontrol etmek için:
 
 ```powershell
-python scripts/test_plate_ocr.py "C:\test-data\plate.jpg" --direction ENTRY
+python scripts/test_plate_ocr.py "C:\test-data\plate.jpg" --direction ENTRY --save-debug "data\ocr-debug"
 ```
 
-Script ham OCR metnini, normalize/düzeltilmiş plakayı, validation sonucunu ve confidence değerini terminale yazar.
+Script ham OCR metnini, normalize/düzeltilmiş plakayı, validation sonucunu, kutuları, confidence ve inference süresini terminale yazar. `--save-debug` ROI, preprocessing varyantları ve çizilmiş OCR kutularını kaydeder.
+
+Video veya görsel klasöründe geçici SQLite ile uçtan uca, headless pipeline testi:
+
+```powershell
+python scripts/test_pipeline.py "C:\test-data\plates" --direction ENTRY --sample-every 2
+```
+
+Çıktı; frame/OCR denemesi, aday, onaylanan kayıt, duplicate ve ortalama inference sürelerini içerir. Runtime logları dönen dosyalar halinde `data/logs/app.log` konumuna yazılır; plaka metni loglanmaz.
 
 ## Kamera Testi
 

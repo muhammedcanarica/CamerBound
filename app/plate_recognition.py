@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import os
+import logging
 import threading
 import time
 from collections import defaultdict, deque
@@ -17,6 +18,7 @@ from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 
 from app.camera import CameraService, Direction
 from app.config import NormalizedRoi, PlateRecognitionConfig, application_root
+from app.ocr_models import OcrModelError, OcrModelNotFound, validate_ocr_models
 from app.plate_service import (
     DuplicatePlateDetection,
     PlateRecord,
@@ -32,8 +34,7 @@ class RecognitionStatus(StrEnum):
     ERROR = "ERROR"
 
 
-class OcrModelNotFound(RuntimeError):
-    pass
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +42,7 @@ class OcrSegment:
     text: str
     confidence: float
     box: tuple[float, float, float, float]
+    variant_index: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,10 +63,7 @@ class PaddleOcrProvider:
     def __init__(self, model_root: Path) -> None:
         detection_dir = model_root / "detection"
         recognition_dir = model_root / "recognition"
-        if not _directory_has_model(detection_dir) or not _directory_has_model(
-            recognition_dir
-        ):
-            raise OcrModelNotFound("OCR modeli bulunamadı.")
+        validate_ocr_models(model_root, load_onnx=True)
 
         os.environ.setdefault(
             "PADDLE_PDX_CACHE_HOME",
@@ -106,14 +105,14 @@ class PaddleOcrProvider:
                     continue
                 score = _safe_score(scores[index] if index < len(scores) else 0.0)
                 box = _safe_box(boxes[index] if index < len(boxes) else None, index)
-                variant_offset = float(result_index * 1_000_000)
-                box = (
-                    box[0] + variant_offset,
-                    box[1],
-                    box[2] + variant_offset,
-                    box[3],
+                segments.append(
+                    OcrSegment(
+                        text=text,
+                        confidence=score,
+                        box=box,
+                        variant_index=result_index,
+                    )
                 )
-                segments.append(OcrSegment(text=text, confidence=score, box=box))
         return segments
 
 
@@ -260,7 +259,9 @@ class PlateRecognitionProcessor:
                 detected_at,
             )
         except DuplicatePlateDetection:
+            LOGGER.info("Duplicate plate detection suppressed for camera_id=%s", camera_id)
             return RecognitionOutcome(candidate=confirmed, record=None, duplicate=True)
+        LOGGER.info("Plate detection saved for camera_id=%s", camera_id)
         return RecognitionOutcome(candidate=confirmed, record=record)
 
 
@@ -312,11 +313,13 @@ class PlateRecognitionWorker(QObject):
         try:
             try:
                 provider = self.provider_factory()
-            except OcrModelNotFound as exc:
+            except OcrModelError as exc:
+                LOGGER.error("OCR model initialization failed: %s", exc)
                 self.status_changed.emit(RecognitionStatus.UNAVAILABLE, str(exc))
                 self._stop_event.wait()
                 return
             except Exception as exc:
+                LOGGER.exception("OCR initialization failed")
                 self.status_changed.emit(
                     RecognitionStatus.UNAVAILABLE,
                     f"OCR kullanılamıyor: {exc}",
@@ -329,6 +332,7 @@ class PlateRecognitionWorker(QObject):
             if self.config.warnings:
                 active_message += " " + " ".join(self.config.warnings)
             self.status_changed.emit(RecognitionStatus.ACTIVE, active_message)
+            recovering_from_error = False
             while not self._stop_event.is_set():
                 pending = self._take_due_frame()
                 if pending is None:
@@ -338,9 +342,19 @@ class PlateRecognitionWorker(QObject):
                 camera_id, item = pending
                 try:
                     outcome = processor.process(camera_id, item.direction, item.frame)
+                except OcrModelError as exc:
+                    LOGGER.error("Fatal OCR model error: %s", exc)
+                    self.status_changed.emit(RecognitionStatus.UNAVAILABLE, str(exc))
+                    self._stop_event.wait()
+                    return
                 except Exception as exc:
+                    LOGGER.exception("Transient OCR inference error")
                     self.status_changed.emit(RecognitionStatus.ERROR, f"OCR hatası: {exc}")
+                    recovering_from_error = True
                     continue
+                if recovering_from_error:
+                    self.status_changed.emit(RecognitionStatus.ACTIVE, "OCR yeniden aktif.")
+                    recovering_from_error = False
                 if outcome.candidate is not None:
                     self.candidate_changed.emit(camera_id, outcome.candidate)
                 if outcome.record is not None:
@@ -385,14 +399,17 @@ class PlateRecognitionService(QObject):
         plate_service: PlateService,
         config: PlateRecognitionConfig,
         provider_factory: Callable[[], OcrProvider] | None = None,
+        settings_path: Path | None = None,
     ) -> None:
         super().__init__()
         self.camera_service = camera_service
         self.plate_service = plate_service
         self.config = config
-        self.provider_factory = provider_factory or (
-            lambda: PaddleOcrProvider(config.model_root)
-        )
+        self.settings_path = (
+            settings_path or application_root() / "config" / "settings.json"
+        ).resolve()
+        self._custom_provider_factory = provider_factory
+        self.provider_factory = provider_factory or self._default_provider_factory
         self._runtime: _RecognitionRuntime | None = None
         self._directions: dict[int, Direction] = {}
         self._status = RecognitionStatus.STOPPED
@@ -437,6 +454,20 @@ class PlateRecognitionService(QObject):
 
     def get_status(self) -> RecognitionStatus:
         return self._status
+
+    def apply_config(self, config: PlateRecognitionConfig) -> None:
+        """Apply OCR settings while camera preview threads keep running."""
+        was_running = self._runtime is not None
+        if was_running:
+            self.stop()
+        self.config = config
+        if self._custom_provider_factory is None:
+            self.provider_factory = self._default_provider_factory
+        if was_running:
+            self.start()
+
+    def _default_provider_factory(self) -> OcrProvider:
+        return PaddleOcrProvider(self.config.model_root)
 
     @Slot(int, object)
     def _receive_frame(self, camera_id: int, frame: object) -> None:
@@ -497,19 +528,23 @@ def select_best_candidate(
     usable = [segment for segment in segments if segment.text.strip()]
     if not usable:
         return None
-    ordered = sorted(usable, key=lambda segment: (segment.box[0], segment.box[1]))
     raw_groups: list[tuple[str, float]] = []
-    for segment in ordered:
-        raw_groups.append((segment.text, segment.confidence))
-    for start in range(len(ordered)):
-        for end in range(start + 2, min(len(ordered), start + 4) + 1):
-            group = ordered[start:end]
-            raw_groups.append(
-                (
-                    "".join(segment.text for segment in group),
-                    sum(segment.confidence for segment in group) / len(group),
+    for variant_index in sorted({segment.variant_index for segment in usable}):
+        ordered = sorted(
+            (segment for segment in usable if segment.variant_index == variant_index),
+            key=lambda segment: (segment.box[0], segment.box[1]),
+        )
+        for segment in ordered:
+            raw_groups.append((segment.text, segment.confidence))
+        for start in range(len(ordered)):
+            for end in range(start + 2, min(len(ordered), start + 4) + 1):
+                group = ordered[start:end]
+                raw_groups.append(
+                    (
+                        "".join(segment.text for segment in group),
+                        sum(segment.confidence for segment in group) / len(group),
+                    )
                 )
-            )
 
     candidates: dict[str, PlateCandidate] = {}
     for raw_text, confidence in raw_groups:
@@ -528,12 +563,6 @@ def select_best_candidate(
     if not candidates:
         return None
     return max(candidates.values(), key=lambda candidate: candidate.confidence)
-
-
-def _directory_has_model(path: Path) -> bool:
-    return path.is_dir() and any(
-        item.is_file() and item.name != ".gitkeep" for item in path.rglob("*")
-    )
 
 
 def _translate(
