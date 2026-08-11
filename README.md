@@ -45,8 +45,13 @@ Native Paddle fallback kullanılacaksa ayrıca `python -m pip install -r require
 
 ## Çalıştırma
 
+Geliştirme ortamında Windows:
+`run.bat` dosyasına çift tıklayın.
+
+Manuel alternatif:
+
 ```powershell
-python main.py
+.\.venv\Scripts\python.exe main.py
 ```
 
 İlk çalıştırmada `data/plate_tracker.db` otomatik oluşturulur; tablolar, indexler, iki varsayılan kamera ve kullanıcı yoksa geliştirme admin hesabı eklenir.

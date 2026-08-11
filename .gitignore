@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.camera-test/
 .pytest_cache/
 data/*.db
 data/*.db-shm
