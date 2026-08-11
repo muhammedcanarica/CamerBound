@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from app.time_utils import to_utc_storage
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -12,7 +14,7 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT NOT NULL COLLATE NOCASE UNIQUE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('ADMIN', 'USER')),
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS cameras (
@@ -63,6 +65,7 @@ class Database:
         with self.connection() as connection:
             connection.executescript(SCHEMA)
             self._seed_cameras(connection)
+            self._normalize_legacy_timestamps(connection)
 
     @staticmethod
     def _seed_cameras(connection: sqlite3.Connection) -> None:
@@ -75,3 +78,27 @@ class Database:
                 """,
                 (("Giriş Kamerası", "ENTRY"), ("Çıkış Kamerası", "EXIT")),
             )
+
+    @staticmethod
+    def _normalize_legacy_timestamps(connection: sqlite3.Connection) -> None:
+        for table, column in (
+            ("users", "created_at"),
+            ("plate_records", "timestamp"),
+        ):
+            rows = connection.execute(
+                f"SELECT id, {column} FROM {table}"
+            ).fetchall()
+            updates: list[tuple[str, int]] = []
+            for row in rows:
+                original = row[column]
+                try:
+                    normalized = to_utc_storage(original)
+                except (TypeError, ValueError):
+                    continue
+                if normalized != original:
+                    updates.append((normalized, row["id"]))
+            if updates:
+                connection.executemany(
+                    f"UPDATE {table} SET {column} = ? WHERE id = ?",
+                    updates,
+                )

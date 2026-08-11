@@ -19,6 +19,7 @@ from app.database import Database
 from app.plate_recognition import PlateRecognitionService, RecognitionStatus
 from app.plate_service import PlateService
 from main import ApplicationController
+from ui.styles import APP_STYLESHEET
 
 
 class LoginFlowSmokeTest(unittest.TestCase):
@@ -121,6 +122,38 @@ class LoginFlowSmokeTest(unittest.TestCase):
                     for row in range(users_page.table.rowCount())
                 }
                 self.assertIn(username, table_usernames)
+
+    def test_combo_box_popup_has_readable_theme_colors(self) -> None:
+        self.application.setStyleSheet(APP_STYLESHEET)
+        self.controller.show_login()
+        login = self.controller.login_window
+        login.username_input.setText("admin")
+        login.password_input.setText("admin123")
+
+        QTest.mouseClick(login.login_button, Qt.MouseButton.LeftButton)
+        self.application.processEvents()
+
+        role_input = self.controller.dashboard_window.pages[3].role_input
+        role_input.ensurePolished()
+        role_input.view().ensurePolished()
+        popup_palette = role_input.view().palette()
+
+        self.assertEqual(
+            popup_palette.color(popup_palette.ColorRole.Base).name(),
+            "#ffffff",
+        )
+        self.assertEqual(
+            popup_palette.color(popup_palette.ColorRole.Text).name(),
+            "#172033",
+        )
+        self.assertEqual(
+            popup_palette.color(popup_palette.ColorRole.Highlight).name(),
+            "#3468d4",
+        )
+        self.assertEqual(
+            popup_palette.color(popup_palette.ColorRole.HighlightedText).name(),
+            "#ffffff",
+        )
 
 
 if __name__ == "__main__":

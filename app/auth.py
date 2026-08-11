@@ -7,6 +7,7 @@ from enum import StrEnum
 import bcrypt
 
 from app.database import Database
+from app.time_utils import to_utc_storage, utc_now
 
 
 class Role(StrEnum):
@@ -51,11 +52,15 @@ class AuthService:
             if user_count > 0:
                 return False
             connection.execute(
-                "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
+                """
+                INSERT INTO users (username, password_hash, role, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
                 (
                     self.DEFAULT_ADMIN_USERNAME,
                     self._hash_password(self.DEFAULT_ADMIN_PASSWORD),
                     Role.ADMIN.value,
+                    to_utc_storage(utc_now()),
                 ),
             )
         return True
@@ -93,11 +98,15 @@ class AuthService:
         try:
             with self.database.connection() as connection:
                 cursor = connection.execute(
-                    "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
+                    """
+                    INSERT INTO users (username, password_hash, role, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
                     (
                         normalized_username,
                         self._hash_password(password),
                         normalized_role.value,
+                        to_utc_storage(utc_now()),
                     ),
                 )
                 user_id = int(cursor.lastrowid)

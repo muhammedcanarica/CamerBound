@@ -20,14 +20,15 @@ from PySide6.QtWidgets import (
 from app.auth import SessionUser
 from app.camera import Direction
 from app.plate_service import PlateRecord, PlateService, VehicleInside
+from app.time_utils import to_local_datetime
 
 
-def display_timestamp(value: str) -> str:
+def display_timestamp(value: str | datetime) -> str:
     try:
-        parsed = datetime.fromisoformat(value)
-        return parsed.strftime("%d.%m.%Y %H:%M:%S")
-    except ValueError:
-        return value
+        local_time = to_local_datetime(value)
+        return local_time.strftime("%d.%m.%Y %H:%M:%S")
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def prepare_table(table: QTableWidget, headers: list[str]) -> None:

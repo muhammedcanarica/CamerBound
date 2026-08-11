@@ -169,6 +169,73 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(exit_record.direction, Direction.EXIT)
         self.assertEqual(after_cooldown.direction, Direction.ENTRY)
 
+    def test_plate_timestamps_are_stored_and_returned_as_utc(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        turkey_offset = timezone(timedelta(hours=3))
+
+        aware_record = self.plate_service.save_plate_detection(
+            "34UTC01",
+            camera.id,
+            0.95,
+            datetime(2026, 8, 11, 13, 0, tzinfo=turkey_offset),
+        )
+        naive_record = self.plate_service.save_plate_detection(
+            "34UTC02",
+            camera.id,
+            0.94,
+            datetime(2026, 8, 11, 10, 0),
+        )
+
+        self.assertEqual(aware_record.timestamp, "2026-08-11T10:00:00+00:00")
+        self.assertEqual(naive_record.timestamp, "2026-08-11T10:00:00+00:00")
+        with self.database.connection() as connection:
+            stored = {
+                row["plate"]: row["timestamp"]
+                for row in connection.execute(
+                    "SELECT plate, timestamp FROM plate_records WHERE plate LIKE '34UTC%'"
+                ).fetchall()
+            }
+        self.assertEqual(stored["34UTC01"], "2026-08-11T10:00:00+00:00")
+        self.assertEqual(stored["34UTC02"], "2026-08-11T10:00:00+00:00")
+
+    def test_initialize_normalizes_legacy_timestamps_without_losing_invalid_rows(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        with self.database.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO users (username, password_hash, role, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                ("legacy-user", "unused", "USER", "2026-08-11 10:00:00"),
+            )
+            connection.executemany(
+                """
+                INSERT INTO plate_records
+                    (plate, direction, camera_id, confidence, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    ("34LEGACY", "ENTRY", camera.id, 0.90, "2026-08-11T13:00:00+03:00"),
+                    ("34INVALID", "ENTRY", camera.id, 0.80, "legacy-value"),
+                ),
+            )
+
+        self.database.initialize()
+
+        with self.database.connection() as connection:
+            created_at = connection.execute(
+                "SELECT created_at FROM users WHERE username = 'legacy-user'"
+            ).fetchone()["created_at"]
+            timestamps = {
+                row["plate"]: row["timestamp"]
+                for row in connection.execute(
+                    "SELECT plate, timestamp FROM plate_records WHERE plate LIKE '34L%' OR plate = '34INVALID'"
+                ).fetchall()
+            }
+        self.assertEqual(created_at, "2026-08-11T10:00:00+00:00")
+        self.assertEqual(timestamps["34LEGACY"], "2026-08-11T10:00:00+00:00")
+        self.assertEqual(timestamps["34INVALID"], "legacy-value")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,14 @@ QLineEdit, QComboBox {
 QLineEdit:focus, QComboBox:focus {
     border: 1px solid #3468d4;
 }
+QComboBox QAbstractItemView {
+    background: white;
+    color: #172033;
+    border: 1px solid #cbd5e1;
+    selection-background-color: #3468d4;
+    selection-color: white;
+    outline: 0;
+}
 QPushButton {
     background: #2f66d0;
     color: white;

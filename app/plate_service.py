@@ -7,6 +7,13 @@ from datetime import datetime, timedelta
 from app.auth import AuthService, SessionUser, ValidationError
 from app.camera import Direction
 from app.database import Database
+from app.time_utils import (
+    as_utc,
+    normalize_utc_timestamp,
+    parse_utc_timestamp,
+    to_utc_storage,
+    utc_now,
+)
 
 
 PLATE_PATTERN = re.compile(r"^[A-Z0-9]{2,12}$")
@@ -57,8 +64,8 @@ class PlateService:
         if not 0 <= confidence <= 1:
             raise ValidationError("Güven değeri 0 ile 1 arasında olmalıdır.")
 
-        detection_time = detected_at or datetime.now().astimezone()
-        timestamp = detection_time.isoformat(timespec="seconds")
+        detection_time = as_utc(detected_at) if detected_at is not None else utc_now()
+        timestamp = to_utc_storage(detection_time)
         with self.database.connection() as connection:
             # Acquire the write lock before checking the latest row so another
             # recognition worker cannot insert between the SELECT and INSERT.
@@ -107,13 +114,10 @@ class PlateService:
         if self.duplicate_cooldown_seconds <= 0:
             return False
         try:
-            previous = datetime.fromisoformat(previous_value)
-        except ValueError:
+            previous = parse_utc_timestamp(previous_value)
+            current = as_utc(current)
+        except (TypeError, ValueError):
             return False
-        if previous.tzinfo is None and current.tzinfo is not None:
-            previous = previous.replace(tzinfo=current.tzinfo)
-        elif previous.tzinfo is not None and current.tzinfo is None:
-            current = current.replace(tzinfo=previous.tzinfo)
         elapsed = current - previous
         return timedelta(0) <= elapsed <= timedelta(
             seconds=self.duplicate_cooldown_seconds
@@ -197,7 +201,9 @@ class PlateService:
             ).fetchall()
         return [
             VehicleInside(
-                plate=row["plate"], entry_time=row["timestamp"], camera_name=row["camera_name"]
+                plate=row["plate"],
+                entry_time=normalize_utc_timestamp(row["timestamp"]),
+                camera_name=row["camera_name"],
             )
             for row in rows
         ]
@@ -220,5 +226,5 @@ class PlateService:
             camera_id=row["camera_id"],
             camera_name=row["camera_name"],
             confidence=row["confidence"],
-            timestamp=row["timestamp"],
+            timestamp=normalize_utc_timestamp(row["timestamp"]),
         )
