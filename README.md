@@ -92,13 +92,18 @@ Normal uygulama çalışması hiçbir zaman model indirmez ve internet gerektirm
 Hazırlık seçenekleri:
 
 ```powershell
+python scripts/prepare_default_ocr_models.py
 python scripts/prepare_default_ocr_models.py --dry-run
 python scripts/prepare_default_ocr_models.py --force
 ```
 
-`--dry-run` dosya değiştirmeden yolları gösterir. `--force` indirme cache'ini ve üretilmiş model çıktılarını baştan hazırlar. Resmî artefactlar için dokümante edilmiş checksum yayımlanmadığından sahte checksum kullanılmaz; indirme uzunluğu, güvenli archive extraction, Paddle model yapısı ve ONNX Runtime yüklemesi doğrulanır.
+`--dry-run` dosya değiştirmeden yolları gösterir. `--force` indirme cache'ini ve `build/ocr-onnx/` dönüşüm çıktılarını baştan hazırlar; doğrulama tamamlanana kadar mevcut çalışan `models/ocr/` klasörünü korur. Resmî artefactlar için dokümante edilmiş checksum yayımlanmadığından sahte checksum kullanılmaz; indirme uzunluğu, güvenli archive extraction, Paddle model yapısı ve ONNX Runtime yüklemesi doğrulanır.
 
-İleri seviye/manual dönüşüm için mevcut `convert_paddle_models.py` ve `setup_ocr_models.py` scriptleri kullanılabilir. Final klasörlerde `inference.onnx` ve `inference.yml` bulunur; `models/ocr/model-info.json` kullanılan resmî model adlarını kaydeder. Binary dosyalar `.gitignore` kapsamındadır.
+#### Advanced / Troubleshooting
+
+Manuel dönüşüm veya hazırlanmış ONNX klasörlerini kurmak için `scripts/convert_paddle_models.py` ve `scripts/setup_ocr_models.py` ayrı ayrı kullanılabilir. Normal geliştirme akışında bu adımlar gerekli değildir; `prepare_default_ocr_models.py` aynı mantığı tek komutta çağırır.
+
+Final klasörlerde `inference.onnx` ve `inference.yml` bulunur; `models/ocr/model-info.json` kullanılan resmî model adlarını kaydeder. Binary dosyalar `.gitignore` kapsamındadır.
 
 ### ROI ve tanıma ayarları
 
@@ -144,6 +149,8 @@ python -m pip install -r requirements-model-tools.txt
 python scripts/prepare_default_ocr_models.py
 python scripts/verify_ocr_models.py
 ```
+
+Model indirme ve dönüştürme adımı internet bağlantısı gerektirir. Modeller hazırlandıktan sonra **CamerBound normal kullanım sırasında internet gerektirmez**; runtime hiçbir zaman otomatik model indirmez.
 
 Hazırlık tamamlandıktan sonra:
 

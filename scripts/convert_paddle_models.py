@@ -27,12 +27,24 @@ python -m pip install -r requirements-model-tools.txt"""
 
 def check_conversion_tools(module_finder=None, executable_finder=None) -> None:
     module_finder = module_finder or importlib.util.find_spec
-    executable_finder = executable_finder or shutil.which
     required_modules = ("paddle", "paddle2onnx", "paddlex")
     if any(module_finder(module) is None for module in required_modules):
         raise ConversionToolsError(TOOLS_ERROR_MESSAGE)
-    if executable_finder("paddle2onnx") is None:
+    if _find_paddlex_executable(executable_finder) is None:
         raise ConversionToolsError(TOOLS_ERROR_MESSAGE)
+
+
+def _find_paddlex_executable(executable_finder=None) -> str | None:
+    if executable_finder is not None:
+        return executable_finder("paddlex")
+
+    executable = shutil.which("paddlex")
+    if executable is not None:
+        return executable
+
+    executable_name = "paddlex.exe" if sys.platform == "win32" else "paddlex"
+    sibling = Path(sys.executable).with_name(executable_name)
+    return str(sibling) if sibling.is_file() else None
 
 
 def validate_paddle_model_directory(source: Path) -> Path:
@@ -57,11 +69,12 @@ def validate_paddle_model_directory(source: Path) -> Path:
 def convert(source: Path, output: Path, opset: int) -> None:
     source = validate_paddle_model_directory(source)
     output.mkdir(parents=True, exist_ok=True)
+    paddlex_executable = _find_paddlex_executable()
+    if paddlex_executable is None:
+        raise ConversionToolsError(TOOLS_ERROR_MESSAGE)
     subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "paddlex",
+            paddlex_executable,
             "--paddle2onnx",
             "--paddle_model_dir",
             str(source),

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+import shutil
 import tarfile
 import tempfile
 import unittest
@@ -89,7 +91,7 @@ class OcrModelPreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "model.tar"
 
-            with self.assertRaisesRegex(ModelPreparationError, "Download failed"):
+            with self.assertRaisesRegex(ModelPreparationError, "Model download failed"):
                 download_file(
                     "https://official.invalid/model.tar",
                     destination,
@@ -123,6 +125,99 @@ class OcrModelPreparationTests(unittest.TestCase):
                 module_finder=lambda _name: None,
                 executable_finder=lambda _name: None,
             )
+
+    def test_failed_staging_preserves_existing_final_models(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project_root = Path(temporary)
+            existing_model = project_root / "models" / "ocr" / "detection" / "inference.onnx"
+            existing_model.parent.mkdir(parents=True)
+            existing_model.write_bytes(b"working-model")
+
+            def fail_install(_sources, _root) -> None:
+                raise RuntimeError("staging failed")
+
+            with self.assertRaisesRegex(RuntimeError, "staging failed"):
+                prepare_default_models(
+                    project_root,
+                    force=True,
+                    downloader=_write_fake_paddle_archive,
+                    converter=_fake_converter,
+                    installer=fail_install,
+                    tool_checker=lambda: None,
+                )
+
+            self.assertEqual(existing_model.read_bytes(), b"working-model")
+            self.assertFalse((project_root / "models" / "ocr-staging").exists())
+
+    def test_successful_preparation_writes_model_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project_root = Path(temporary)
+            verification_lines = [
+                "Detection model: OK",
+                "Recognition model: OK",
+                "ONNX Runtime: OK",
+                "PaddleOCR provider: OK",
+                "OCR status: READY",
+            ]
+
+            lines = prepare_default_models(
+                project_root,
+                downloader=_write_fake_paddle_archive,
+                converter=_fake_converter,
+                installer=_fake_installer,
+                verifier=lambda _root: (0, verification_lines),
+                tool_checker=lambda: None,
+            )
+
+            model_root = project_root / "models" / "ocr"
+            metadata = json.loads(
+                (model_root / "model-info.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                metadata,
+                {
+                    "detection": {"name": "PP-OCRv5_mobile_det"},
+                    "recognition": {"name": "en_PP-OCRv5_mobile_rec"},
+                    "format": "onnx",
+                    "engine": "onnxruntime",
+                },
+            )
+            for folder in ("detection", "recognition"):
+                self.assertTrue((model_root / folder / "inference.onnx").is_file())
+                self.assertTrue((model_root / folder / "inference.yml").is_file())
+            self.assertIn("PaddleOCR provider: OK", lines)
+            self.assertIn("OCR status: READY", lines)
+            self.assertEqual(lines[-1], "OCR MODELS READY")
+
+
+def _write_fake_paddle_archive(_url: str, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(destination, "w") as tar:
+        for filename, content in (
+            ("inference.json", b"{}"),
+            ("inference.pdiparams", b"parameters"),
+            ("inference.yml", b"Global:\n  model_name: fake\n"),
+        ):
+            member = tarfile.TarInfo(f"fake-model/{filename}")
+            member.size = len(content)
+            tar.addfile(member, io.BytesIO(content))
+
+
+def _fake_converter(_source: Path, output: Path, _opset: int) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "inference.onnx").write_bytes(b"onnx")
+    (output / "inference.yml").write_text(
+        "Global:\n  model_name: fake\n",
+        encoding="utf-8",
+    )
+
+
+def _fake_installer(sources: dict[str, tuple[Path, str]], model_root: Path) -> None:
+    for folder, (source, _label) in sources.items():
+        target = model_root / folder
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / "inference.onnx", target / "inference.onnx")
+        shutil.copy2(source / "inference.yml", target / "inference.yml")
 
 
 if __name__ == "__main__":

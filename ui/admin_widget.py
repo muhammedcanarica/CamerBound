@@ -69,11 +69,15 @@ class UsersAdminWidget(QWidget):
 
     def _create_user(self) -> None:
         try:
+            try:
+                normalized_role = Role(self.role_input.currentData())
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("Geçersiz kullanıcı rolü.") from exc
             self.auth_service.create_user(
                 self.user,
                 self.username_input.text(),
                 self.password_input.text(),
-                self.role_input.currentData(),
+                normalized_role,
             )
         except (UserExistsError, ValidationError, PermissionError) as exc:
             QMessageBox.warning(self, "Kullanıcı oluşturulamadı", str(exc))

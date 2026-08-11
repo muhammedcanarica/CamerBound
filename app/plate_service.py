@@ -135,9 +135,20 @@ class PlateService:
         self,
         actor: SessionUser,
         plate_query: str = "",
-        direction: Direction | None = None,
+        direction: Direction | str | None = None,
         limit: int = 500,
     ) -> list[PlateRecord]:
+        try:
+            normalized_direction = (
+                direction
+                if direction is None or isinstance(direction, Direction)
+                else Direction(direction)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "Geçersiz kamera yönü. ENTRY veya EXIT kullanın."
+            ) from exc
+
         AuthService.require_authenticated(actor)
         conditions: list[str] = []
         parameters: list[object] = []
@@ -145,9 +156,9 @@ class PlateService:
         if normalized_query:
             conditions.append("pr.plate LIKE ?")
             parameters.append(f"%{normalized_query}%")
-        if direction is not None:
+        if normalized_direction is not None:
             conditions.append("pr.direction = ?")
-            parameters.append(direction.value)
+            parameters.append(normalized_direction.value)
 
         query = self._record_select()
         if conditions:

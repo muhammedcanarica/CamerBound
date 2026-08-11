@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -11,7 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QSizePolicy
 
-from app.auth import AuthService
+from app.auth import AuthService, Role
 from app.camera import CameraService
 from app.config import load_config
 from app.database import Database
@@ -97,6 +98,29 @@ class LoginFlowSmokeTest(unittest.TestCase):
             dashboard.dashboard_home.camera_cards[next(iter(dashboard.dashboard_home.camera_cards))]
             .ocr_status.text(),
         )
+
+        users_page = dashboard.pages[3]
+        for username, role in (("ui-user", Role.USER), ("ui-admin", Role.ADMIN)):
+            with self.subTest(role=role):
+                role_index = users_page.role_input.findData(role)
+                users_page.role_input.setItemData(role_index, role.value)
+                users_page.role_input.setCurrentIndex(role_index)
+                users_page.username_input.setText(username)
+                users_page.password_input.setText("safe-pass-123")
+
+                with patch("ui.admin_widget.QMessageBox.information"):
+                    users_page._create_user()
+
+                created = self.controller.auth_service.authenticate(
+                    username,
+                    "safe-pass-123",
+                )
+                self.assertIs(created.role, role)
+                table_usernames = {
+                    users_page.table.item(row, 1).text()
+                    for row in range(users_page.table.rowCount())
+                }
+                self.assertIn(username, table_usernames)
 
 
 if __name__ == "__main__":

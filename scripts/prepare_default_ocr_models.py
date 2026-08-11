@@ -29,7 +29,10 @@ from scripts.verify_ocr_models import verify_ocr_setup
 
 DOWNLOAD_ROOT_NAME = Path("build") / "ocr-model-downloads"
 WORK_ROOT_NAME = Path("build") / "ocr-model-work"
+CONVERSION_ROOT_NAME = Path("build") / "ocr-onnx"
 FINAL_MODEL_ROOT_NAME = Path("models") / "ocr"
+STAGING_MODEL_ROOT_NAME = Path("models") / "ocr-staging"
+BACKUP_MODEL_ROOT_NAME = Path("models") / "ocr-backup"
 DOWNLOAD_TIMEOUT_SECONDS = 60
 
 
@@ -97,14 +100,15 @@ def download_file(
             os.fsync(output.fileno())
         if expected_length is not None and bytes_written != int(expected_length):
             raise ModelPreparationError(
-                f"Download incomplete for {url}: {bytes_written}/{expected_length} bytes"
+                "Model download failed: incomplete response for "
+                f"{url}: {bytes_written}/{expected_length} bytes"
             )
         os.replace(partial, destination)
     except Exception as exc:
         partial.unlink(missing_ok=True)
         if isinstance(exc, ModelPreparationError):
             raise
-        raise ModelPreparationError(f"Download failed for {url}: {exc}") from exc
+        raise ModelPreparationError(f"Model download failed: {url}: {exc}") from exc
 
 
 def ensure_archive(
@@ -183,14 +187,25 @@ def write_model_metadata(model_root: Path) -> None:
 
 def dry_run_report(project_root: Path) -> list[str]:
     download_root = project_root / DOWNLOAD_ROOT_NAME
-    work_root = project_root / WORK_ROOT_NAME
+    conversion_root = project_root / CONVERSION_ROOT_NAME
     model_root = project_root / FINAL_MODEL_ROOT_NAME
     return [
-        f"Detection model: {DEFAULT_MODELS[0].name}",
-        f"Recognition model: {DEFAULT_MODELS[1].name}",
-        f"Download cache: {download_root}",
-        f"Conversion output: {work_root / 'onnx'}",
-        f"Final model path: {model_root}",
+        "Detection model:",
+        DEFAULT_MODELS[0].name,
+        "",
+        "Recognition model:",
+        DEFAULT_MODELS[1].name,
+        "",
+        "Download cache:",
+        str(download_root),
+        "",
+        "Conversion output:",
+        str(conversion_root),
+        "",
+        "Final models:",
+        str(model_root),
+        "",
+        "No files changed.",
     ]
 
 
@@ -212,60 +227,100 @@ def prepare_default_models(
     tool_checker()
     download_root = project_root / DOWNLOAD_ROOT_NAME
     work_root = project_root / WORK_ROOT_NAME
+    conversion_root = project_root / CONVERSION_ROOT_NAME
     model_root = project_root / FINAL_MODEL_ROOT_NAME
+    staging_root = project_root / STAGING_MODEL_ROOT_NAME
+    backup_root = project_root / BACKUP_MODEL_ROOT_NAME
+    _recover_interrupted_publish(model_root, backup_root)
     if force:
-        shutil.rmtree(download_root, ignore_errors=True)
-        shutil.rmtree(work_root, ignore_errors=True)
-        _clear_model_outputs(model_root)
+        _remove_tree(download_root, project_root / "build")
+        _remove_tree(work_root, project_root / "build")
+        _remove_tree(conversion_root, project_root / "build")
+
+    _remove_tree(staging_root, project_root / "models")
 
     lines: list[str] = []
-    paddle_sources: dict[str, Path] = {}
-    for spec in DEFAULT_MODELS:
-        downloaded = ensure_archive(
-            spec,
-            download_root,
-            force=False,
-            downloader=downloader,
-        )
-        suffix = "OK" if downloaded else "OK (cached)"
-        lines.append(f"Downloading {spec.name}... {suffix}")
-        extract_root = work_root / "extracted" / spec.key
-        shutil.rmtree(extract_root, ignore_errors=True)
-        safe_extract_tar(download_root / spec.archive_name, extract_root)
-        paddle_sources[spec.key] = find_paddle_model_directory(extract_root)
+    try:
+        paddle_sources: dict[str, Path] = {}
+        for spec in DEFAULT_MODELS:
+            downloaded = ensure_archive(
+                spec,
+                download_root,
+                force=False,
+                downloader=downloader,
+            )
+            suffix = "OK" if downloaded else "OK (cached)"
+            lines.append(f"Downloading {spec.name}... {suffix}")
+            extract_root = work_root / "extracted" / spec.key
+            _remove_tree(extract_root, work_root)
+            safe_extract_tar(download_root / spec.archive_name, extract_root)
+            paddle_sources[spec.key] = find_paddle_model_directory(extract_root)
 
-    lines.append("")
-    converted_sources: dict[str, tuple[Path, str]] = {}
-    for spec in DEFAULT_MODELS:
-        output = work_root / "onnx" / spec.key
-        shutil.rmtree(output, ignore_errors=True)
-        converter(paddle_sources[spec.key], output, 11)
-        converted_sources[spec.key] = (output, spec.label)
-        lines.append(f"{spec.label} conversion... OK")
+        lines.append("")
+        converted_sources: dict[str, tuple[Path, str]] = {}
+        for spec in DEFAULT_MODELS:
+            output = conversion_root / spec.key
+            _remove_tree(output, conversion_root)
+            converter(paddle_sources[spec.key], output, 11)
+            converted_sources[spec.key] = (output, spec.label)
+            lines.append(f"{spec.label} conversion... OK")
 
-    installer(converted_sources, model_root)
-    exit_code, verification_lines = verifier(model_root)
-    if exit_code != 0:
-        raise ModelPreparationError("\n".join(verification_lines))
-    write_model_metadata(model_root)
+        installer(converted_sources, staging_root)
+        _preserve_gitkeep_files(model_root, staging_root)
+        write_model_metadata(staging_root)
+        exit_code, verification_lines = verifier(staging_root)
+        if exit_code != 0:
+            raise ModelPreparationError("\n".join(verification_lines))
+        _publish_staged_models(staging_root, model_root, backup_root)
 
-    lines.extend(("", *verification_lines[:3], "", "OCR MODELS READY"))
-    return lines
+        lines.extend(("", *verification_lines, "", "OCR MODELS READY"))
+        return lines
+    finally:
+        _remove_tree(staging_root, project_root / "models")
 
 
-def _clear_model_outputs(model_root: Path) -> None:
+def _remove_tree(path: Path, allowed_root: Path) -> None:
+    path = path.resolve()
+    allowed_root = allowed_root.resolve()
+    if path == allowed_root or not path.is_relative_to(allowed_root):
+        raise ModelPreparationError(f"Unsafe cleanup path rejected: {path}")
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def _recover_interrupted_publish(model_root: Path, backup_root: Path) -> None:
+    if not backup_root.exists():
+        return
+    if model_root.exists():
+        _remove_tree(backup_root, model_root.parent)
+    else:
+        os.replace(backup_root, model_root)
+
+
+def _preserve_gitkeep_files(model_root: Path, staging_root: Path) -> None:
     for folder in ("detection", "recognition"):
-        directory = model_root / folder
-        if not directory.is_dir():
-            continue
-        for item in directory.iterdir():
-            if item.name == ".gitkeep":
-                continue
-            if item.is_dir():
-                shutil.rmtree(item)
-            else:
-                item.unlink()
-    (model_root / "model-info.json").unlink(missing_ok=True)
+        source = model_root / folder / ".gitkeep"
+        if source.is_file():
+            shutil.copy2(source, staging_root / folder / ".gitkeep")
+
+
+def _publish_staged_models(
+    staging_root: Path,
+    model_root: Path,
+    backup_root: Path,
+) -> None:
+    _recover_interrupted_publish(model_root, backup_root)
+    had_existing_models = model_root.exists()
+    if had_existing_models:
+        os.replace(model_root, backup_root)
+    try:
+        os.replace(staging_root, model_root)
+    except Exception:
+        if had_existing_models and backup_root.exists() and not model_root.exists():
+            os.replace(backup_root, model_root)
+        raise
+    else:
+        _remove_tree(backup_root, model_root.parent)
 
 
 def main() -> int:

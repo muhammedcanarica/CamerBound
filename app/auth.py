@@ -79,8 +79,13 @@ class AuthService:
         )
 
     def create_user(
-        self, actor: SessionUser, username: str, password: str, role: Role
+        self, actor: SessionUser, username: str, password: str, role: Role | str
     ) -> SessionUser:
+        try:
+            normalized_role = role if isinstance(role, Role) else Role(role)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("Geçersiz kullanıcı rolü.") from exc
+
         self.require_admin(actor)
         normalized_username = username.strip()
         self._validate_new_user(normalized_username, password)
@@ -89,13 +94,21 @@ class AuthService:
             with self.database.connection() as connection:
                 cursor = connection.execute(
                     "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
-                    (normalized_username, self._hash_password(password), role.value),
+                    (
+                        normalized_username,
+                        self._hash_password(password),
+                        normalized_role.value,
+                    ),
                 )
                 user_id = int(cursor.lastrowid)
         except sqlite3.IntegrityError as exc:
             raise UserExistsError("Bu kullanıcı adı zaten kullanılıyor.") from exc
 
-        return SessionUser(id=user_id, username=normalized_username, role=role)
+        return SessionUser(
+            id=user_id,
+            username=normalized_username,
+            role=normalized_role,
+        )
 
     def list_users(self, actor: SessionUser) -> list[sqlite3.Row]:
         self.require_admin(actor)

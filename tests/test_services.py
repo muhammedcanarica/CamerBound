@@ -11,6 +11,7 @@ from app.auth import (
     AuthorizationError,
     Role,
     UserExistsError,
+    ValidationError,
 )
 from app.camera import CameraService, Direction
 from app.database import Database
@@ -52,6 +53,47 @@ class ServiceTests(unittest.TestCase):
                 self.admin, "SECURITY", "another-pass", Role.USER
             )
 
+    def test_create_user_accepts_role_enum_and_string_values(self) -> None:
+        cases = (
+            ("enum-user", Role.USER, Role.USER),
+            ("string-user", "USER", Role.USER),
+            ("enum-admin", Role.ADMIN, Role.ADMIN),
+            ("string-admin", "ADMIN", Role.ADMIN),
+        )
+
+        for username, value, expected in cases:
+            with self.subTest(value=value):
+                created = self.auth_service.create_user(
+                    self.admin,
+                    username,
+                    "safe-pass-123",
+                    value,
+                )
+                with self.database.connection() as connection:
+                    stored_role = connection.execute(
+                        "SELECT role FROM users WHERE id = ?",
+                        (created.id,),
+                    ).fetchone()["role"]
+
+                self.assertIs(created.role, expected)
+                self.assertEqual(stored_role, expected.value)
+
+    def test_create_user_rejects_invalid_role(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "Geçersiz kullanıcı rolü"):
+            self.auth_service.create_user(
+                self.admin,
+                "invalid-role-user",
+                "safe-pass-123",
+                "INVALID",
+            )
+
+        with self.database.connection() as connection:
+            user_count = connection.execute(
+                "SELECT COUNT(*) FROM users WHERE username = ?",
+                ("invalid-role-user",),
+            ).fetchone()[0]
+        self.assertEqual(user_count, 0)
+
     def test_user_cannot_change_camera_or_create_user(self) -> None:
         user = self.auth_service.create_user(
             self.admin, "operator", "operator-pass", Role.USER
@@ -89,10 +131,10 @@ class ServiceTests(unittest.TestCase):
             now + timedelta(minutes=20),
         )
 
-        entry_records = self.plate_service.search_records(
-            self.admin, "34", Direction.ENTRY
-        )
+        entry_records = self.plate_service.search_records(self.admin, "34", "ENTRY")
         self.assertEqual([record.plate for record in entry_records], ["34ABC123"])
+        with self.assertRaisesRegex(ValidationError, "ENTRY veya EXIT"):
+            self.plate_service.search_records(self.admin, direction="INVALID")
         vehicles_inside = self.plate_service.get_vehicles_inside(self.admin)
         self.assertEqual([vehicle.plate for vehicle in vehicles_inside], ["06XYZ99"])
 
