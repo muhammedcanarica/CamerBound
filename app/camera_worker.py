@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import threading
 import time
+import logging
+import sys
 from enum import StrEnum
 from typing import Callable, Protocol
 
 import cv2
 from PySide6.QtCore import QObject, Signal, Slot
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class CameraStatus(StrEnum):
@@ -33,6 +38,9 @@ CaptureFactory = Callable[[CaptureSource], VideoCaptureLike]
 
 def create_video_capture(source: CaptureSource) -> VideoCaptureLike:
     """Create an OpenCV capture with bounded network timeouts where supported."""
+    if isinstance(source, int) and sys.platform == "win32":
+        return _create_windows_webcam_capture(source)
+
     capture = cv2.VideoCapture()
     is_network_source = isinstance(source, str) and "://" in source
     timeout_parameters: list[int] = []
@@ -57,6 +65,31 @@ def create_video_capture(source: CaptureSource) -> VideoCaptureLike:
 
     capture.open(source)
     return capture
+
+
+def _create_windows_webcam_capture(source: int) -> VideoCaptureLike:
+    """Open a Windows webcam with deterministic backend fallback."""
+    attempts = (
+        (getattr(cv2, "CAP_DSHOW", None), "DSHOW"),
+        (getattr(cv2, "CAP_MSMF", None), "MSMF"),
+        (getattr(cv2, "CAP_ANY", 0), "CAP_ANY"),
+    )
+    last_capture: VideoCaptureLike | None = None
+    for backend, backend_name in attempts:
+        if backend is None:
+            continue
+        capture = cv2.VideoCapture()
+        try:
+            capture.open(source, backend)
+            if capture.isOpened():
+                LOGGER.info("Camera %s opened with %s", source, backend_name)
+                return capture
+        except (TypeError, cv2.error):
+            pass
+        capture.release()
+        last_capture = capture
+
+    return last_capture or cv2.VideoCapture()
 
 
 class CameraWorker(QObject):

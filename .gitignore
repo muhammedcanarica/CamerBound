@@ -12,6 +12,8 @@ build/
 dist/
 *.spec
 models/ocr/**
+models/ocr-staging/
+models/ocr-backup/
 !models/ocr/model-info.json
 !models/ocr/detection/
 !models/ocr/detection/.gitkeep

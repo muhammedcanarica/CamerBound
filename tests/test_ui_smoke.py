@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QSizePolicy
+from PySide6.QtWidgets import QApplication, QFrame, QScrollArea, QSizePolicy
 
 from app.auth import AuthService, Role
 from app.camera import CameraService
@@ -127,6 +127,30 @@ class LoginFlowSmokeTest(unittest.TestCase):
                     for row in range(users_page.table.rowCount())
                 }
                 self.assertIn(username, table_usernames)
+
+        camera_settings = dashboard.pages[4]
+        dashboard.stack.setCurrentWidget(camera_settings)
+        camera_settings.refresh()
+        self.application.processEvents()
+        self.assertIsInstance(camera_settings.scroll_area, QScrollArea)
+        self.assertTrue(camera_settings.scroll_area.widgetResizable())
+        self.assertEqual(
+            camera_settings.scroll_area.frameShape(),
+            QFrame.Shape.NoFrame,
+        )
+        self.assertIs(camera_settings.scroll_area.widget(), camera_settings.content_widget)
+        self.assertEqual(len(camera_settings._camera_buttons), 2)
+        for save_button, roi_button in camera_settings._camera_buttons.values():
+            self.assertGreaterEqual(save_button.minimumHeight(), 36)
+            self.assertGreaterEqual(roi_button.minimumHeight(), 36)
+            self.assertEqual(
+                save_button.sizePolicy().horizontalPolicy(),
+                QSizePolicy.Policy.Expanding,
+            )
+            self.assertEqual(
+                roi_button.sizePolicy().horizontalPolicy(),
+                QSizePolicy.Policy.Expanding,
+            )
 
     def test_combo_box_popup_has_readable_theme_colors(self) -> None:
         self.application.setStyleSheet(APP_STYLESHEET)

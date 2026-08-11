@@ -13,17 +13,21 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLayout,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+    QFrame,
 )
 
 from app.auth import AuthService, Role, SessionUser, UserExistsError, ValidationError
-from app.camera import Camera, CameraService, Direction
+from app.camera import Camera, CameraService, CameraStatus, Direction
 from app.config import ConfigError, update_plate_roi
 from app.ocr_models import OcrModelError, collect_model_diagnostics, select_ocr_backend
 from app.plate_recognition import PlateRecognitionService
@@ -120,22 +124,34 @@ class CameraSettingsWidget(QWidget):
         self.user = user
         self.recognition_service = recognition_service
         self._editors: dict[int, tuple[QLineEdit, QLineEdit, QComboBox, QCheckBox]] = {}
+        self._camera_buttons: dict[int, tuple[QPushButton, QPushButton]] = {}
         self._camera_layout: QVBoxLayout
         self._build_ui()
         self.diagnostics_ready.connect(self._show_diagnostics)
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.content_widget = QWidget()
+        layout = QVBoxLayout(self.content_widget)
         layout.setContentsMargins(24, 22, 24, 22)
         layout.setSpacing(14)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         layout.addWidget(QLabel("Kamera Ayarları", objectName="pageTitle"))
-        layout.addWidget(
-            QLabel(
-                "RTSP bilgileri yerel veritabanında saklanır. Credential koruması sonraki aşamadadır.",
-                objectName="mutedLabel",
-            )
+        description = QLabel(
+            "Webcam index, RTSP URL veya video dosyası kaynağı yerel veritabanında saklanır. "
+            "Kamera credential koruması sonraki aşamadadır.",
+            objectName="mutedLabel",
         )
+        description.setWordWrap(True)
+        layout.addWidget(description)
         self._camera_layout = QVBoxLayout()
+        self._camera_layout.setSpacing(14)
         layout.addLayout(self._camera_layout)
         diagnostics_group = QGroupBox("OCR Tanılama")
         diagnostics_layout = QVBoxLayout(diagnostics_group)
@@ -147,6 +163,8 @@ class CameraSettingsWidget(QWidget):
         diagnostics_layout.addWidget(diagnostics_button)
         layout.addWidget(diagnostics_group)
         layout.addStretch()
+        self.scroll_area.setWidget(self.content_widget)
+        root_layout.addWidget(self.scroll_area)
 
     def refresh(self) -> None:
         while self._camera_layout.count():
@@ -155,15 +173,22 @@ class CameraSettingsWidget(QWidget):
             if widget is not None:
                 widget.deleteLater()
         self._editors.clear()
+        self._camera_buttons.clear()
         for camera in self.camera_service.list_cameras():
             self._add_camera_editor(camera)
 
     def _add_camera_editor(self, camera: Camera) -> None:
         group = QGroupBox(f"Kamera #{camera.id}")
+        group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         form = QFormLayout(group)
+        form.setContentsMargins(14, 18, 14, 14)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(9)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         name_input = QLineEdit(camera.name)
         url_input = QLineEdit(camera.stream_url)
-        url_input.setPlaceholderText("rtsp://...")
+        url_input.setPlaceholderText("RTSP URL, video dosyası veya webcam index (örn. 0)")
         direction_input = QComboBox()
         direction_input.addItem("Giriş", Direction.ENTRY)
         direction_input.addItem("Çıkış", Direction.EXIT)
@@ -171,24 +196,31 @@ class CameraSettingsWidget(QWidget):
         enabled_input = QCheckBox("Aktif")
         enabled_input.setChecked(camera.enabled)
         save_button = QPushButton("Kaydet")
+        save_button.setMinimumHeight(36)
+        save_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         save_button.clicked.connect(partial(self._save_camera, camera.id))
         roi_button = QPushButton("Plaka Alanını Kalibre Et")
+        roi_button.setMinimumHeight(36)
+        roi_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         roi_button.setEnabled(self.recognition_service is not None)
         roi_button.clicked.connect(partial(self._calibrate_roi, camera.id))
         form.addRow("Ad", name_input)
-        form.addRow("RTSP URL", url_input)
+        form.addRow("Kamera Kaynağı", url_input)
         form.addRow("Yön", direction_input)
         form.addRow("Durum", enabled_input)
         form.addRow("", save_button)
         form.addRow("", roi_button)
         self._camera_layout.addWidget(group)
         self._editors[camera.id] = (name_input, url_input, direction_input, enabled_input)
+        self._camera_buttons[camera.id] = (save_button, roi_button)
 
     def _save_camera(self, camera_id: int) -> None:
         name, url, direction, enabled = self._editors[camera_id]
         try:
             normalized_direction = Direction(direction.currentData())
-            self.camera_service.update_camera(
+            previous = self.camera_service.get_camera(camera_id)
+            was_running = self.camera_service.is_camera_running(camera_id)
+            updated = self.camera_service.update_camera(
                 self.user,
                 camera_id,
                 name.text(),
@@ -196,14 +228,31 @@ class CameraSettingsWidget(QWidget):
                 normalized_direction,
                 enabled.isChecked(),
             )
-        except (TypeError, ValueError, ValidationError, PermissionError) as exc:
+            restart_required = previous.direction is not updated.direction
+            if was_running:
+                stop_status = self.camera_service.stop_camera(camera_id)
+                if stop_status is CameraStatus.ERROR:
+                    raise RuntimeError("Kamera güvenli şekilde durdurulamadı.")
+            if (
+                not restart_required
+                and updated.enabled
+                and updated.stream_url
+            ):
+                self.camera_service.start_camera(camera_id)
+        except (TypeError, ValueError, ValidationError, PermissionError, RuntimeError) as exc:
             QMessageBox.warning(self, "Kamera kaydedilemedi", str(exc))
             return
+        if restart_required:
+            message = (
+                "Kamera ayarları kaydedildi. Yön değişikliğinin OCR akışına güvenli uygulanması "
+                "için Dashboard oturumunu yeniden açın."
+            )
+        else:
+            message = "Kamera ayarları kaydedildi ve canlı akışa uygulandı."
         QMessageBox.information(
             self,
             "Başarılı",
-            "Kamera ayarları kaydedildi. Değişikliğin canlı akışa uygulanması için "
-            "Dashboard oturumunu yeniden açın.",
+            message,
         )
 
     def _calibrate_roi(self, camera_id: int) -> None:

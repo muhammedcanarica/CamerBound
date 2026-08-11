@@ -229,6 +229,11 @@ class CameraService(QObject):
         with self._lock:
             return self._statuses.get(camera_id, CameraStatus.STOPPED)
 
+    def is_camera_running(self, camera_id: int) -> bool:
+        self.get_camera(camera_id)
+        with self._lock:
+            return camera_id in self._runtimes
+
     def get_latest_frame(self, camera_id: int) -> object | None:
         """Return a safe snapshot of the latest delivered camera frame."""
         self.get_camera(camera_id)
