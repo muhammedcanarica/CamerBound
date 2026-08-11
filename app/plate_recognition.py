@@ -22,6 +22,7 @@ from app.ocr_models import (
     OcrBackend,
     OcrModelError,
     OcrModelNotFound,
+    read_model_name,
     select_ocr_backend,
 )
 from app.plate_service import (
@@ -98,7 +99,9 @@ class PaddleOcrProvider:
             pipeline_factory = PaddleOCR
 
         options = {
+            "text_detection_model_name": read_model_name(detection_dir),
             "text_detection_model_dir": str(detection_dir),
+            "text_recognition_model_name": read_model_name(recognition_dir),
             "text_recognition_model_dir": str(recognition_dir),
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
@@ -108,6 +111,10 @@ class PaddleOcrProvider:
         }
         if self.backend is OcrBackend.ONNX:
             options["engine"] = "onnxruntime"
+        else:
+            # The current Windows Paddle dev build fails in oneDNN/PIR for these
+            # official PP-OCRv5 models; the regular CPU executor is compatible.
+            options["enable_mkldnn"] = False
         self._pipeline = pipeline_factory(**options)
 
     def recognize(self, images: Sequence[np.ndarray]) -> list[OcrSegment]:

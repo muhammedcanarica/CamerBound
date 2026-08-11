@@ -129,6 +129,7 @@ class OcrBackendTests(unittest.TestCase):
         self.assertEqual(os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"], "True")
         self.assertEqual(pipelines[0].options["device"], "cpu")
         self.assertFalse(pipelines[0].options["enable_hpi"])
+        self.assertFalse(pipelines[0].options["enable_mkldnn"])
         self.assertNotIn("engine", pipelines[0].options)
         self.assertEqual(
             Path(pipelines[0].options["text_detection_model_dir"]),
@@ -138,7 +139,14 @@ class OcrBackendTests(unittest.TestCase):
             Path(pipelines[0].options["text_recognition_model_dir"]),
             (paddle_root / "recognition").resolve(),
         )
-        self.assertNotIn("model_name", pipelines[0].options)
+        self.assertEqual(
+            pipelines[0].options["text_detection_model_name"],
+            "fake",
+        )
+        self.assertEqual(
+            pipelines[0].options["text_recognition_model_name"],
+            "fake",
+        )
         self.assertTrue(all(isinstance(segment, OcrSegment) for segment in segments))
         self.assertEqual(segments[0].text, "34ABC123")
 
@@ -166,6 +174,7 @@ class OcrBackendTests(unittest.TestCase):
         self.assertIs(provider.backend, OcrBackend.ONNX)
         self.assertEqual(pipelines[0].options["engine"], "onnxruntime")
         self.assertFalse(pipelines[0].options["enable_hpi"])
+        self.assertNotIn("enable_mkldnn", pipelines[0].options)
 
 
 def _write_config(directory: Path) -> None:

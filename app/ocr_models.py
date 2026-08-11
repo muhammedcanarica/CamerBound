@@ -153,6 +153,22 @@ def validate_model_directory(
     )
 
 
+def read_model_name(directory: Path) -> str:
+    config_path = directory.resolve() / "inference.yml"
+    try:
+        import yaml
+
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        model_name = config["Global"]["model_name"]
+    except Exception as exc:
+        raise OcrModelInvalid(
+            f"Model adı inference.yml dosyasından okunamadı: {config_path}: {exc}"
+        ) from exc
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise OcrModelInvalid(f"Model adı boş veya geçersiz: {config_path}")
+    return model_name.strip()
+
+
 def validate_ocr_models(
     model_root: Path,
     *,
