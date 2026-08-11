@@ -27,6 +27,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.application = QApplication.instance() or QApplication([])
+        cls.application.setStyleSheet(APP_STYLESHEET)
 
     def setUp(self) -> None:
         self.temp_directory = tempfile.TemporaryDirectory()
@@ -139,6 +140,14 @@ class LoginFlowSmokeTest(unittest.TestCase):
             QFrame.Shape.NoFrame,
         )
         self.assertIs(camera_settings.scroll_area.widget(), camera_settings.content_widget)
+        self.assertEqual(
+            camera_settings.scroll_area.viewport().grab().toImage().pixelColor(1, 1).name(),
+            "#f4f7fb",
+        )
+        self.assertEqual(
+            camera_settings.content_widget.grab().toImage().pixelColor(1, 1).name(),
+            "#f4f7fb",
+        )
         self.assertEqual(len(camera_settings._camera_buttons), 2)
         for save_button, roi_button in camera_settings._camera_buttons.values():
             self.assertGreaterEqual(save_button.minimumHeight(), 36)

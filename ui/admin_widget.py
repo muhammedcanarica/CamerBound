@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import partial
 import threading
 
-from PySide6.QtCore import Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot
 
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -135,9 +135,14 @@ class CameraSettingsWidget(QWidget):
         root_layout.setSpacing(0)
 
         self.scroll_area = QScrollArea()
+        self.scroll_area.setObjectName("cameraSettingsScroll")
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         self.content_widget = QWidget()
+        self.content_widget.setObjectName("cameraSettingsContent")
+        self.scroll_area.viewport().setObjectName("cameraSettingsViewport")
+        for background_widget in (self.scroll_area.viewport(), self.content_widget):
+            background_widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QVBoxLayout(self.content_widget)
         layout.setContentsMargins(24, 22, 24, 22)
         layout.setSpacing(14)

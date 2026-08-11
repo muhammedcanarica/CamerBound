@@ -7,6 +7,9 @@ QWidget {
 QMainWindow, QWidget#appRoot, QWidget#loginRoot {
     background: #f4f7fb;
 }
+QWidget#cameraSettingsViewport, QWidget#cameraSettingsContent {
+    background: #f4f7fb;
+}
 QFrame#loginCard, QFrame#contentCard, QFrame#cameraCard, QGroupBox {
     background: white;
     border: 1px solid #dce3ee;
