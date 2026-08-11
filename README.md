@@ -159,6 +159,33 @@ python scripts/test_pipeline.py "C:\test-data\plates" --direction ENTRY --sample
 
 Çıktı; frame/OCR denemesi, aday, onaylanan kayıt, duplicate ve ortalama inference sürelerini içerir. Runtime logları dönen dosyalar halinde `data/logs/app.log` konumuna yazılır; plaka metni loglanmaz.
 
+## Şu anda OCR'ı çalıştırmak için
+
+OCR model dosyaları repository içinde bulunmaz; geliştirme ortamında ayrıca hazırlanmalıdır.
+
+1. `models/ocr/detection/` ve `models/ocr/recognition/` klasörlerine ilgili `inference.onnx` ve `inference.yml` dosyalarını yerleştirin veya yukarıdaki `setup_ocr_models.py` akışını kullanın.
+2. Hazırlığı doğrulayın:
+
+   ```powershell
+   python scripts/verify_ocr_models.py
+   ```
+
+3. Bir plaka görseliyle lokal OCR'ı deneyin:
+
+   ```powershell
+   python scripts/test_plate_ocr.py "C:\test-data\plate.jpg" --direction ENTRY
+   ```
+
+4. Uygulamayı başlatın:
+
+   ```powershell
+   python main.py
+   ```
+
+5. Dashboard kamera kartlarında `OCR: Aktif` durumunu kontrol edin.
+
+`verify_ocr_models.py` model yoksa exit code `1` ve `OCR status: NOT READY`; modeller ve runtime hazırsa exit code `0` ve `OCR status: READY` döndürür. Production runtime internetten model indirmez.
+
 ## Kamera Testi
 
 RTSP kamera ile test etmek için:

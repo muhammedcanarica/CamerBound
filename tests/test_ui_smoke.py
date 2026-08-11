@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QSizePolicy
 
 from app.auth import AuthService
 from app.camera import CameraService
@@ -65,9 +65,23 @@ class LoginFlowSmokeTest(unittest.TestCase):
 
         dashboard = self.controller.dashboard_window
         self.assertIsNotNone(dashboard)
+        dashboard.resize(1280, 720)
+        self.application.processEvents()
         self.assertTrue(dashboard.isVisible())
         self.assertEqual(dashboard.user.username, "admin")
         self.assertEqual(dashboard.stack.count(), 5)
+        self.assertTrue(dashboard.dashboard_home.recent_table.isVisible())
+        for card in dashboard.dashboard_home.camera_cards.values():
+            self.assertGreaterEqual(card.preview.minimumHeight(), 280)
+            self.assertGreaterEqual(card.preview.height(), 280)
+            self.assertEqual(
+                card.preview.sizePolicy().horizontalPolicy(),
+                QSizePolicy.Policy.Expanding,
+            )
+            self.assertEqual(
+                card.preview.sizePolicy().verticalPolicy(),
+                QSizePolicy.Policy.Expanding,
+            )
 
         for _ in range(100):
             self.application.processEvents()

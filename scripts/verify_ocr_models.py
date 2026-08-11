@@ -12,7 +12,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.ocr_models import collect_model_diagnostics
+from app.ocr_models import (
+    OcrModelError,
+    OcrModelNotFound,
+    validate_model_directory,
+    validate_ocr_models,
+)
 from app.plate_recognition import PaddleOcrProvider
 
 
@@ -23,47 +28,83 @@ EXPECTED = {
 }
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="OCR sürümlerini, modellerini ve provider'ı doğrular.")
-    parser.add_argument("--model-root", type=Path, default=PROJECT_ROOT / "models" / "ocr")
-    args = parser.parse_args()
-    failed = False
+def verify_ocr_setup(model_root: Path, provider_factory=None) -> tuple[int, list[str]]:
+    """Return a short, stable readiness report without downloading models."""
+    model_root = model_root.resolve()
+    lines: list[str] = []
+    models_ready = True
 
-    print("Runtime sürümleri")
-    for package, expected in EXPECTED.items():
+    for folder, label in (("detection", "Detection"), ("recognition", "Recognition")):
         try:
-            actual = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError:
-            actual = "YÜKLÜ DEĞİL"
-        ok = actual == expected
-        failed |= not ok
-        print(f"  [{'OK' if ok else 'HATA'}] {package}: {actual} (beklenen {expected})")
-
-    print("Model dosyaları ve ONNX Runtime")
-    checks = collect_model_diagnostics(args.model_root.resolve(), load_onnx=True)
-    for check in checks:
-        failed |= not check.ok
-        provider_text = f" providers={','.join(check.providers)}" if check.providers else ""
-        print(f"  [{'OK' if check.ok else 'HATA'}] {check.name}: {check.message}{provider_text}")
-
-    if not failed:
-        print("PaddleOCR provider başlatılıyor...")
-        try:
-            provider = PaddleOcrProvider(args.model_root.resolve())
-            smoke_result = provider.recognize(
-                [np.zeros((64, 256, 3), dtype=np.uint8)]
-            )
-        except Exception as exc:
-            failed = True
-            print(f"  [HATA] Provider başlatılamadı: {exc}")
+            validate_model_directory(model_root / folder, label, load_onnx=False)
+        except OcrModelNotFound:
+            status = "MISSING"
+            models_ready = False
+        except OcrModelError:
+            status = "INVALID"
+            models_ready = False
         else:
-            print(
-                "  [OK] Provider ONNX Runtime CPU ile başlatıldı ve predict çalıştı "
-                f"(segment={len(smoke_result)})."
-            )
+            status = "OK"
+        lines.append(f"{label} model: {status}")
 
-    print("SONUÇ: " + ("BAŞARISIZ" if failed else "BAŞARILI"))
-    return 1 if failed else 0
+    if not models_ready:
+        lines.append("OCR status: NOT READY")
+        return 1, lines
+
+    versions_ready = all(
+        _installed_version(package) == expected
+        for package, expected in EXPECTED.items()
+    )
+    if not versions_ready:
+        lines.extend(
+            (
+                "ONNX Runtime: ERROR",
+                "PaddleOCR provider: ERROR",
+                "OCR status: NOT READY",
+            )
+        )
+        return 1, lines
+
+    try:
+        validate_ocr_models(model_root, load_onnx=True)
+    except OcrModelError:
+        lines.extend(("ONNX Runtime: ERROR", "OCR status: NOT READY"))
+        return 1, lines
+    lines.append("ONNX Runtime: OK")
+
+    factory = provider_factory or PaddleOcrProvider
+    try:
+        provider = factory(model_root)
+        provider.recognize([np.zeros((64, 256, 3), dtype=np.uint8)])
+    except Exception:
+        lines.extend(("PaddleOCR provider: ERROR", "OCR status: NOT READY"))
+        return 1, lines
+
+    lines.extend(("PaddleOCR provider: OK", "OCR status: READY"))
+    return 0, lines
+
+
+def _installed_version(package: str) -> str | None:
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Lokal OCR modellerinin kullanıma hazır olup olmadığını doğrular."
+    )
+    parser.add_argument(
+        "--model-root",
+        type=Path,
+        default=PROJECT_ROOT / "models" / "ocr",
+    )
+    args = parser.parse_args()
+
+    exit_code, lines = verify_ocr_setup(args.model_root)
+    print("\n".join(lines))
+    return exit_code
 
 
 if __name__ == "__main__":

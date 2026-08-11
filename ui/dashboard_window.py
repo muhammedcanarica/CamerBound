@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -73,8 +74,8 @@ class DashboardHome(QWidget):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 22)
-        layout.setSpacing(16)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(10)
 
         header = QHBoxLayout()
         header.addWidget(QLabel("Dashboard", objectName="pageTitle"))
@@ -88,7 +89,7 @@ class DashboardHome(QWidget):
         camera_layout.setSpacing(16)
         camera_layout.addWidget(self._camera_card(Direction.ENTRY), 1)
         camera_layout.addWidget(self._camera_card(Direction.EXIT), 1)
-        layout.addLayout(camera_layout, 2)
+        layout.addLayout(camera_layout, 7)
 
         layout.addWidget(QLabel("Son Hareketler", objectName="sectionTitle"))
         self.recent_table = QTableWidget()
@@ -96,19 +97,33 @@ class DashboardHome(QWidget):
             self.recent_table,
             ["Plaka", "İşlem", "Kamera", "Güven", "Tarih / Saat"],
         )
+        self.recent_table.setMinimumHeight(120)
+        self.recent_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         layout.addWidget(self.recent_table, 3)
 
     def _camera_card(self, direction: Direction) -> QFrame:
         card = QFrame(objectName="cameraCard")
+        card.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(18, 16, 18, 16)
-        card_layout.setSpacing(9)
+        card_layout.setContentsMargins(14, 12, 14, 12)
+        card_layout.setSpacing(5)
         title_text = "GİRİŞ KAMERASI" if direction is Direction.ENTRY else "ÇIKIŞ KAMERASI"
         card_layout.addWidget(QLabel(title_text, objectName="sectionTitle"))
 
         preview = QLabel("Kamera görüntüsü\nRTSP entegrasyonu bekleniyor")
         preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview.setMinimumHeight(150)
+        preview.setMinimumHeight(290)
+        preview.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        preview.setScaledContents(False)
         preview.setStyleSheet(
             "background:#111827; color:#94a3b8; border-radius:7px; font-size:14px;"
         )
