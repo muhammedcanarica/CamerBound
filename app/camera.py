@@ -43,6 +43,7 @@ class CameraService(QObject):
 
     frame_ready = Signal(int, object)
     status_changed = Signal(int, object, str)
+    _frame_available = Signal(int)
     STOP_TIMEOUT_MS = 5_000
 
     def __init__(
@@ -59,7 +60,13 @@ class CameraService(QObject):
         self.preview_fps = preview_fps
         self._statuses: dict[int, CameraStatus] = {}
         self._runtimes: dict[int, _CameraRuntime] = {}
+        self._latest_frames: dict[int, object] = {}
+        self._frame_notifications_pending: set[int] = set()
         self._lock = RLock()
+        self._frame_available.connect(
+            self._flush_latest_frame,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
     def list_cameras(self) -> list[Camera]:
         with self.database.connection() as connection:
@@ -129,7 +136,10 @@ class CameraService(QObject):
             self._runtimes[camera_id] = runtime
 
             thread.started.connect(worker.run)
-            worker.frame_ready.connect(self._on_frame_ready)
+            worker.frame_ready.connect(
+                self._on_frame_ready,
+                Qt.ConnectionType.DirectConnection,
+            )
             worker.status_changed.connect(self._on_worker_status_changed)
             worker.finished.connect(
                 thread.quit,
@@ -170,6 +180,7 @@ class CameraService(QObject):
             current = self._runtimes.get(camera_id)
             if current is runtime:
                 self._runtimes.pop(camera_id, None)
+            self._discard_frame(camera_id)
         self._set_status(camera_id, CameraStatus.STOPPED, "Kamera durduruldu.")
         return CameraStatus.STOPPED
 
@@ -186,6 +197,7 @@ class CameraService(QObject):
                     current = self._runtimes.get(camera_id)
                     if current is runtime:
                         self._runtimes.pop(camera_id, None)
+                    self._discard_frame(camera_id)
                 self._set_status(camera_id, CameraStatus.STOPPED, "Kamera durduruldu.")
             else:
                 self._set_status(
@@ -202,10 +214,24 @@ class CameraService(QObject):
     @Slot(int, object)
     def _on_frame_ready(self, camera_id: int, frame: object) -> None:
         with self._lock:
-            runtime = self._runtimes.get(camera_id)
-            if runtime is None or runtime.worker is not self.sender():
+            if camera_id not in self._runtimes:
                 return
-        self.frame_ready.emit(camera_id, frame)
+            self._latest_frames[camera_id] = frame
+            if camera_id in self._frame_notifications_pending:
+                return
+            self._frame_notifications_pending.add(camera_id)
+        self._frame_available.emit(camera_id)
+
+    @Slot(int)
+    def _flush_latest_frame(self, camera_id: int) -> None:
+        with self._lock:
+            self._frame_notifications_pending.discard(camera_id)
+            if camera_id not in self._runtimes:
+                self._latest_frames.pop(camera_id, None)
+                return
+            frame = self._latest_frames.pop(camera_id, None)
+        if frame is not None:
+            self.frame_ready.emit(camera_id, frame)
 
     @Slot(int, object, str)
     def _on_worker_status_changed(
@@ -234,6 +260,7 @@ class CameraService(QObject):
                     break
             if finished_camera_id is not None:
                 self._runtimes.pop(finished_camera_id, None)
+                self._discard_frame(finished_camera_id)
 
         if finished_camera_id is not None:
             self._set_status(
@@ -246,6 +273,10 @@ class CameraService(QObject):
         with self._lock:
             self._statuses[camera_id] = status
         self.status_changed.emit(camera_id, status, message)
+
+    def _discard_frame(self, camera_id: int) -> None:
+        self._latest_frames.pop(camera_id, None)
+        self._frame_notifications_pending.discard(camera_id)
 
     @staticmethod
     def _capture_source(stream_url: str) -> str | int:

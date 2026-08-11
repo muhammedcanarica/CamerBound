@@ -34,13 +34,27 @@ CaptureFactory = Callable[[CaptureSource], VideoCaptureLike]
 def create_video_capture(source: CaptureSource) -> VideoCaptureLike:
     """Create an OpenCV capture with bounded network timeouts where supported."""
     capture = cv2.VideoCapture()
-    timeout_properties = (
-        (getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None), 2_000),
-        (getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None), 2_000),
-    )
-    for property_id, timeout_ms in timeout_properties:
-        if property_id is not None:
-            capture.set(property_id, timeout_ms)
+    is_network_source = isinstance(source, str) and "://" in source
+    timeout_parameters: list[int] = []
+    if is_network_source:
+        for property_name in (
+            "CAP_PROP_OPEN_TIMEOUT_MSEC",
+            "CAP_PROP_READ_TIMEOUT_MSEC",
+        ):
+            property_id = getattr(cv2, property_name, None)
+            if property_id is not None:
+                timeout_parameters.extend((property_id, 2_000))
+
+    if timeout_parameters:
+        try:
+            # FFmpeg timeout properties are open-only and must be supplied here.
+            capture.open(source, cv2.CAP_ANY, timeout_parameters)
+            return capture
+        except (TypeError, cv2.error):
+            # Older/different backends may not support the params overload.
+            capture.release()
+            capture = cv2.VideoCapture()
+
     capture.open(source)
     return capture
 

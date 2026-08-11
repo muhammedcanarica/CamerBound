@@ -1,15 +1,16 @@
 # Plaka Takip Sistemi
 
-Şirket içindeki güvenlik bilgisayarında tamamen yerel çalışacak Windows masaüstü plaka takip uygulamasının ilk sürümüdür. Bu sürüm; kullanıcı oturumu, rol tabanlı yetkilendirme, kamera yapılandırması ve plaka kayıt altyapısını sağlar. İnternet veya bulut servisi kullanmaz.
+Şirket içindeki güvenlik bilgisayarında tamamen yerel çalışacak Windows masaüstü plaka takip uygulamasının ilk sürümüdür. Bu sürüm; kullanıcı oturumu, rol tabanlı yetkilendirme, canlı kamera önizlemesi ve plaka kayıt altyapısını sağlar. İnternet veya bulut servisi kullanmaz.
 
-> **Önemli:** Bu aşamada gerçek RTSP bağlantısı, OpenCV görüntü işleme, OCR/ONNX veya plaka tanıma modeli yoktur. Kamera alanları sonraki entegrasyon için hazırlanmıştır.
+> **Önemli:** Bu aşamada RTSP/local video/webcam görüntüsü yalnızca Dashboard önizlemesi için kullanılır. OCR, YOLO, ONNX veya plaka tanıma modeli henüz yoktur.
 
 ## Özellikler
 
 - bcrypt ile hashlenen şifreler ve SQLite kullanıcı verisi
 - `ADMIN` ve `USER` rolleri
 - Login → Dashboard akışı
-- Giriş/çıkış kamera kartları ve son hareketler
+- Giriş/çıkış kamera kartlarında OpenCV tabanlı canlı önizleme ve bağlantı durumu
+- Kamera başına ayrı worker thread, sınırlı önizleme FPS'i ve otomatik yeniden bağlanma
 - Plaka ve yön bazlı kayıt arama
 - Son hareketi `ENTRY` olan araçlardan hesaplanan “İçerideki Araçlar” ekranı
 - ADMIN için kullanıcı oluşturma ve iki kamerayı yapılandırma
@@ -22,8 +23,7 @@
 - Python 3.12
 - PySide6
 - bcrypt
-
-OpenCV bu sürümde kullanılmadığı için minimum dependency listesine henüz eklenmemiştir.
+- OpenCV (`opencv-python`)
 
 ## Kurulum
 
@@ -61,6 +61,23 @@ python -m unittest discover -v
 
 UI testi Qt'yi `offscreen` platformunda açar, login formundaki butona tıklar ve ADMIN dashboard’unun oluştuğunu kontrol eder.
 
+## Kamera Testi
+
+RTSP kamera ile test etmek için:
+
+1. Uygulamaya `ADMIN` hesabıyla giriş yapın.
+2. Sol menüden **Ayarlar** sayfasını açın.
+3. Giriş ve/veya çıkış kamerasının URL alanına kameranın RTSP adresini girin. Örnek biçim: `rtsp://username:password@camera-ip:554/path`
+4. Kamerayı **Aktif** olarak işaretleyip kaydedin.
+5. Kamera ayarının çalışan akışa uygulanması için çıkış yapıp yeniden giriş yapın.
+6. Dashboard'a dönerek doğru yön kartında canlı görüntüyü ve bağlantı durumunu kontrol edin.
+
+Gerçek kamera olmadan aynı pipeline'ı yerel bir video ile test edebilirsiniz. Büyük video dosyasını repository'ye commit etmeden örneğin `test-data/car-video.mp4` konumuna kopyalayın ve Ayarlar ekranındaki URL alanına bu relative yolu girin. Absolute bir video yolu da kullanılabilir. Video bittiğinde worker kısa bir beklemeden sonra kaynağı yeniden açar.
+
+Webcam testi için URL alanına cihaz indeksini (`0`, gerekirse `1`) yazabilirsiniz.
+
+RTSP kullanıcı adı ve parolasını kaynak koda veya repository'ye eklemeyin. Mevcut sürüm `stream_url` değerini yerel SQLite veritabanında düz metin saklar; production öncesinde credential şifreleme eklenmelidir.
+
 ## Klasör yapısı
 
 ```text
@@ -71,6 +88,7 @@ CamerBound/
 ├── app/
 │   ├── auth.py
 │   ├── camera.py
+│   ├── camera_worker.py
 │   ├── config.py
 │   ├── database.py
 │   └── plate_service.py
@@ -86,6 +104,7 @@ CamerBound/
 │   └── plate_tracker.db       # İlk çalıştırmada oluşur
 ├── models/                    # Gelecekteki yerel OCR/ONNX modeli
 └── tests/
+    ├── test_camera_service.py
     ├── test_services.py
     └── test_ui_smoke.py
 ```
@@ -94,7 +113,8 @@ CamerBound/
 
 - `app/database.py`: SQLite bağlantısı, transaction yönetimi, şema ve başlangıç kamera kayıtları.
 - `app/auth.py`: Parola hashleme, login, oturum modeli, kullanıcı oluşturma ve rol kontrolleri.
-- `app/camera.py`: Kamera ayarları ve gelecekteki `VideoCapture` yaşam döngüsünün servis sınırı.
+- `app/camera.py`: Kamera ayarları, worker/thread referansları ve capture yaşam döngüsünün servis sınırı.
+- `app/camera_worker.py`: OpenCV kaynağını UI thread'i dışında okur, önizleme FPS'ini sınırlar ve kesintide yeniden bağlanır.
 - `app/plate_service.py`: Kayıt ekleme, arama, son kayıtlar ve içerideki araç sorgusu.
 - `ui/`: Servisleri kullanan PySide6 ekranları; doğrudan SQL çalıştırmaz.
 - `app/config.py`: `settings.json` okur ve relative yolları uygulama köküne göre çözer.
@@ -102,12 +122,10 @@ CamerBound/
 ## Sonraki geliştirme adımları
 
 1. Varsayılan admin parolasını değiştirme ekranı eklemek.
-2. `app/camera.py` içindeki `start_camera` / `stop_camera` sınırına OpenCV `VideoCapture` ve worker thread eklemek.
-3. Kamera karelerini Qt sinyalleriyle dashboard kartlarına taşımak.
-4. `models/` altına lokal OCR/ONNX modeli ve ayrı tanıma servisi eklemek.
-5. `app/plate_service.py` içindeki TODO noktasında kamera/plaka debounce uygulamak.
-6. RTSP credential verisini şifreli saklamak.
-7. PyInstaller yapılandırması ve temiz bir Windows makinede paket testi yapmak.
+2. `models/` altına lokal OCR/ONNX modeli ve ayrı tanıma servisi eklemek.
+3. `app/plate_service.py` içindeki TODO noktasında kamera/plaka debounce uygulamak.
+4. RTSP credential verisini şifreli saklamak.
+5. PyInstaller yapılandırması ve temiz bir Windows makinede paket testi yapmak.
 
 ## Ayarlar
 

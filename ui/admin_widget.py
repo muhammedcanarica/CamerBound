@@ -165,4 +165,9 @@ class CameraSettingsWidget(QWidget):
         except (ValidationError, PermissionError) as exc:
             QMessageBox.warning(self, "Kamera kaydedilemedi", str(exc))
             return
-        QMessageBox.information(self, "Başarılı", "Kamera ayarları kaydedildi.")
+        QMessageBox.information(
+            self,
+            "Başarılı",
+            "Kamera ayarları kaydedildi. Değişikliğin canlı akışa uygulanması için "
+            "Dashboard oturumunu yeniden açın.",
+        )

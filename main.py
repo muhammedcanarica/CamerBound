@@ -81,6 +81,7 @@ def main() -> int:
         return 1
 
     controller = ApplicationController(*services)
+    application.aboutToQuit.connect(services[2].stop_all)
     controller.show_login()
     return application.exec()
 
