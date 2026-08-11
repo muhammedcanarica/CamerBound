@@ -154,6 +154,8 @@ class OcrBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             onnx_root = root / "onnx"
+            _write_config(onnx_root / "detection")
+            _write_config(onnx_root / "recognition")
             pipelines: list[_FakePipeline] = []
 
             def factory(**options):

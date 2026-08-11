@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,10 +36,14 @@ class LoginFlowSmokeTest(unittest.TestCase):
         auth_service.ensure_default_admin()
         plate_service = PlateService(database, duplicate_cooldown_seconds=10)
         camera_service = CameraService(database)
+        recognition_config = replace(
+            load_config().plate_recognition,
+            model_root=Path(self.temp_directory.name) / "missing-ocr-models",
+        )
         recognition_service = PlateRecognitionService(
             camera_service,
             plate_service,
-            load_config().plate_recognition,
+            recognition_config,
         )
         self.controller = ApplicationController(
             auth_service,

@@ -283,6 +283,7 @@ def prepare_default_models(
                 )
             )
 
+        _write_gitkeep_files(staging_backend_root)
         write_model_metadata(staging_backend_root, selected_backend)
         exit_code, verification_lines = verifier(
             staging_root,
@@ -314,6 +315,13 @@ def install_paddle_models(sources: dict[str, Path], model_root: Path) -> None:
             source_file = source / filename
             if source_file.is_file():
                 shutil.copy2(source_file, target / filename)
+
+
+def _write_gitkeep_files(model_root: Path) -> None:
+    for folder in ("detection", "recognition"):
+        directory = model_root / folder
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / ".gitkeep").touch()
 
 
 def _remove_tree(path: Path, allowed_root: Path) -> None:
