@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from app.auth import (
     AuthService,
@@ -17,6 +18,8 @@ from app.camera import CameraService, Direction
 from app.database import Database
 from app.plate_service import PlateService
 from app.plate_service import DuplicatePlateDetection
+from app.time_utils import to_utc_storage
+from main import apply_startup_retention_cleanup
 
 
 class ServiceTests(unittest.TestCase):
@@ -33,6 +36,19 @@ class ServiceTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_directory.cleanup()
+
+    def _insert_record(self, plate: str, timestamp: str) -> int:
+        camera = self.camera_service.list_cameras()[0]
+        with self.database.connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO plate_records
+                    (plate, direction, camera_id, confidence, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (plate, camera.direction.value, camera.id, 0.90, timestamp),
+            )
+            return int(cursor.lastrowid)
 
     def test_default_admin_authentication(self) -> None:
         self.assertEqual(self.admin.role, Role.ADMIN)
@@ -235,6 +251,133 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(created_at, "2026-08-11T10:00:00+00:00")
         self.assertEqual(timestamps["34LEGACY"], "2026-08-11T10:00:00+00:00")
         self.assertEqual(timestamps["34INVALID"], "legacy-value")
+
+    def test_user_cannot_delete_or_read_admin_record_stats(self) -> None:
+        user = self.auth_service.create_user(
+            self.admin, "retention-user", "safe-pass-123", Role.USER
+        )
+        self._insert_record("34KEEP01", "2026-01-01T00:00:00+00:00")
+
+        with self.assertRaises(AuthorizationError):
+            self.plate_service.delete_records_older_than(user, 90)
+        with self.assertRaises(AuthorizationError):
+            self.plate_service.delete_all_records(user)
+        with self.assertRaises(AuthorizationError):
+            self.plate_service.get_record_stats(user)
+
+        with self.database.connection() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM plate_records"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_admin_retention_cleanup_uses_exclusive_utc_cutoff(self) -> None:
+        turkey_offset = timezone(timedelta(hours=3))
+        now = datetime(2026, 8, 11, 13, 0, tzinfo=turkey_offset)
+        cutoff = now.astimezone(timezone.utc) - timedelta(days=90)
+        old_timestamp = to_utc_storage(cutoff - timedelta(seconds=1))
+        cutoff_timestamp = to_utc_storage(cutoff)
+        new_timestamp = to_utc_storage(cutoff + timedelta(seconds=1))
+        self._insert_record("34OLD01", old_timestamp)
+        self._insert_record("34EDGE1", cutoff_timestamp)
+        self._insert_record("34NEW01", new_timestamp)
+
+        deleted = self.plate_service.delete_records_older_than(
+            self.admin,
+            90,
+            now,
+        )
+
+        self.assertEqual(deleted, 1)
+        with self.database.connection() as connection:
+            remaining = {
+                row["plate"]
+                for row in connection.execute(
+                    "SELECT plate FROM plate_records"
+                ).fetchall()
+            }
+        self.assertEqual(remaining, {"34EDGE1", "34NEW01"})
+        stats = self.plate_service.get_record_stats(self.admin)
+        self.assertEqual(stats.total_records, 2)
+        self.assertEqual(stats.oldest_timestamp, cutoff_timestamp)
+
+    def test_unlimited_retention_does_not_delete_records(self) -> None:
+        self._insert_record("34FOREVER", "2020-01-01T00:00:00+00:00")
+        self.plate_service.set_record_retention_days(0)
+
+        deleted = self.plate_service.apply_retention_policy(
+            datetime(2026, 8, 11, 10, 0, tzinfo=timezone.utc)
+        )
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(
+            self.plate_service.get_record_stats(self.admin).total_records,
+            1,
+        )
+
+    def test_delete_all_only_clears_plate_records_and_returns_row_count(self) -> None:
+        self.auth_service.create_user(
+            self.admin, "preserved-user", "safe-pass-123", Role.USER
+        )
+        self._insert_record("34DELETE1", "2026-08-01T00:00:00+00:00")
+        self._insert_record("34DELETE2", "2026-08-02T00:00:00+00:00")
+        with self.database.connection() as connection:
+            users_before = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            cameras_before = connection.execute("SELECT COUNT(*) FROM cameras").fetchone()[0]
+
+        deleted = self.plate_service.delete_all_records(self.admin)
+
+        self.assertEqual(deleted, 2)
+        with self.database.connection() as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM plate_records").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+                users_before,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM cameras").fetchone()[0],
+                cameras_before,
+            )
+
+    def test_startup_retention_cleanup_runs_once_and_logs_removed_rows(self) -> None:
+        now = datetime(2026, 8, 11, 10, 0, tzinfo=timezone.utc)
+        self._insert_record(
+            "34START1",
+            to_utc_storage(now - timedelta(days=91)),
+        )
+        self._insert_record(
+            "34START2",
+            to_utc_storage(now - timedelta(days=10)),
+        )
+        with patch("app.plate_service.utc_now", return_value=now):
+            with self.assertLogs("main", level="INFO") as captured:
+                deleted = apply_startup_retention_cleanup(self.plate_service)
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual(
+            self.plate_service.get_record_stats(self.admin).total_records,
+            1,
+        )
+        self.assertTrue(
+            any("removed 1 plate records older than 90 days" in line for line in captured.output)
+        )
+
+    def test_startup_cleanup_exception_does_not_escape(self) -> None:
+        with patch.object(
+            self.plate_service,
+            "apply_retention_policy",
+            side_effect=RuntimeError("cleanup failed"),
+        ):
+            with self.assertLogs("main", level="ERROR") as captured:
+                deleted = apply_startup_retention_cleanup(self.plate_service)
+
+        self.assertEqual(deleted, 0)
+        self.assertTrue(
+            any("startup will continue" in line for line in captured.output)
+        )
 
 
 if __name__ == "__main__":

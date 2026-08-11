@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
+import sqlite3
 import threading
 
 from PySide6.QtCore import Qt, Signal, Slot
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLayout,
     QLineEdit,
@@ -28,9 +30,15 @@ from PySide6.QtWidgets import (
 
 from app.auth import AuthService, Role, SessionUser, UserExistsError, ValidationError
 from app.camera import Camera, CameraService, CameraStatus, Direction
-from app.config import ConfigError, update_plate_roi
+from app.config import (
+    ConfigError,
+    application_root,
+    update_plate_roi,
+    update_record_retention,
+)
 from app.ocr_models import OcrModelError, collect_model_diagnostics, select_ocr_backend
 from app.plate_recognition import PlateRecognitionService
+from app.plate_service import PlateService
 from ui.roi_calibration_dialog import RoiCalibrationDialog
 from ui.records_widget import display_timestamp, prepare_table
 
@@ -112,17 +120,25 @@ class UsersAdminWidget(QWidget):
 
 class CameraSettingsWidget(QWidget):
     diagnostics_ready = Signal(str)
+    records_changed = Signal()
 
     def __init__(
         self,
         camera_service: CameraService,
         user: SessionUser,
+        plate_service: PlateService,
         recognition_service: PlateRecognitionService | None = None,
     ) -> None:
         super().__init__()
         self.camera_service = camera_service
         self.user = user
+        self.plate_service = plate_service
         self.recognition_service = recognition_service
+        self.settings_path = (
+            recognition_service.settings_path
+            if recognition_service is not None
+            else application_root() / "config" / "settings.json"
+        )
         self._editors: dict[int, tuple[QLineEdit, QLineEdit, QComboBox, QCheckBox]] = {}
         self._camera_buttons: dict[int, tuple[QPushButton, QPushButton]] = {}
         self._camera_layout: QVBoxLayout
@@ -167,6 +183,47 @@ class CameraSettingsWidget(QWidget):
         diagnostics_layout.addWidget(self.diagnostics_label)
         diagnostics_layout.addWidget(diagnostics_button)
         layout.addWidget(diagnostics_group)
+        self.retention_group = QGroupBox("Veri Saklama")
+        self.retention_group.setObjectName("dataRetentionGroup")
+        retention_layout = QVBoxLayout(self.retention_group)
+        retention_form = QFormLayout()
+        self.retention_combo = QComboBox()
+        self.retention_combo.setObjectName("recordRetentionCombo")
+        for label, days in (
+            ("30 gün", 30),
+            ("90 gün", 90),
+            ("180 gün", 180),
+            ("Süresiz", 0),
+        ):
+            self.retention_combo.addItem(label, days)
+        retention_form.addRow(
+            "Plaka kayıtlarını saklama süresi:", self.retention_combo
+        )
+        retention_layout.addLayout(retention_form)
+        self.save_retention_button = QPushButton("Saklama Politikasını Kaydet")
+        self.save_retention_button.clicked.connect(self._save_retention_policy)
+        retention_layout.addWidget(self.save_retention_button)
+        self.total_records_label = QLabel("Toplam kayıt: 0")
+        self.oldest_record_label = QLabel("En eski kayıt: -")
+        retention_layout.addWidget(self.total_records_label)
+        retention_layout.addWidget(self.oldest_record_label)
+        self.cleanup_old_button = QPushButton("Eski Kayıtları Şimdi Temizle")
+        self.cleanup_old_button.setObjectName("cleanupOldRecordsButton")
+        self.cleanup_old_button.clicked.connect(self._cleanup_old_records)
+        retention_layout.addWidget(self.cleanup_old_button)
+        danger_title = QLabel("Tehlikeli Bölge")
+        danger_title.setStyleSheet("color:#b42318; font-weight:700;")
+        retention_layout.addWidget(danger_title)
+        self.delete_all_records_button = QPushButton(
+            "Tüm Plaka Kayıtlarını Temizle"
+        )
+        self.delete_all_records_button.setObjectName("deleteAllPlateRecordsButton")
+        self.delete_all_records_button.setStyleSheet(
+            "background:#b42318; border-color:#b42318; color:white;"
+        )
+        self.delete_all_records_button.clicked.connect(self._delete_all_records)
+        retention_layout.addWidget(self.delete_all_records_button)
+        layout.addWidget(self.retention_group)
         layout.addStretch()
         self.scroll_area.setWidget(self.content_widget)
         root_layout.addWidget(self.scroll_area)
@@ -181,6 +238,128 @@ class CameraSettingsWidget(QWidget):
         self._camera_buttons.clear()
         for camera in self.camera_service.list_cameras():
             self._add_camera_editor(camera)
+        self._refresh_retention()
+
+    def _refresh_retention(self) -> None:
+        index = self.retention_combo.findData(self.plate_service.record_retention_days)
+        if index >= 0:
+            self.retention_combo.setCurrentIndex(index)
+        unlimited = self.plate_service.record_retention_days == 0
+        self.cleanup_old_button.setEnabled(not unlimited)
+        self.cleanup_old_button.setToolTip(
+            "Saklama süresi Süresiz olduğu için otomatik temizlenecek kayıt yok."
+            if unlimited
+            else ""
+        )
+        try:
+            stats = self.plate_service.get_record_stats(self.user)
+        except (PermissionError, sqlite3.Error) as exc:
+            self.total_records_label.setText("Toplam kayıt: -")
+            self.oldest_record_label.setText("En eski kayıt: -")
+            self.retention_group.setToolTip(str(exc))
+            return
+        self.retention_group.setToolTip("")
+        self.total_records_label.setText(f"Toplam kayıt: {stats.total_records}")
+        oldest = (
+            display_timestamp(stats.oldest_timestamp)
+            if stats.oldest_timestamp is not None
+            else "-"
+        )
+        self.oldest_record_label.setText(f"En eski kayıt: {oldest}")
+
+    def _save_retention_policy(self) -> None:
+        try:
+            AuthService.require_admin(self.user)
+            retention_days = int(self.retention_combo.currentData())
+            updated_config = update_record_retention(
+                self.settings_path,
+                retention_days,
+            )
+            self.plate_service.set_record_retention_days(
+                updated_config.record_retention_days
+            )
+            if self.recognition_service is not None:
+                self.recognition_service.config = updated_config
+        except (ConfigError, PermissionError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "Saklama politikası kaydedilemedi", str(exc))
+            return
+
+        self._refresh_retention()
+        if retention_days == 0:
+            message = "Plaka kayıtları süresiz saklanacak."
+        else:
+            message = f"Plaka kayıtları {retention_days} gün saklanacak."
+        QMessageBox.information(self, "Başarılı", message)
+
+    def _cleanup_old_records(self) -> None:
+        retention_days = self.plate_service.record_retention_days
+        if retention_days == 0:
+            QMessageBox.information(
+                self,
+                "Temizlenecek kayıt yok",
+                "Saklama süresi Süresiz olduğu için otomatik temizlenecek kayıt yok.",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "Eski kayıtları temizle",
+            f"{retention_days} günden eski plaka kayıtları kalıcı olarak silinecek.\n\n"
+            "Devam etmek istiyor musunuz?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            deleted = self.plate_service.delete_records_older_than(self.user)
+        except (PermissionError, ValueError, sqlite3.Error) as exc:
+            QMessageBox.warning(self, "Kayıtlar temizlenemedi", str(exc))
+            return
+        self._refresh_retention()
+        self.records_changed.emit()
+        QMessageBox.information(
+            self,
+            "Temizleme tamamlandı",
+            f"{deleted} eski kayıt silindi.",
+        )
+
+    def _delete_all_records(self) -> None:
+        answer = QMessageBox.warning(
+            self,
+            "Tüm kayıtları temizle",
+            "Tüm plaka hareket kayıtları kalıcı olarak silinecek.\n"
+            "Bu işlem geri alınamaz.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Ok:
+            return
+        confirmation, accepted = QInputDialog.getText(
+            self,
+            "Onay gerekli",
+            "Devam etmek için TEMIZLE yazın:",
+        )
+        if not accepted:
+            return
+        if confirmation != "TEMIZLE":
+            QMessageBox.warning(
+                self,
+                "Onay başarısız",
+                "TEMIZLE metni tam olarak yazılmadığı için kayıtlar silinmedi.",
+            )
+            return
+        try:
+            self.plate_service.delete_all_records(self.user)
+        except (PermissionError, sqlite3.Error) as exc:
+            QMessageBox.warning(self, "Kayıtlar temizlenemedi", str(exc))
+            return
+        self._refresh_retention()
+        self.records_changed.emit()
+        QMessageBox.information(
+            self,
+            "Temizleme tamamlandı",
+            "Tüm plaka kayıtları temizlendi.",
+        )
 
     def _add_camera_editor(self, camera: Camera) -> None:
         group = QGroupBox(f"Kamera #{camera.id}")

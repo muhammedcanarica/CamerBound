@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -11,7 +12,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFrame, QScrollArea, QSizePolicy
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QGroupBox,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+)
 
 from app.auth import AuthService, Role
 from app.camera import CameraService
@@ -41,10 +50,21 @@ class LoginFlowSmokeTest(unittest.TestCase):
             load_config().plate_recognition,
             model_root=Path(self.temp_directory.name) / "missing-ocr-models",
         )
+        settings_path = Path(self.temp_directory.name) / "settings.json"
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "database_path": "ui-test.db",
+                    "plate_detection": {"record_retention_days": 90},
+                }
+            ),
+            encoding="utf-8",
+        )
         recognition_service = PlateRecognitionService(
             camera_service,
             plate_service,
             recognition_config,
+            settings_path=settings_path,
         )
         self.controller = ApplicationController(
             auth_service,
@@ -160,6 +180,79 @@ class LoginFlowSmokeTest(unittest.TestCase):
                 roi_button.sizePolicy().horizontalPolicy(),
                 QSizePolicy.Policy.Expanding,
             )
+        self.assertIsInstance(camera_settings.retention_group, QGroupBox)
+        self.assertEqual(
+            [
+                camera_settings.retention_combo.itemText(index)
+                for index in range(camera_settings.retention_combo.count())
+            ],
+            ["30 gün", "90 gün", "180 gün", "Süresiz"],
+        )
+        self.assertEqual(
+            [
+                camera_settings.retention_combo.itemData(index)
+                for index in range(camera_settings.retention_combo.count())
+            ],
+            [30, 90, 180, 0],
+        )
+        self.assertEqual(
+            camera_settings.delete_all_records_button.text(),
+            "Tüm Plaka Kayıtlarını Temizle",
+        )
+
+        camera_settings.retention_combo.setCurrentIndex(
+            camera_settings.retention_combo.findData(180)
+        )
+        with patch("ui.admin_widget.QMessageBox.information"):
+            camera_settings._save_retention_policy()
+        self.assertEqual(self.controller.plate_service.record_retention_days, 180)
+        self.assertEqual(
+            load_config(camera_settings.settings_path).plate_recognition.record_retention_days,
+            180,
+        )
+
+        self.controller.plate_service.set_record_retention_days(0)
+        camera_settings.refresh()
+        self.assertFalse(camera_settings.cleanup_old_button.isEnabled())
+        self.assertIn("Süresiz", camera_settings.cleanup_old_button.toolTip())
+
+    def test_user_dashboard_has_no_admin_retention_controls(self) -> None:
+        admin = self.controller.auth_service.authenticate("admin", "admin123")
+        user = self.controller.auth_service.create_user(
+            admin,
+            "ui-operator",
+            "safe-pass-123",
+            Role.USER,
+        )
+
+        self.controller.show_dashboard(user)
+        self.application.processEvents()
+
+        dashboard = self.controller.dashboard_window
+        self.assertEqual(dashboard.stack.count(), 3)
+        self.assertIsNone(dashboard.findChild(QGroupBox, "dataRetentionGroup"))
+        self.assertIsNone(
+            dashboard.findChild(QPushButton, "deleteAllPlateRecordsButton")
+        )
+
+    def test_delete_all_requires_exact_confirmation_text(self) -> None:
+        admin = self.controller.auth_service.authenticate("admin", "admin123")
+        self.controller.show_dashboard(admin)
+        settings_page = self.controller.dashboard_window.pages[4]
+
+        with patch.object(
+            self.controller.plate_service,
+            "delete_all_records",
+        ) as delete_all, patch(
+            "ui.admin_widget.QMessageBox.warning",
+            return_value=QMessageBox.StandardButton.Ok,
+        ), patch(
+            "ui.admin_widget.QInputDialog.getText",
+            return_value=("temizle", True),
+        ):
+            settings_page._delete_all_records()
+
+        delete_all.assert_not_called()
 
     def test_combo_box_popup_has_readable_theme_colors(self) -> None:
         self.application.setStyleSheet(APP_STYLESHEET)

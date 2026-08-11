@@ -17,6 +17,9 @@ from ui.login_window import LoginWindow
 from ui.styles import APP_STYLESHEET
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 class ApplicationController:
     def __init__(
         self,
@@ -70,7 +73,12 @@ def build_services() -> tuple[
     database.initialize()
     auth_service = AuthService(database)
     auth_service.ensure_default_admin()
-    plate_service = PlateService(database, config.duplicate_cooldown_seconds)
+    plate_service = PlateService(
+        database,
+        config.duplicate_cooldown_seconds,
+        config.plate_recognition.record_retention_days,
+    )
+    apply_startup_retention_cleanup(plate_service)
     camera_service = CameraService(database)
     recognition_service = PlateRecognitionService(
         camera_service,
@@ -81,9 +89,24 @@ def build_services() -> tuple[
     return auth_service, plate_service, camera_service, recognition_service
 
 
+def apply_startup_retention_cleanup(plate_service: PlateService) -> int:
+    try:
+        removed = plate_service.apply_retention_policy()
+    except Exception:
+        LOGGER.exception("Retention cleanup failed; application startup will continue.")
+        return 0
+    if removed:
+        LOGGER.info(
+            "Retention cleanup removed %s plate records older than %s days.",
+            removed,
+            plate_service.record_retention_days,
+        )
+    return removed
+
+
 def main() -> int:
     log_path = configure_logging()
-    logging.getLogger(__name__).info("Application startup log_path=%s", log_path)
+    LOGGER.info("Application startup log_path=%s", log_path)
     application = QApplication(sys.argv)
     application.setApplicationName("Plaka Takip Sistemi")
     application.setStyle("Fusion")
@@ -103,7 +126,7 @@ def main() -> int:
     application.aboutToQuit.connect(services[2].stop_all)
     application.aboutToQuit.connect(services[3].stop)
     application.aboutToQuit.connect(
-        lambda: logging.getLogger(__name__).info("Application shutdown")
+        lambda: LOGGER.info("Application shutdown")
     )
     controller.show_login()
     return application.exec()

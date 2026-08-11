@@ -22,6 +22,8 @@ class NormalizedRoi:
 
 
 DEFAULT_ROI = NormalizedRoi(x=0.10, y=0.35, width=0.80, height=0.55)
+DEFAULT_RECORD_RETENTION_DAYS = 90
+SUPPORTED_RECORD_RETENTION_DAYS = (30, 90, 180, 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +36,7 @@ class PlateRecognitionConfig:
     entry_roi: NormalizedRoi
     exit_roi: NormalizedRoi
     model_root: Path
+    record_retention_days: int = DEFAULT_RECORD_RETENTION_DAYS
     ocr_backend: str = "auto"
     warnings: tuple[str, ...] = ()
 
@@ -104,12 +107,7 @@ def update_plate_roi(
         raise ConfigError(f"Geçersiz kamera yönü: {direction_value}")
 
     settings_path = settings_path.resolve()
-    try:
-        raw = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError) as exc:
-        raise ConfigError(f"Ayar dosyası güncellenemedi: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise ConfigError("Ayar dosyasının kökü JSON nesnesi olmalıdır.")
+    raw = _read_settings_for_update(settings_path)
 
     plate_detection = raw.setdefault("plate_detection", {})
     if not isinstance(plate_detection, dict):
@@ -126,9 +124,47 @@ def update_plate_roi(
         "height": roi.height,
     }
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_settings_atomic(settings_path, raw)
+    return load_config(settings_path).plate_recognition
+
+
+def update_record_retention(
+    settings_path: Path,
+    retention_days: int,
+) -> PlateRecognitionConfig:
+    """Atomically update record retention while preserving unknown settings fields."""
+    if (
+        isinstance(retention_days, bool)
+        or retention_days not in SUPPORTED_RECORD_RETENTION_DAYS
+    ):
+        raise ConfigError("Saklama süresi 30, 90, 180 veya 0 olmalıdır.")
+
+    settings_path = settings_path.resolve()
+    raw = _read_settings_for_update(settings_path)
+    plate_detection = raw.setdefault("plate_detection", {})
+    if not isinstance(plate_detection, dict):
+        plate_detection = {}
+        raw["plate_detection"] = plate_detection
+    plate_detection["record_retention_days"] = retention_days
+
+    _write_settings_atomic(settings_path, raw)
+    return load_config(settings_path).plate_recognition
+
+
+def _read_settings_for_update(settings_path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        raise ConfigError(f"Ayar dosyası güncellenemedi: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError("Ayar dosyasının kökü JSON nesnesi olmalıdır.")
+    return raw
+
+
+def _write_settings_atomic(settings_path: Path, raw: dict[str, Any]) -> None:
     temporary_path: Path | None = None
     try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", dir=settings_path.parent, delete=False, suffix=".tmp"
         ) as handle:
@@ -138,10 +174,11 @@ def update_plate_roi(
             os.fsync(handle.fileno())
             temporary_path = Path(handle.name)
         os.replace(temporary_path, settings_path)
+    except OSError as exc:
+        raise ConfigError(f"Ayar dosyası atomik olarak yazılamadı: {exc}") from exc
     finally:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink()
-    return load_config(settings_path).plate_recognition
 
 
 def _load_plate_recognition(
@@ -169,6 +206,9 @@ def _load_plate_recognition(
         raw.get("duplicate_cooldown_seconds"), 10, 0, 86_400, int,
         "duplicate_cooldown_seconds", warnings,
     )
+    retention_days = _record_retention_days(
+        raw.get("record_retention_days"), warnings
+    )
     backend_value = raw.get("ocr_backend", "auto")
     if not isinstance(backend_value, str) or backend_value.lower() not in {
         "auto",
@@ -189,12 +229,29 @@ def _load_plate_recognition(
         confirmations_required=confirmations,
         confirmation_window_seconds=confirmation_window,
         duplicate_cooldown_seconds=cooldown,
+        record_retention_days=retention_days,
         entry_roi=_parse_roi(roi_settings.get("ENTRY"), "ENTRY", warnings),
         exit_roi=_parse_roi(roi_settings.get("EXIT"), "EXIT", warnings),
         model_root=(root / "models" / "ocr").resolve(),
         ocr_backend=backend_value.lower(),
         warnings=tuple(warnings),
     )
+
+
+def _record_retention_days(value: object, warnings: list[str]) -> int:
+    if value is None:
+        return DEFAULT_RECORD_RETENTION_DAYS
+    if isinstance(value, bool) or not isinstance(value, int):
+        warnings.append(
+            "record_retention_days geçersiz; varsayılan 90 gün kullanıldı."
+        )
+        return DEFAULT_RECORD_RETENTION_DAYS
+    if value not in SUPPORTED_RECORD_RETENTION_DAYS:
+        warnings.append(
+            "record_retention_days desteklenmiyor; varsayılan 90 gün kullanıldı."
+        )
+        return DEFAULT_RECORD_RETENTION_DAYS
+    return value
 
 
 def _bounded_number(

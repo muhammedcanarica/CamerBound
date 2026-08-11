@@ -56,6 +56,11 @@ Manuel alternatif:
 
 İlk çalıştırmada `data/plate_tracker.db` otomatik oluşturulur; tablolar, indexler, iki varsayılan kamera ve kullanıcı yoksa geliştirme admin hesabı eklenir.
 
+## Kayıt Saklama
+
+Varsayılan plaka kayıt saklama süresi 90 gündür.
+ADMIN kullanıcı Ayarlar > Veri Saklama bölümünden 30 / 90 / 180 gün veya Süresiz seçebilir.
+
 ## Varsayılan geliştirme hesabı
 
 - Kullanıcı adı: `admin`

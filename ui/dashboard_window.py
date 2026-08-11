@@ -456,14 +456,17 @@ class DashboardWindow(QMainWindow):
                 "Kullanıcılar",
                 UsersAdminWidget(self.auth_service, self.user),
             )
+            settings_page = CameraSettingsWidget(
+                self.camera_service,
+                self.user,
+                self.plate_service,
+                self.recognition_service,
+            )
+            settings_page.records_changed.connect(self._refresh_after_records_changed)
             self._add_page(
                 sidebar_layout,
                 "Ayarlar",
-                CameraSettingsWidget(
-                    self.camera_service,
-                    self.user,
-                    self.recognition_service,
-                ),
+                settings_page,
             )
 
         sidebar_layout.addStretch()
@@ -494,6 +497,14 @@ class DashboardWindow(QMainWindow):
 
     @Slot(object)
     def _refresh_record_pages(self, _record: PlateRecord) -> None:
+        for page in self.pages[1:3]:
+            refresh = getattr(page, "refresh", None)
+            if callable(refresh):
+                refresh()
+
+    @Slot()
+    def _refresh_after_records_changed(self) -> None:
+        self.dashboard_home.refresh()
         for page in self.pages[1:3]:
             refresh = getattr(page, "refresh", None)
             if callable(refresh):

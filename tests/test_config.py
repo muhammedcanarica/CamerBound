@@ -4,9 +4,17 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.camera import Direction
-from app.config import DEFAULT_ROI, NormalizedRoi, load_config, update_plate_roi
+from app.config import (
+    DEFAULT_ROI,
+    ConfigError,
+    NormalizedRoi,
+    load_config,
+    update_plate_roi,
+    update_record_retention,
+)
 
 
 class PlateRecognitionConfigTests(unittest.TestCase):
@@ -74,6 +82,67 @@ class PlateRecognitionConfigTests(unittest.TestCase):
             self.assertEqual(load_config(settings_path).plate_recognition.entry_roi, expected)
             self.assertEqual(raw["unknown_root"], {"keep": True})
             self.assertEqual(raw["plate_detection"]["custom"], "keep-me")
+            self.assertEqual(list(Path(temp_directory).glob("*.tmp")), [])
+
+    def test_invalid_record_retention_falls_back_to_90_with_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            settings_path = Path(temp_directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "database_path": "test.db",
+                        "plate_detection": {"record_retention_days": 45},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(settings_path).plate_recognition
+
+        self.assertEqual(config.record_retention_days, 90)
+        self.assertTrue(
+            any("record_retention_days" in warning for warning in config.warnings)
+        )
+
+    def test_record_retention_update_is_atomic_and_preserves_unknown_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            settings_path = Path(temp_directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "database_path": "test.db",
+                        "unknown_root": {"keep": True},
+                        "plate_detection": {"custom": "keep-me"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = update_record_retention(settings_path, 180)
+            raw = json.loads(settings_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(config.record_retention_days, 180)
+            self.assertEqual(raw["unknown_root"], {"keep": True})
+            self.assertEqual(raw["plate_detection"]["custom"], "keep-me")
+            self.assertEqual(raw["plate_detection"]["record_retention_days"], 180)
+            self.assertEqual(list(Path(temp_directory).glob("*.tmp")), [])
+
+    def test_failed_atomic_record_retention_update_keeps_original_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            settings_path = Path(temp_directory) / "settings.json"
+            original = json.dumps(
+                {
+                    "database_path": "test.db",
+                    "plate_detection": {"record_retention_days": 90},
+                }
+            )
+            settings_path.write_text(original, encoding="utf-8")
+
+            with patch("app.config.os.replace", side_effect=OSError("disk error")):
+                with self.assertRaises(ConfigError):
+                    update_record_retention(settings_path, 30)
+
+            self.assertEqual(settings_path.read_text(encoding="utf-8"), original)
             self.assertEqual(list(Path(temp_directory).glob("*.tmp")), [])
 
 

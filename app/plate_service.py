@@ -6,6 +6,10 @@ from datetime import datetime, timedelta
 
 from app.auth import AuthService, SessionUser, ValidationError
 from app.camera import Direction
+from app.config import (
+    DEFAULT_RECORD_RETENTION_DAYS,
+    SUPPORTED_RECORD_RETENTION_DAYS,
+)
 from app.database import Database
 from app.time_utils import (
     as_utc,
@@ -37,6 +41,12 @@ class VehicleInside:
     camera_name: str
 
 
+@dataclass(frozen=True, slots=True)
+class PlateRecordStats:
+    total_records: int
+    oldest_timestamp: str | None
+
+
 class DuplicatePlateDetection(Exception):
     """Raised when the same camera reports a plate inside the cooldown window."""
 
@@ -47,9 +57,23 @@ class DuplicatePlateDetection(Exception):
 
 
 class PlateService:
-    def __init__(self, database: Database, duplicate_cooldown_seconds: int) -> None:
+    def __init__(
+        self,
+        database: Database,
+        duplicate_cooldown_seconds: int,
+        record_retention_days: int = DEFAULT_RECORD_RETENTION_DAYS,
+    ) -> None:
         self.database = database
         self.duplicate_cooldown_seconds = duplicate_cooldown_seconds
+        self.set_record_retention_days(record_retention_days)
+
+    def set_record_retention_days(self, retention_days: int) -> None:
+        if (
+            isinstance(retention_days, bool)
+            or retention_days not in SUPPORTED_RECORD_RETENTION_DAYS
+        ):
+            raise ValidationError("Saklama süresi 30, 90, 180 veya 0 olmalıdır.")
+        self.record_retention_days = retention_days
 
     def save_plate_detection(
         self,
@@ -207,6 +231,69 @@ class PlateService:
             )
             for row in rows
         ]
+
+    def delete_records_older_than(
+        self,
+        actor: SessionUser,
+        retention_days: int | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        AuthService.require_admin(actor)
+        days = self.record_retention_days if retention_days is None else retention_days
+        self._validate_retention_days(days)
+        return self._delete_records_older_than(days, now)
+
+    def apply_retention_policy(self, now: datetime | None = None) -> int:
+        """Apply the configured startup policy without requiring an interactive actor."""
+        return self._delete_records_older_than(self.record_retention_days, now)
+
+    def delete_all_records(self, actor: SessionUser) -> int:
+        AuthService.require_admin(actor)
+        with self.database.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute("DELETE FROM plate_records")
+            return max(0, cursor.rowcount)
+
+    def get_record_stats(self, actor: SessionUser) -> PlateRecordStats:
+        AuthService.require_admin(actor)
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS total_records, MIN(timestamp) AS oldest_timestamp "
+                "FROM plate_records"
+            ).fetchone()
+        oldest = row["oldest_timestamp"]
+        return PlateRecordStats(
+            total_records=int(row["total_records"]),
+            oldest_timestamp=(
+                normalize_utc_timestamp(oldest) if oldest is not None else None
+            ),
+        )
+
+    def _delete_records_older_than(
+        self,
+        retention_days: int,
+        now: datetime | None,
+    ) -> int:
+        self._validate_retention_days(retention_days)
+        if retention_days == 0:
+            return 0
+        current = as_utc(now) if now is not None else utc_now()
+        cutoff = to_utc_storage(current - timedelta(days=retention_days))
+        with self.database.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "DELETE FROM plate_records WHERE timestamp < ?",
+                (cutoff,),
+            )
+            return max(0, cursor.rowcount)
+
+    @staticmethod
+    def _validate_retention_days(retention_days: int) -> None:
+        if (
+            isinstance(retention_days, bool)
+            or retention_days not in SUPPORTED_RECORD_RETENTION_DAYS
+        ):
+            raise ValidationError("Saklama süresi 30, 90, 180 veya 0 olmalıdır.")
 
     @staticmethod
     def _record_select() -> str:
