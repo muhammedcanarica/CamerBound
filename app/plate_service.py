@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.auth import AuthService, SessionUser, ValidationError
 from app.camera import Direction
@@ -30,6 +30,15 @@ class VehicleInside:
     camera_name: str
 
 
+class DuplicatePlateDetection(Exception):
+    """Raised when the same camera reports a plate inside the cooldown window."""
+
+    def __init__(self, plate: str, camera_id: int) -> None:
+        super().__init__("Aynı plaka cooldown süresi içinde zaten kaydedildi.")
+        self.plate = plate
+        self.camera_id = camera_id
+
+
 class PlateService:
     def __init__(self, database: Database, duplicate_cooldown_seconds: int) -> None:
         self.database = database
@@ -48,16 +57,33 @@ class PlateService:
         if not 0 <= confidence <= 1:
             raise ValidationError("Güven değeri 0 ile 1 arasında olmalıdır.")
 
-        timestamp = (detected_at or datetime.now().astimezone()).isoformat(timespec="seconds")
+        detection_time = detected_at or datetime.now().astimezone()
+        timestamp = detection_time.isoformat(timespec="seconds")
         with self.database.connection() as connection:
+            # Acquire the write lock before checking the latest row so another
+            # recognition worker cannot insert between the SELECT and INSERT.
+            connection.execute("BEGIN IMMEDIATE")
             camera = connection.execute(
                 "SELECT id, name, direction FROM cameras WHERE id = ?", (camera_id,)
             ).fetchone()
             if camera is None:
                 raise ValidationError("Kamera bulunamadı.")
 
-            # TODO: duplicate_cooldown_seconds kullanılarak aynı kamera/plaka için
-            # kısa süreli tekrar kayıtları burada engellenecek.
+            latest = connection.execute(
+                """
+                SELECT timestamp
+                FROM plate_records
+                WHERE camera_id = ? AND plate = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+                """,
+                (camera_id, normalized_plate),
+            ).fetchone()
+            if latest is not None and self._inside_cooldown(
+                latest["timestamp"], detection_time
+            ):
+                raise DuplicatePlateDetection(normalized_plate, camera_id)
+
             cursor = connection.execute(
                 """
                 INSERT INTO plate_records (plate, direction, camera_id, confidence, timestamp)
@@ -75,6 +101,22 @@ class PlateService:
             camera_name=camera["name"],
             confidence=confidence,
             timestamp=timestamp,
+        )
+
+    def _inside_cooldown(self, previous_value: str, current: datetime) -> bool:
+        if self.duplicate_cooldown_seconds <= 0:
+            return False
+        try:
+            previous = datetime.fromisoformat(previous_value)
+        except ValueError:
+            return False
+        if previous.tzinfo is None and current.tzinfo is not None:
+            previous = previous.replace(tzinfo=current.tzinfo)
+        elif previous.tzinfo is not None and current.tzinfo is None:
+            current = current.replace(tzinfo=previous.tzinfo)
+        elapsed = current - previous
+        return timedelta(0) <= elapsed <= timedelta(
+            seconds=self.duplicate_cooldown_seconds
         )
 
     def get_recent_records(

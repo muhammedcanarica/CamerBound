@@ -13,7 +13,9 @@ from PySide6.QtWidgets import QApplication
 
 from app.auth import AuthService
 from app.camera import CameraService
+from app.config import load_config
 from app.database import Database
+from app.plate_recognition import PlateRecognitionService, RecognitionStatus
 from app.plate_service import PlateService
 from main import ApplicationController
 
@@ -29,10 +31,18 @@ class LoginFlowSmokeTest(unittest.TestCase):
         database.initialize()
         auth_service = AuthService(database)
         auth_service.ensure_default_admin()
+        plate_service = PlateService(database, duplicate_cooldown_seconds=10)
+        camera_service = CameraService(database)
+        recognition_service = PlateRecognitionService(
+            camera_service,
+            plate_service,
+            load_config().plate_recognition,
+        )
         self.controller = ApplicationController(
             auth_service,
-            PlateService(database, duplicate_cooldown_seconds=10),
-            CameraService(database),
+            plate_service,
+            camera_service,
+            recognition_service,
         )
 
     def tearDown(self) -> None:
@@ -58,6 +68,21 @@ class LoginFlowSmokeTest(unittest.TestCase):
         self.assertTrue(dashboard.isVisible())
         self.assertEqual(dashboard.user.username, "admin")
         self.assertEqual(dashboard.stack.count(), 5)
+
+        for _ in range(100):
+            self.application.processEvents()
+            if self.controller.recognition_service.get_status() is RecognitionStatus.UNAVAILABLE:
+                break
+            QTest.qWait(10)
+        self.assertEqual(
+            self.controller.recognition_service.get_status(),
+            RecognitionStatus.UNAVAILABLE,
+        )
+        self.assertIn(
+            "OCR: Kullanılamıyor",
+            dashboard.dashboard_home.camera_cards[next(iter(dashboard.dashboard_home.camera_cards))]
+            .ocr_status.text(),
+        )
 
 
 if __name__ == "__main__":

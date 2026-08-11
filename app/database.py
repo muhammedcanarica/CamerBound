@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS plate_records (
 
 CREATE INDEX IF NOT EXISTS idx_plate_records_plate ON plate_records(plate);
 CREATE INDEX IF NOT EXISTS idx_plate_records_timestamp ON plate_records(timestamp);
+CREATE INDEX IF NOT EXISTS idx_plate_records_camera_plate_time
+ON plate_records(camera_id, plate, timestamp DESC);
 """
 
 

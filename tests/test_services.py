@@ -15,6 +15,7 @@ from app.auth import (
 from app.camera import CameraService, Direction
 from app.database import Database
 from app.plate_service import PlateService
+from app.plate_service import DuplicatePlateDetection
 
 
 class ServiceTests(unittest.TestCase):
@@ -94,6 +95,37 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual([record.plate for record in entry_records], ["34ABC123"])
         vehicles_inside = self.plate_service.get_vehicles_inside(self.admin)
         self.assertEqual([vehicle.plate for vehicle in vehicles_inside], ["06XYZ99"])
+
+    def test_duplicate_cooldown_is_camera_specific(self) -> None:
+        cameras = {camera.direction: camera for camera in self.camera_service.list_cameras()}
+        now = datetime(2026, 8, 11, 10, 0, tzinfo=timezone.utc)
+
+        first = self.plate_service.save_plate_detection(
+            "34ABC123", cameras[Direction.ENTRY].id, 0.95, now
+        )
+        with self.assertRaises(DuplicatePlateDetection):
+            self.plate_service.save_plate_detection(
+                "34ABC123",
+                cameras[Direction.ENTRY].id,
+                0.94,
+                now + timedelta(seconds=5),
+            )
+        exit_record = self.plate_service.save_plate_detection(
+            "34ABC123",
+            cameras[Direction.EXIT].id,
+            0.93,
+            now + timedelta(seconds=5),
+        )
+        after_cooldown = self.plate_service.save_plate_detection(
+            "34ABC123",
+            cameras[Direction.ENTRY].id,
+            0.92,
+            now + timedelta(seconds=11),
+        )
+
+        self.assertEqual(first.direction, Direction.ENTRY)
+        self.assertEqual(exit_record.direction, Direction.EXIT)
+        self.assertEqual(after_cooldown.direction, Direction.ENTRY)
 
 
 if __name__ == "__main__":

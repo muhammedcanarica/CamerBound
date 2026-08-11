@@ -1,6 +1,24 @@
 {
   "database_path": "data/plate_tracker.db",
   "plate_detection": {
-    "duplicate_cooldown_seconds": 10
+    "recognition_interval_ms": 500,
+    "min_confidence": 0.65,
+    "confirmations_required": 2,
+    "confirmation_window_seconds": 3,
+    "duplicate_cooldown_seconds": 10,
+    "roi": {
+      "ENTRY": {
+        "x": 0.1,
+        "y": 0.35,
+        "width": 0.8,
+        "height": 0.55
+      },
+      "EXIT": {
+        "x": 0.1,
+        "y": 0.35,
+        "width": 0.8,
+        "height": 0.55
+      }
+    }
   }
 }

@@ -2,7 +2,7 @@
 
 Şirket içindeki güvenlik bilgisayarında tamamen yerel çalışacak Windows masaüstü plaka takip uygulamasının ilk sürümüdür. Bu sürüm; kullanıcı oturumu, rol tabanlı yetkilendirme, canlı kamera önizlemesi ve plaka kayıt altyapısını sağlar. İnternet veya bulut servisi kullanmaz.
 
-> **Önemli:** Bu aşamada RTSP/local video/webcam görüntüsü yalnızca Dashboard önizlemesi için kullanılır. OCR, YOLO, ONNX veya plaka tanıma modeli henüz yoktur.
+> **Önemli:** Bu sürüm sabit giriş/çıkış kameraları için ROI tabanlı lokal OCR MVP'sidir. YOLO veya başka bir object detection modeli kullanılmaz.
 
 ## Özellikler
 
@@ -11,6 +11,8 @@
 - Login → Dashboard akışı
 - Giriş/çıkış kamera kartlarında OpenCV tabanlı canlı önizleme ve bağlantı durumu
 - Kamera başına ayrı worker thread, sınırlı önizleme FPS'i ve otomatik yeniden bağlanma
+- PaddleOCR + ONNX Runtime ile tamamen lokal plaka tanıma
+- Kamera yönüne özel ROI, multi-frame confirmation ve duplicate cooldown
 - Plaka ve yön bazlı kayıt arama
 - Son hareketi `ENTRY` olan araçlardan hesaplanan “İçerideki Araçlar” ekranı
 - ADMIN için kullanıcı oluşturma ve iki kamerayı yapılandırma
@@ -23,7 +25,9 @@
 - Python 3.12
 - PySide6
 - bcrypt
-- OpenCV (`opencv-python`)
+- OpenCV (`opencv-contrib-python`, PaddleOCR ile ortak tek `cv2` dağıtımı)
+- PaddleOCR 3.7.0
+- ONNX Runtime 1.27.0 (CPU)
 
 ## Kurulum
 
@@ -61,6 +65,66 @@ python -m unittest discover -v
 
 UI testi Qt'yi `offscreen` platformunda açar, login formundaki butona tıklar ve ADMIN dashboard’unun oluştuğunu kontrol eder.
 
+## Plaka Tanıma
+
+Pipeline şu sırayla çalışır:
+
+```text
+CameraService frame
+→ ENTRY/EXIT ROI crop
+→ original + contrast preprocessing
+→ lokal PaddleOCR / ONNX Runtime
+→ normalization ve Türk plaka doğrulama
+→ multi-frame confirmation
+→ duplicate cooldown
+→ PlateService
+→ SQLite ve Dashboard güncellemesi
+```
+
+OCR inference ayrı bir `QThread` üzerinde çalışır. Kamera başına yalnızca en güncel frame tutulur; OCR yavaşladığında biriken, sınırsız bir frame kuyruğu oluşmaz. Model bulunmazsa login, Dashboard ve kamera preview çalışmaya devam eder; kartta `OCR: Kullanılamıyor` gösterilir.
+
+### Lokal modeller
+
+Uygulama çalışma anında model indirmez ve PaddleX model-source ağ kontrolünü kapatır. ONNX Runtime ile uyumlu PaddleOCR detection ve recognition model dizinleri şu konumlarda bulunmalıdır:
+
+```text
+models/ocr/detection/
+models/ocr/recognition/
+```
+
+Önceden indirilmiş/çıkarılmış model dizinlerini hazırlamak için:
+
+```powershell
+python scripts/setup_ocr_models.py `
+  --detection-source "C:\models\paddle-det" `
+  --recognition-source "C:\models\paddle-rec"
+```
+
+Model binary dosyaları `.gitignore` kapsamındadır. Production paketine `models/ocr/` klasörü ayrıca dahil edilmelidir.
+
+### ROI ve tanıma ayarları
+
+`config/settings.json` içindeki `plate_detection` alanı kullanılır:
+
+- `recognition_interval_ms`: Her kamera için OCR denemeleri arasındaki minimum süre. Varsayılan `500` ms.
+- `min_confidence`: Database kaydı için minimum OCR güveni. Varsayılan `0.65`.
+- `confirmations_required`: Plakanın kaydedilmeden önce kaç frame'de görülmesi gerektiği.
+- `confirmation_window_seconds`: Confirmation oylarının geçerli olduğu süre.
+- `duplicate_cooldown_seconds`: Aynı kamera ve plakanın tekrar kaydedilmesini engelleyen süre.
+- `roi.ENTRY` / `roi.EXIT`: `x`, `y`, `width`, `height` şeklinde normalize `0-1` koordinatları.
+
+Geçersiz ROI uygulamayı kapatmaz; varsayılan ROI kullanılır ve OCR durum mesajında uyarı gösterilir. Dashboard preview üzerindeki yeşil çerçeve OCR'ın taradığı alanı belirtir.
+
+### Tek görsel OCR testi
+
+Model kalitesini gerçek kamera olmadan kontrol etmek için:
+
+```powershell
+python scripts/test_plate_ocr.py "C:\test-data\plate.jpg" --direction ENTRY
+```
+
+Script ham OCR metnini, normalize/düzeltilmiş plakayı, validation sonucunu ve confidence değerini terminale yazar.
+
 ## Kamera Testi
 
 RTSP kamera ile test etmek için:
@@ -91,6 +155,7 @@ CamerBound/
 │   ├── camera_worker.py
 │   ├── config.py
 │   ├── database.py
+│   ├── plate_recognition.py
 │   └── plate_service.py
 ├── ui/
 │   ├── admin_widget.py
@@ -102,9 +167,14 @@ CamerBound/
 │   └── settings.json
 ├── data/
 │   └── plate_tracker.db       # İlk çalıştırmada oluşur
-├── models/                    # Gelecekteki yerel OCR/ONNX modeli
+├── models/ocr/                # Lokal detection/recognition modelleri (binary'ler ignore edilir)
+├── scripts/
+│   ├── setup_ocr_models.py
+│   └── test_plate_ocr.py
 └── tests/
     ├── test_camera_service.py
+    ├── test_config.py
+    ├── test_plate_recognition.py
     ├── test_services.py
     └── test_ui_smoke.py
 ```
@@ -115,6 +185,7 @@ CamerBound/
 - `app/auth.py`: Parola hashleme, login, oturum modeli, kullanıcı oluşturma ve rol kontrolleri.
 - `app/camera.py`: Kamera ayarları, worker/thread referansları ve capture yaşam döngüsünün servis sınırı.
 - `app/camera_worker.py`: OpenCV kaynağını UI thread'i dışında okur, önizleme FPS'ini sınırlar ve kesintide yeniden bağlanır.
+- `app/plate_recognition.py`: ROI, preprocessing, PaddleOCR adapter, plaka doğrulama, voting ve OCR worker yaşam döngüsü.
 - `app/plate_service.py`: Kayıt ekleme, arama, son kayıtlar ve içerideki araç sorgusu.
 - `ui/`: Servisleri kullanan PySide6 ekranları; doğrudan SQL çalıştırmaz.
 - `app/config.py`: `settings.json` okur ve relative yolları uygulama köküne göre çözer.
@@ -122,10 +193,10 @@ CamerBound/
 ## Sonraki geliştirme adımları
 
 1. Varsayılan admin parolasını değiştirme ekranı eklemek.
-2. `models/` altına lokal OCR/ONNX modeli ve ayrı tanıma servisi eklemek.
-3. `app/plate_service.py` içindeki TODO noktasında kamera/plaka debounce uygulamak.
+2. Gerçek kamera açılarıyla ENTRY/EXIT ROI değerlerini kalibre etmek.
+3. Kuruma ait plaka örnekleriyle OCR doğruluğunu ölçmek ve gerekirse modeli fine-tune etmek.
 4. RTSP credential verisini şifreli saklamak.
-5. PyInstaller yapılandırması ve temiz bir Windows makinede paket testi yapmak.
+5. OCR model klasörlerini içeren PyInstaller yapılandırması ve temiz Windows paket testi yapmak.
 
 ## Ayarlar
 
@@ -135,7 +206,15 @@ CamerBound/
 {
   "database_path": "data/plate_tracker.db",
   "plate_detection": {
-    "duplicate_cooldown_seconds": 10
+    "recognition_interval_ms": 500,
+    "min_confidence": 0.65,
+    "confirmations_required": 2,
+    "confirmation_window_seconds": 3,
+    "duplicate_cooldown_seconds": 10,
+    "roi": {
+      "ENTRY": {"x": 0.1, "y": 0.35, "width": 0.8, "height": 0.55},
+      "EXIT": {"x": 0.1, "y": 0.35, "width": 0.8, "height": 0.55}
+    }
   }
 }
 ```

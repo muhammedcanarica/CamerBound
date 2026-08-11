@@ -6,6 +6,12 @@ venv/
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/paddlex-cache/
 build/
 dist/
 *.spec
+models/ocr/**
+!models/ocr/detection/
+!models/ocr/detection/.gitkeep
+!models/ocr/recognition/
+!models/ocr/recognition/.gitkeep

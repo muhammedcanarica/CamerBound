@@ -8,6 +8,7 @@ from app.auth import AuthService, SessionUser
 from app.camera import CameraService
 from app.config import load_config
 from app.database import Database
+from app.plate_recognition import PlateRecognitionService
 from app.plate_service import PlateService
 from ui.dashboard_window import DashboardWindow
 from ui.login_window import LoginWindow
@@ -20,10 +21,12 @@ class ApplicationController:
         auth_service: AuthService,
         plate_service: PlateService,
         camera_service: CameraService,
+        recognition_service: PlateRecognitionService | None = None,
     ) -> None:
         self.auth_service = auth_service
         self.plate_service = plate_service
         self.camera_service = camera_service
+        self.recognition_service = recognition_service
         self.login_window: LoginWindow | None = None
         self.dashboard_window: DashboardWindow | None = None
 
@@ -41,27 +44,38 @@ class ApplicationController:
     def show_dashboard(self, user: SessionUser) -> None:
         if self.login_window is not None:
             self.login_window.hide()
+        if self.recognition_service is not None:
+            self.recognition_service.start()
         self.dashboard_window = DashboardWindow(
             user,
             self.auth_service,
             self.plate_service,
             self.camera_service,
+            self.recognition_service,
         )
         self.dashboard_window.logout_requested.connect(self.show_login)
         self.dashboard_window.show()
 
 
-def build_services() -> tuple[AuthService, PlateService, CameraService]:
+def build_services() -> tuple[
+    AuthService,
+    PlateService,
+    CameraService,
+    PlateRecognitionService,
+]:
     config = load_config()
     database = Database(config.database_path)
     database.initialize()
     auth_service = AuthService(database)
     auth_service.ensure_default_admin()
-    return (
-        auth_service,
-        PlateService(database, config.duplicate_cooldown_seconds),
-        CameraService(database),
+    plate_service = PlateService(database, config.duplicate_cooldown_seconds)
+    camera_service = CameraService(database)
+    recognition_service = PlateRecognitionService(
+        camera_service,
+        plate_service,
+        config.plate_recognition,
     )
+    return auth_service, plate_service, camera_service, recognition_service
 
 
 def main() -> int:
@@ -82,6 +96,7 @@ def main() -> int:
 
     controller = ApplicationController(*services)
     application.aboutToQuit.connect(services[2].stop_all)
+    application.aboutToQuit.connect(services[3].stop)
     controller.show_login()
     return application.exec()
 

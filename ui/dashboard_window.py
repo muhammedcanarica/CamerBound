@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import cv2
 from PySide6.QtCore import QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QImage, QPixmap, QResizeEvent
+from PySide6.QtGui import QColor, QCloseEvent, QImage, QPainter, QPen, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -21,6 +21,11 @@ from PySide6.QtWidgets import (
 
 from app.auth import Role, SessionUser, ValidationError
 from app.camera import Camera, CameraService, CameraStatus, Direction
+from app.plate_recognition import (
+    PlateCandidate,
+    PlateRecognitionService,
+    RecognitionStatus,
+)
 from app.plate_service import PlateRecord, PlateService
 from ui.admin_widget import CameraSettingsWidget, UsersAdminWidget
 from ui.records_widget import (
@@ -37,22 +42,33 @@ class CameraCardWidgets:
     status: QLabel
     details: QLabel
     last_plate: QLabel
+    ocr_status: QLabel
 
 
 class DashboardHome(QWidget):
     def __init__(
-        self, plate_service: PlateService, camera_service: CameraService, user: SessionUser
+        self,
+        plate_service: PlateService,
+        camera_service: CameraService,
+        user: SessionUser,
+        recognition_service: PlateRecognitionService | None = None,
     ) -> None:
         super().__init__()
         self.plate_service = plate_service
         self.camera_service = camera_service
         self.user = user
+        self.recognition_service = recognition_service
         self.camera_cards: dict[Direction, CameraCardWidgets] = {}
         self.camera_directions: dict[int, Direction] = {}
         self._latest_images: dict[Direction, QImage] = {}
         self._build_ui()
         self.camera_service.frame_ready.connect(self._show_frame)
         self.camera_service.status_changed.connect(self._show_status)
+        if self.recognition_service is not None:
+            self.recognition_service.status_changed.connect(self._show_ocr_status)
+            self.recognition_service.candidate_changed.connect(self._show_candidate)
+            self.recognition_service.record_saved.connect(self._record_saved)
+            QTimer.singleShot(0, self._sync_ocr_status)
         QTimer.singleShot(0, self._start_enabled_cameras)
 
     def _build_ui(self) -> None:
@@ -101,15 +117,18 @@ class DashboardHome(QWidget):
         details = QLabel("Kamera yapılandırması yükleniyor", objectName="mutedLabel")
         last_plate = QLabel("Son okunan plaka: -")
         last_plate.setStyleSheet("font-weight:600;")
+        ocr_status = QLabel("OCR: Başlatılmadı", objectName="mutedLabel")
         card_layout.addWidget(preview, 1)
         card_layout.addWidget(status)
         card_layout.addWidget(details)
         card_layout.addWidget(last_plate)
+        card_layout.addWidget(ocr_status)
         self.camera_cards[direction] = CameraCardWidgets(
             preview=preview,
             status=status,
             details=details,
             last_plate=last_plate,
+            ocr_status=ocr_status,
         )
         return card
 
@@ -179,8 +198,56 @@ class DashboardHome(QWidget):
         except (AttributeError, TypeError, ValueError, cv2.error):
             return
 
+        self._draw_roi(image, direction)
         self._latest_images[direction] = image
         self._display_image(direction, image)
+
+    @Slot()
+    def _sync_ocr_status(self) -> None:
+        if self.recognition_service is None:
+            return
+        status = self.recognition_service.get_status()
+        messages = {
+            RecognitionStatus.STOPPED: "OCR başlatılmadı.",
+            RecognitionStatus.INITIALIZING: "OCR başlatılıyor.",
+            RecognitionStatus.ACTIVE: "OCR aktif.",
+            RecognitionStatus.UNAVAILABLE: "OCR kullanılamıyor.",
+            RecognitionStatus.ERROR: "OCR hatası.",
+        }
+        self._show_ocr_status(status, messages[status])
+
+    @Slot(object, str)
+    def _show_ocr_status(self, status: RecognitionStatus, message: str) -> None:
+        status = RecognitionStatus(status)
+        prefixes = {
+            RecognitionStatus.STOPPED: "OCR: Kapalı",
+            RecognitionStatus.INITIALIZING: "OCR: Başlatılıyor",
+            RecognitionStatus.ACTIVE: "OCR: Aktif",
+            RecognitionStatus.UNAVAILABLE: "OCR: Kullanılamıyor",
+            RecognitionStatus.ERROR: "OCR: Hata",
+        }
+        for card in self.camera_cards.values():
+            card.ocr_status.setText(prefixes[status])
+            card.ocr_status.setToolTip(message)
+
+    @Slot(int, object)
+    def _show_candidate(self, camera_id: int, candidate: PlateCandidate) -> None:
+        direction = self.camera_directions.get(camera_id)
+        if direction is None:
+            return
+        self.camera_cards[direction].ocr_status.setText(
+            f"OCR: Aktif · Son: {candidate.plate} · %{candidate.confidence * 100:.0f}"
+        )
+        self.camera_cards[direction].ocr_status.setToolTip(
+            f"Ham OCR: {candidate.raw_text}"
+        )
+
+    @Slot(object)
+    def _record_saved(self, record: PlateRecord) -> None:
+        card = self.camera_cards.get(record.direction)
+        if card is not None:
+            card.last_plate.setText(f"Son okunan plaka: {record.plate}")
+        self.refresh()
 
     @Slot(int, object, str)
     def _show_status(
@@ -238,6 +305,20 @@ class DashboardHome(QWidget):
         preview.setText("")
         preview.setPixmap(pixmap)
 
+    def _draw_roi(self, image: QImage, direction: Direction) -> None:
+        if self.recognition_service is None:
+            return
+        roi = self.recognition_service.config.roi_for(direction)
+        painter = QPainter(image)
+        painter.setPen(QPen(QColor("#22c55e"), 2))
+        painter.drawRect(
+            round(roi.x * image.width()),
+            round(roi.y * image.height()),
+            max(1, round(roi.width * image.width())),
+            max(1, round(roi.height * image.height())),
+        )
+        painter.end()
+
     def _clear_preview(self, direction: Direction, message: str) -> None:
         self._latest_images.pop(direction, None)
         preview = self.camera_cards[direction].preview
@@ -280,12 +361,14 @@ class DashboardWindow(QMainWindow):
         auth_service: object,
         plate_service: PlateService,
         camera_service: CameraService,
+        recognition_service: PlateRecognitionService | None = None,
     ) -> None:
         super().__init__()
         self.user = user
         self.auth_service = auth_service
         self.plate_service = plate_service
         self.camera_service = camera_service
+        self.recognition_service = recognition_service
         self.pages: list[QWidget] = []
         self.nav_buttons: list[QPushButton] = []
         self._camera_shutdown_started = False
@@ -293,6 +376,8 @@ class DashboardWindow(QMainWindow):
         self.setMinimumSize(1080, 700)
         self.resize(1280, 820)
         self._build_ui()
+        if self.recognition_service is not None:
+            self.recognition_service.record_saved.connect(self._refresh_record_pages)
 
     def _build_ui(self) -> None:
         root = QWidget(objectName="appRoot")
@@ -332,6 +417,7 @@ class DashboardWindow(QMainWindow):
             self.plate_service,
             self.camera_service,
             self.user,
+            self.recognition_service,
         )
         self._add_page(
             sidebar_layout,
@@ -387,8 +473,17 @@ class DashboardWindow(QMainWindow):
         if callable(refresh):
             refresh()
 
+    @Slot(object)
+    def _refresh_record_pages(self, _record: PlateRecord) -> None:
+        for page in self.pages[1:3]:
+            refresh = getattr(page, "refresh", None)
+            if callable(refresh):
+                refresh()
+
     def closeEvent(self, event: QCloseEvent) -> None:
         if not self._camera_shutdown_started:
             self._camera_shutdown_started = True
             self.camera_service.stop_all()
+            if self.recognition_service is not None:
+                self.recognition_service.stop()
         super().closeEvent(event)
