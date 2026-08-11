@@ -1,0 +1,6 @@
+{
+  "database_path": "data/plate_tracker.db",
+  "plate_detection": {
+    "duplicate_cooldown_seconds": 10
+  }
+}
