@@ -17,3 +17,13 @@ models/ocr/**
 !models/ocr/detection/.gitkeep
 !models/ocr/recognition/
 !models/ocr/recognition/.gitkeep
+!models/ocr/onnx/
+!models/ocr/onnx/detection/
+!models/ocr/onnx/detection/.gitkeep
+!models/ocr/onnx/recognition/
+!models/ocr/onnx/recognition/.gitkeep
+!models/ocr/paddle/
+!models/ocr/paddle/detection/
+!models/ocr/paddle/detection/.gitkeep
+!models/ocr/paddle/recognition/
+!models/ocr/paddle/recognition/.gitkeep

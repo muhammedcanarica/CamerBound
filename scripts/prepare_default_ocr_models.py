@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.ocr_models import OcrModelError
+from app.ocr_models import OcrBackend, OcrModelError, normalize_ocr_backend
 from scripts.convert_paddle_models import (
     ConversionToolsError,
     check_conversion_tools,
@@ -168,12 +168,12 @@ def find_paddle_model_directory(extracted_root: Path) -> Path:
     )
 
 
-def write_model_metadata(model_root: Path) -> None:
+def write_model_metadata(model_root: Path, backend: OcrBackend) -> None:
     metadata = {
         "detection": {"name": DEFAULT_MODELS[0].name},
         "recognition": {"name": DEFAULT_MODELS[1].name},
-        "format": "onnx",
-        "engine": "onnxruntime",
+        "format": backend.value,
+        "engine": "onnxruntime" if backend is OcrBackend.ONNX else "paddle",
     }
     destination = model_root / "model-info.json"
     temporary = destination.with_name(destination.name + ".tmp")
@@ -185,10 +185,10 @@ def write_model_metadata(model_root: Path) -> None:
     os.replace(temporary, destination)
 
 
-def dry_run_report(project_root: Path) -> list[str]:
+def dry_run_report(project_root: Path, backend: OcrBackend) -> list[str]:
     download_root = project_root / DOWNLOAD_ROOT_NAME
     conversion_root = project_root / CONVERSION_ROOT_NAME
-    model_root = project_root / FINAL_MODEL_ROOT_NAME
+    model_root = project_root / FINAL_MODEL_ROOT_NAME / backend.value
     return [
         "Detection model:",
         DEFAULT_MODELS[0].name,
@@ -200,7 +200,7 @@ def dry_run_report(project_root: Path) -> list[str]:
         str(download_root),
         "",
         "Conversion output:",
-        str(conversion_root),
+        str(conversion_root) if backend is OcrBackend.ONNX else "Skipped (Paddle backend)",
         "",
         "Final models:",
         str(model_root),
@@ -214,28 +214,35 @@ def prepare_default_models(
     *,
     force: bool = False,
     dry_run: bool = False,
+    backend: str | OcrBackend = OcrBackend.AUTO,
     downloader=download_file,
     converter=convert,
     installer=install_models,
+    paddle_installer=None,
     verifier=verify_ocr_setup,
     tool_checker=check_conversion_tools,
 ) -> list[str]:
     project_root = project_root.resolve()
+    selected_backend = _preparation_backend(backend)
     if dry_run:
-        return dry_run_report(project_root)
+        return dry_run_report(project_root, selected_backend)
 
-    tool_checker()
+    if selected_backend is OcrBackend.ONNX:
+        tool_checker()
     download_root = project_root / DOWNLOAD_ROOT_NAME
     work_root = project_root / WORK_ROOT_NAME
     conversion_root = project_root / CONVERSION_ROOT_NAME
     model_root = project_root / FINAL_MODEL_ROOT_NAME
+    final_backend_root = model_root / selected_backend.value
     staging_root = project_root / STAGING_MODEL_ROOT_NAME
-    backup_root = project_root / BACKUP_MODEL_ROOT_NAME
-    _recover_interrupted_publish(model_root, backup_root)
+    staging_backend_root = staging_root / selected_backend.value
+    backup_root = project_root / BACKUP_MODEL_ROOT_NAME / selected_backend.value
+    _recover_interrupted_publish(final_backend_root, backup_root)
     if force:
         _remove_tree(download_root, project_root / "build")
         _remove_tree(work_root, project_root / "build")
-        _remove_tree(conversion_root, project_root / "build")
+        if selected_backend is OcrBackend.ONNX:
+            _remove_tree(conversion_root, project_root / "build")
 
     _remove_tree(staging_root, project_root / "models")
 
@@ -257,26 +264,56 @@ def prepare_default_models(
             paddle_sources[spec.key] = find_paddle_model_directory(extract_root)
 
         lines.append("")
-        converted_sources: dict[str, tuple[Path, str]] = {}
-        for spec in DEFAULT_MODELS:
-            output = conversion_root / spec.key
-            _remove_tree(output, conversion_root)
-            converter(paddle_sources[spec.key], output, 11)
-            converted_sources[spec.key] = (output, spec.label)
-            lines.append(f"{spec.label} conversion... OK")
+        if selected_backend is OcrBackend.ONNX:
+            converted_sources: dict[str, tuple[Path, str]] = {}
+            for spec in DEFAULT_MODELS:
+                output = conversion_root / spec.key
+                _remove_tree(output, conversion_root)
+                converter(paddle_sources[spec.key], output, 11)
+                converted_sources[spec.key] = (output, spec.label)
+                lines.append(f"{spec.label} conversion... OK")
+            installer(converted_sources, staging_backend_root)
+        else:
+            install_paddle = paddle_installer or install_paddle_models
+            install_paddle(paddle_sources, staging_backend_root)
+            lines.extend(
+                (
+                    "Detection Paddle model: OK",
+                    "Recognition Paddle model: OK",
+                )
+            )
 
-        installer(converted_sources, staging_root)
-        _preserve_gitkeep_files(model_root, staging_root)
-        write_model_metadata(staging_root)
-        exit_code, verification_lines = verifier(staging_root)
+        write_model_metadata(staging_backend_root, selected_backend)
+        exit_code, verification_lines = verifier(
+            staging_root,
+            backend=selected_backend,
+        )
         if exit_code != 0:
             raise ModelPreparationError("\n".join(verification_lines))
-        _publish_staged_models(staging_root, model_root, backup_root)
+        _publish_staged_models(staging_backend_root, final_backend_root, backup_root)
 
         lines.extend(("", *verification_lines, "", "OCR MODELS READY"))
         return lines
     finally:
         _remove_tree(staging_root, project_root / "models")
+
+
+def _preparation_backend(value: str | OcrBackend) -> OcrBackend:
+    normalized = normalize_ocr_backend(value)
+    if normalized is OcrBackend.AUTO:
+        return OcrBackend.PADDLE if sys.platform == "win32" else OcrBackend.ONNX
+    return normalized
+
+
+def install_paddle_models(sources: dict[str, Path], model_root: Path) -> None:
+    for folder, source in sources.items():
+        source = validate_paddle_model_directory(source)
+        target = model_root / folder
+        target.mkdir(parents=True, exist_ok=True)
+        for filename in ("inference.json", "inference.pdmodel", "inference.pdiparams", "inference.yml"):
+            source_file = source / filename
+            if source_file.is_file():
+                shutil.copy2(source_file, target / filename)
 
 
 def _remove_tree(path: Path, allowed_root: Path) -> None:
@@ -292,16 +329,10 @@ def _recover_interrupted_publish(model_root: Path, backup_root: Path) -> None:
     if not backup_root.exists():
         return
     if model_root.exists():
-        _remove_tree(backup_root, model_root.parent)
+        _remove_tree(backup_root, model_root.parent.parent)
     else:
+        model_root.parent.mkdir(parents=True, exist_ok=True)
         os.replace(backup_root, model_root)
-
-
-def _preserve_gitkeep_files(model_root: Path, staging_root: Path) -> None:
-    for folder in ("detection", "recognition"):
-        source = model_root / folder / ".gitkeep"
-        if source.is_file():
-            shutil.copy2(source, staging_root / folder / ".gitkeep")
 
 
 def _publish_staged_models(
@@ -310,8 +341,10 @@ def _publish_staged_models(
     backup_root: Path,
 ) -> None:
     _recover_interrupted_publish(model_root, backup_root)
+    model_root.parent.mkdir(parents=True, exist_ok=True)
     had_existing_models = model_root.exists()
     if had_existing_models:
+        backup_root.parent.mkdir(parents=True, exist_ok=True)
         os.replace(model_root, backup_root)
     try:
         os.replace(staging_root, model_root)
@@ -320,19 +353,29 @@ def _publish_staged_models(
             os.replace(backup_root, model_root)
         raise
     else:
-        _remove_tree(backup_root, model_root.parent)
+        _remove_tree(backup_root, model_root.parent.parent)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Resmî PaddleOCR modellerini indirir ve lokal ONNX modelleri hazırlar."
+        description="Resmî PaddleOCR modellerini indirir ve lokal OCR modelleri hazırlar."
     )
     parser.add_argument("--force", action="store_true", help="Cache ve model çıktılarını yeniler.")
     parser.add_argument("--dry-run", action="store_true", help="Dosya değiştirmeden planı gösterir.")
+    parser.add_argument(
+        "--backend",
+        choices=tuple(item.value for item in OcrBackend),
+        default=OcrBackend.AUTO.value,
+        help="Hazırlanacak runtime backend'i (Windows auto: paddle).",
+    )
     args = parser.parse_args()
 
     try:
-        lines = prepare_default_models(force=args.force, dry_run=args.dry_run)
+        lines = prepare_default_models(
+            force=args.force,
+            dry_run=args.dry_run,
+            backend=args.backend,
+        )
     except (
         ConversionToolsError,
         ModelPreparationError,

@@ -1,0 +1,3 @@
+# requirements.txt sonrasında native Paddle CPU fallback için kurulur.
+# Packaging bu dosyanın kapsamı dışındadır.
+paddlepaddle>=3.0,<4

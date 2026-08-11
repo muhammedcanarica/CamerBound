@@ -129,7 +129,9 @@ class OcrModelPreparationTests(unittest.TestCase):
     def test_failed_staging_preserves_existing_final_models(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project_root = Path(temporary)
-            existing_model = project_root / "models" / "ocr" / "detection" / "inference.onnx"
+            existing_model = (
+                project_root / "models" / "ocr" / "onnx" / "detection" / "inference.onnx"
+            )
             existing_model.parent.mkdir(parents=True)
             existing_model.write_bytes(b"working-model")
 
@@ -139,6 +141,7 @@ class OcrModelPreparationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "staging failed"):
                 prepare_default_models(
                     project_root,
+                    backend="onnx",
                     force=True,
                     downloader=_write_fake_paddle_archive,
                     converter=_fake_converter,
@@ -162,14 +165,15 @@ class OcrModelPreparationTests(unittest.TestCase):
 
             lines = prepare_default_models(
                 project_root,
+                backend="onnx",
                 downloader=_write_fake_paddle_archive,
                 converter=_fake_converter,
                 installer=_fake_installer,
-                verifier=lambda _root: (0, verification_lines),
+                verifier=lambda _root, backend: (0, verification_lines),
                 tool_checker=lambda: None,
             )
 
-            model_root = project_root / "models" / "ocr"
+            model_root = project_root / "models" / "ocr" / "onnx"
             metadata = json.loads(
                 (model_root / "model-info.json").read_text(encoding="utf-8")
             )
@@ -188,6 +192,48 @@ class OcrModelPreparationTests(unittest.TestCase):
             self.assertIn("PaddleOCR provider: OK", lines)
             self.assertIn("OCR status: READY", lines)
             self.assertEqual(lines[-1], "OCR MODELS READY")
+
+    def test_paddle_preparation_skips_conversion_and_writes_native_models(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project_root = Path(temporary)
+            existing_onnx = (
+                project_root / "models" / "ocr" / "onnx" / "detection" / "inference.onnx"
+            )
+            existing_onnx.parent.mkdir(parents=True)
+            existing_onnx.write_bytes(b"keep-onnx")
+            verification_lines = [
+                "Detection model: OK",
+                "Recognition model: OK",
+                "PaddlePaddle: OK",
+                "PaddleOCR provider: OK",
+                "OCR backend: PADDLE",
+                "OCR status: READY",
+            ]
+
+            lines = prepare_default_models(
+                project_root,
+                backend="paddle",
+                downloader=_write_fake_paddle_archive,
+                converter=lambda *_args: self.fail("Paddle preparation must not convert"),
+                verifier=lambda _root, backend: (0, verification_lines),
+                tool_checker=lambda: self.fail("Paddle preparation must not check conversion tools"),
+            )
+
+            model_root = project_root / "models" / "ocr" / "paddle"
+            metadata = json.loads(
+                (model_root / "model-info.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["format"], "paddle")
+            self.assertEqual(metadata["engine"], "paddle")
+            for folder in ("detection", "recognition"):
+                self.assertTrue((model_root / folder / "inference.json").is_file())
+                self.assertTrue((model_root / folder / "inference.pdiparams").is_file())
+                self.assertTrue((model_root / folder / "inference.yml").is_file())
+            self.assertIn("Detection Paddle model: OK", lines)
+            self.assertIn("Recognition Paddle model: OK", lines)
+            self.assertIn("OCR backend: PADDLE", lines)
+            self.assertEqual(lines[-1], "OCR MODELS READY")
+            self.assertEqual(existing_onnx.read_bytes(), b"keep-onnx")
 
 
 def _write_fake_paddle_archive(_url: str, destination: Path) -> None:

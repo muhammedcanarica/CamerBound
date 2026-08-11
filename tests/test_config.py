@@ -10,6 +10,24 @@ from app.config import DEFAULT_ROI, NormalizedRoi, load_config, update_plate_roi
 
 
 class PlateRecognitionConfigTests(unittest.TestCase):
+    def test_ocr_backend_defaults_to_auto_and_invalid_value_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            settings_path = Path(temp_directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "database_path": "test.db",
+                        "plate_detection": {"ocr_backend": "invalid"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(settings_path).plate_recognition
+
+        self.assertEqual(config.ocr_backend, "auto")
+        self.assertTrue(any("ocr_backend" in warning for warning in config.warnings))
+
     def test_invalid_roi_falls_back_without_crashing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             settings_path = Path(temp_directory) / "settings.json"

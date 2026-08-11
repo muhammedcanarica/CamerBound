@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 from app.auth import AuthService, Role, SessionUser, UserExistsError, ValidationError
 from app.camera import Camera, CameraService, Direction
 from app.config import ConfigError, update_plate_roi
-from app.ocr_models import collect_model_diagnostics
+from app.ocr_models import OcrModelError, collect_model_diagnostics, select_ocr_backend
 from app.plate_recognition import PlateRecognitionService
 from ui.roi_calibration_dialog import RoiCalibrationDialog
 from ui.records_widget import display_timestamp, prepare_table
@@ -245,15 +245,29 @@ class CameraSettingsWidget(QWidget):
         if self.recognition_service is None:
             self.diagnostics_label.setText("OCR servisi bu ekrana bağlı değil.")
             return
-        self.diagnostics_label.setText("ONNX modelleri arka planda kontrol ediliyor...")
-        model_root = self.recognition_service.config.model_root
+        self.diagnostics_label.setText("OCR modelleri arka planda kontrol ediliyor...")
+        config = self.recognition_service.config
 
         def check() -> None:
-            checks = collect_model_diagnostics(model_root, load_onnx=True)
-            lines = [
-                f"{'✓' if item.ok else '✗'} {item.name}: {item.message}"
-                for item in checks
-            ]
+            try:
+                selection = select_ocr_backend(
+                    config.model_root,
+                    config.ocr_backend,
+                    load_onnx=True,
+                )
+            except OcrModelError as exc:
+                lines = [f"OCR modelleri: Kullanılamıyor ({exc})", "Backend: Kullanılamıyor"]
+            else:
+                checks = collect_model_diagnostics(
+                    config.model_root,
+                    backend=selection.backend,
+                    load_onnx=selection.backend.value == "onnx",
+                )
+                lines = [
+                    f"{item.name}: {'Hazır' if item.ok else 'Kullanılamıyor'}"
+                    for item in checks
+                ]
+                lines.append(f"Backend: {selection.label}")
             lines.append(f"Servis: {self.recognition_service.get_status().value}")
             self.diagnostics_ready.emit("\n".join(lines))
 

@@ -74,7 +74,9 @@ def main() -> int:
         parser.error("--sample-every en az 1 olmalıdır.")
 
     config = load_config().plate_recognition
-    provider = TimedProvider(PaddleOcrProvider(config.model_root))
+    provider = TimedProvider(
+        PaddleOcrProvider(config.model_root, backend=config.ocr_backend)
+    )
     frame_count = candidates = confirmed = duplicates = 0
     started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="camerbound-pipeline-") as temporary:

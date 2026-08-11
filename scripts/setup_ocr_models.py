@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.ocr_models import OcrModelError, validate_model_directory, validate_ocr_models
 
 
-MODEL_ROOT = PROJECT_ROOT / "models" / "ocr"
+MODEL_ROOT = PROJECT_ROOT / "models" / "ocr" / "onnx"
 
 
 def install_models(
@@ -53,7 +53,7 @@ def main() -> int:
         target = MODEL_ROOT / name
         print(f"{name}: {source} -> {target}")
 
-    print("OCR modelleri hazır ve ONNX Runtime ile yüklenebiliyor.")
+    print("OCR modelleri models/ocr/onnx altında hazır ve ONNX Runtime ile yüklenebiliyor.")
     return 0
 
 

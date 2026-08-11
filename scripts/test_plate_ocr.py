@@ -49,7 +49,10 @@ def main() -> int:
         parser.error("ROI görselden çıkarılamadı.")
 
     try:
-        provider = PaddleOcrProvider(config.model_root)
+        provider = PaddleOcrProvider(
+            config.model_root,
+            backend=config.ocr_backend,
+        )
     except OcrModelNotFound as exc:
         print(str(exc))
         return 2

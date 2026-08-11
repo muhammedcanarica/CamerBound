@@ -34,6 +34,7 @@ class PlateRecognitionConfig:
     entry_roi: NormalizedRoi
     exit_roi: NormalizedRoi
     model_root: Path
+    ocr_backend: str = "auto"
     warnings: tuple[str, ...] = ()
 
     def roi_for(self, direction: object) -> NormalizedRoi:
@@ -168,6 +169,14 @@ def _load_plate_recognition(
         raw.get("duplicate_cooldown_seconds"), 10, 0, 86_400, int,
         "duplicate_cooldown_seconds", warnings,
     )
+    backend_value = raw.get("ocr_backend", "auto")
+    if not isinstance(backend_value, str) or backend_value.lower() not in {
+        "auto",
+        "onnx",
+        "paddle",
+    }:
+        warnings.append("ocr_backend geçersiz; varsayılan 'auto' kullanıldı.")
+        backend_value = "auto"
 
     roi_settings = raw.get("roi", {})
     if not isinstance(roi_settings, dict):
@@ -183,6 +192,7 @@ def _load_plate_recognition(
         entry_roi=_parse_roi(roi_settings.get("ENTRY"), "ENTRY", warnings),
         exit_roi=_parse_roi(roi_settings.get("EXIT"), "EXIT", warnings),
         model_root=(root / "models" / "ocr").resolve(),
+        ocr_backend=backend_value.lower(),
         warnings=tuple(warnings),
     )
 

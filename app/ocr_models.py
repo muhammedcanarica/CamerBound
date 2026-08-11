@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 
-LOGGER = logging.getLogger(__name__)
-REQUIRED_MODEL_FILES = ("inference.onnx", "inference.yml")
+ONNX_REQUIRED_MODEL_FILES = ("inference.onnx", "inference.yml")
+PADDLE_REQUIRED_MODEL_FILES = ("inference.pdiparams", "inference.yml")
+
+
+class OcrBackend(StrEnum):
+    AUTO = "auto"
+    ONNX = "onnx"
+    PADDLE = "paddle"
 
 
 class OcrModelError(RuntimeError):
@@ -30,17 +36,74 @@ class ModelCheck:
     providers: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class BackendSelection:
+    backend: OcrBackend
+    model_root: Path
+
+    @property
+    def label(self) -> str:
+        return "ONNX Runtime" if self.backend is OcrBackend.ONNX else "Paddle CPU"
+
+
+def normalize_ocr_backend(value: str | OcrBackend) -> OcrBackend:
+    try:
+        return value if isinstance(value, OcrBackend) else OcrBackend(str(value).lower())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Geçersiz OCR backend: {value}") from exc
+
+
+def backend_model_root(model_root: Path, backend: str | OcrBackend) -> Path:
+    """Resolve the new backend layout while retaining legacy ONNX directories."""
+    model_root = model_root.resolve()
+    normalized = normalize_ocr_backend(backend)
+    if normalized is OcrBackend.AUTO:
+        raise ValueError("AUTO backend için tek bir model klasörü çözümlenemez.")
+    nested = model_root / normalized.value
+    if normalized is OcrBackend.ONNX:
+        nested_has_artifacts = any(
+            (nested / folder / filename).is_file()
+            for folder in ("detection", "recognition")
+            for filename in ONNX_REQUIRED_MODEL_FILES
+        )
+        legacy_directories = (model_root / "detection", model_root / "recognition")
+        if not nested_has_artifacts and any(
+            directory.exists() for directory in legacy_directories
+        ):
+            return model_root
+    return nested
+
+
 def validate_model_directory(
     directory: Path,
     name: str,
     *,
+    backend: str | OcrBackend = OcrBackend.ONNX,
     load_onnx: bool = False,
 ) -> ModelCheck:
+    normalized_backend = normalize_ocr_backend(backend)
+    if normalized_backend is OcrBackend.AUTO:
+        raise ValueError("Model klasörü doğrulamasında backend AUTO olamaz.")
     directory = directory.resolve()
     if not directory.is_dir():
         raise OcrModelNotFound(f"{name} model klasörü bulunamadı: {directory}")
 
-    missing = [filename for filename in REQUIRED_MODEL_FILES if not (directory / filename).is_file()]
+    if normalized_backend is OcrBackend.ONNX:
+        missing = [
+            filename
+            for filename in ONNX_REQUIRED_MODEL_FILES
+            if not (directory / filename).is_file()
+        ]
+    else:
+        missing = [
+            filename
+            for filename in PADDLE_REQUIRED_MODEL_FILES
+            if not (directory / filename).is_file()
+        ]
+        if not (directory / "inference.json").is_file() and not (
+            directory / "inference.pdmodel"
+        ).is_file():
+            missing.insert(0, "inference.json veya inference.pdmodel")
     if missing:
         raise OcrModelNotFound(
             f"{name} modeli eksik: {', '.join(missing)} ({directory})"
@@ -60,6 +123,8 @@ def validate_model_directory(
 
     providers: tuple[str, ...] = ()
     if load_onnx:
+        if normalized_backend is not OcrBackend.ONNX:
+            raise ValueError("load_onnx yalnızca ONNX modelleri için kullanılabilir.")
         try:
             import onnxruntime as ort
 
@@ -78,34 +143,89 @@ def validate_model_directory(
         except Exception as exc:
             raise OcrModelInvalid(f"{name} ONNX modeli yüklenemedi: {exc}") from exc
 
+    runtime_message = ", ONNX Runtime yükledi" if load_onnx else ""
     return ModelCheck(
         name=name,
         directory=directory,
         ok=True,
-        message="dosyalar ve yapı geçerli" + (", ONNX Runtime yükledi" if load_onnx else ""),
+        message="dosyalar ve yapı geçerli" + runtime_message,
         providers=providers,
     )
 
 
-def validate_ocr_models(model_root: Path, *, load_onnx: bool = False) -> tuple[ModelCheck, ...]:
+def validate_ocr_models(
+    model_root: Path,
+    *,
+    backend: str | OcrBackend = OcrBackend.ONNX,
+    load_onnx: bool = False,
+) -> tuple[ModelCheck, ...]:
+    normalized_backend = normalize_ocr_backend(backend)
+    resolved_root = backend_model_root(model_root, normalized_backend)
     checks: list[ModelCheck] = []
     for folder, label in (("detection", "Detection"), ("recognition", "Recognition")):
         try:
             checks.append(
-                validate_model_directory(model_root / folder, label, load_onnx=load_onnx)
+                validate_model_directory(
+                    resolved_root / folder,
+                    label,
+                    backend=normalized_backend,
+                    load_onnx=load_onnx,
+                )
             )
         except OcrModelError as exc:
-            LOGGER.error("OCR model validation failed for %s: %s", label, exc)
             raise
     return tuple(checks)
 
 
-def collect_model_diagnostics(model_root: Path, *, load_onnx: bool = False) -> tuple[ModelCheck, ...]:
+def collect_model_diagnostics(
+    model_root: Path,
+    *,
+    backend: str | OcrBackend = OcrBackend.ONNX,
+    load_onnx: bool = False,
+) -> tuple[ModelCheck, ...]:
+    normalized_backend = normalize_ocr_backend(backend)
+    resolved_root = backend_model_root(model_root, normalized_backend)
     checks: list[ModelCheck] = []
     for folder, label in (("detection", "Detection"), ("recognition", "Recognition")):
-        directory = model_root / folder
+        directory = resolved_root / folder
         try:
-            checks.append(validate_model_directory(directory, label, load_onnx=load_onnx))
+            checks.append(
+                validate_model_directory(
+                    directory,
+                    label,
+                    backend=normalized_backend,
+                    load_onnx=load_onnx,
+                )
+            )
         except OcrModelError as exc:
             checks.append(ModelCheck(label, directory.resolve(), False, str(exc)))
     return tuple(checks)
+
+
+def select_ocr_backend(
+    model_root: Path,
+    requested: str | OcrBackend = OcrBackend.AUTO,
+    *,
+    load_onnx: bool = True,
+) -> BackendSelection:
+    normalized = normalize_ocr_backend(requested)
+    candidates = (
+        (OcrBackend.ONNX, OcrBackend.PADDLE)
+        if normalized is OcrBackend.AUTO
+        else (normalized,)
+    )
+    errors: list[str] = []
+    for candidate in candidates:
+        try:
+            validate_ocr_models(
+                model_root,
+                backend=candidate,
+                load_onnx=load_onnx and candidate is OcrBackend.ONNX,
+            )
+        except OcrModelError as exc:
+            if normalized is not OcrBackend.AUTO:
+                raise
+            errors.append(f"{candidate.value.upper()}: {exc}")
+            continue
+        return BackendSelection(candidate, backend_model_root(model_root, candidate))
+    raise OcrModelNotFound("Kullanılabilir OCR modeli bulunamadı. " + " | ".join(errors))

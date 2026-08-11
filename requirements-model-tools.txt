@@ -1,4 +1,4 @@
-# Yalnızca Paddle -> ONNX dönüşüm ortamı içindir; uygulama runtime'ına kurulmaz.
-paddlepaddle==3.3.1
+# Yalnızca Paddle -> ONNX dönüşüm araçları içindir.
+-r requirements-paddle.txt
 paddle2onnx==2.1.0
 paddlex==3.7.2

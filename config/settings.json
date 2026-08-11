@@ -1,6 +1,7 @@
 {
   "database_path": "data/plate_tracker.db",
   "plate_detection": {
+    "ocr_backend": "auto",
     "recognition_interval_ms": 500,
     "min_confidence": 0.65,
     "confirmations_required": 2,

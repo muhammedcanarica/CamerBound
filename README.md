@@ -11,7 +11,7 @@
 - Login → Dashboard akışı
 - Giriş/çıkış kamera kartlarında OpenCV tabanlı canlı önizleme ve bağlantı durumu
 - Kamera başına ayrı worker thread, sınırlı önizleme FPS'i ve otomatik yeniden bağlanma
-- PaddleOCR + ONNX Runtime ile tamamen lokal plaka tanıma
+- PaddleOCR ile ONNX Runtime veya native Paddle CPU üzerinde tamamen lokal plaka tanıma
 - Kamera yönüne özel ROI, multi-frame confirmation ve duplicate cooldown
 - Plaka ve yön bazlı kayıt arama
 - Son hareketi `ENTRY` olan araçlardan hesaplanan “İçerideki Araçlar” ekranı
@@ -28,6 +28,7 @@
 - OpenCV (`opencv-contrib-python`, PaddleOCR ile ortak tek `cv2` dağıtımı)
 - PaddleOCR 3.7.0
 - ONNX Runtime 1.27.0 (CPU)
+- Native fallback için PaddlePaddle 3.x (CPU)
 
 ## Kurulum
 
@@ -39,6 +40,8 @@ py -3.12 -m venv .venv
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
+
+Native Paddle fallback kullanılacaksa ayrıca `python -m pip install -r requirements-paddle.txt` çalıştırılır.
 
 ## Çalıştırma
 
@@ -85,25 +88,27 @@ OCR inference ayrı bir `QThread` üzerinde çalışır. Kamera başına yalnız
 
 ### OCR model hazırlama altyapısı
 
-Repository model binary dosyalarını içermez. Development hazırlık scripti [PaddleOCR resmî model listesindeki](https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/OCR.html) `PP-OCRv5_mobile_det` ve `en_PP-OCRv5_mobile_rec` modellerini Paddle'ın resmî model artefact sunucusundan indirir, `build/ocr-model-downloads/` altında cache'ler ve ONNX'e dönüştürür. Bu adım internet bağlantısı gerektirir.
+Repository model binary dosyalarını içermez. Development hazırlık scripti [PaddleOCR resmî model listesindeki](https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/OCR.html) `PP-OCRv5_mobile_det` ve `en_PP-OCRv5_mobile_rec` modellerini Paddle'ın resmî model artefact sunucusundan indirir ve `build/ocr-model-downloads/` altında cache'ler. Modeller native Paddle olarak doğrudan kurulabilir veya ayrıca ONNX'e dönüştürülebilir. Yalnızca hazırlama/indirme adımı internet bağlantısı gerektirir.
 
 Normal uygulama çalışması hiçbir zaman model indirmez ve internet gerektirmez. Model yoksa Dashboard'daki `OCR: Kullanılamıyor` davranışı korunur.
 
 Hazırlık seçenekleri:
 
 ```powershell
-python scripts/prepare_default_ocr_models.py
-python scripts/prepare_default_ocr_models.py --dry-run
-python scripts/prepare_default_ocr_models.py --force
+python -m pip install -r requirements-paddle.txt
+python scripts/prepare_default_ocr_models.py --backend paddle
+python scripts/verify_ocr_models.py
 ```
 
-`--dry-run` dosya değiştirmeden yolları gösterir. `--force` indirme cache'ini ve `build/ocr-onnx/` dönüşüm çıktılarını baştan hazırlar; doğrulama tamamlanana kadar mevcut çalışan `models/ocr/` klasörünü korur. Resmî artefactlar için dokümante edilmiş checksum yayımlanmadığından sahte checksum kullanılmaz; indirme uzunluğu, güvenli archive extraction, Paddle model yapısı ve ONNX Runtime yüklemesi doğrulanır.
+Windows geliştirme ortamında önerilen yol `--backend paddle` seçeneğidir; bu yol Paddle2ONNX çalıştırmaz. `--backend auto` Windows'ta Paddle'ı, diğer platformlarda ONNX'i hazırlar. `--dry-run` dosya değiştirmeden yolları gösterir. `--force` indirme cache'ini ve seçilen backend çıktısını baştan hazırlar; doğrulama tamamlanana kadar mevcut çalışan backend klasörünü korur. Resmî artefactlar için dokümante edilmiş checksum yayımlanmadığından sahte checksum kullanılmaz; indirme uzunluğu, güvenli archive extraction ve model yapısı doğrulanır.
+
+Runtime backend seçimi `auto` olduğunda geçerli ONNX modelleri önce kullanılır; ONNX hazır değilse native Paddle CPU'ya geçilir. Uygulama runtime sırasında model indirmez.
 
 #### Advanced / Troubleshooting
 
-Manuel dönüşüm veya hazırlanmış ONNX klasörlerini kurmak için `scripts/convert_paddle_models.py` ve `scripts/setup_ocr_models.py` ayrı ayrı kullanılabilir. Normal geliştirme akışında bu adımlar gerekli değildir; `prepare_default_ocr_models.py` aynı mantığı tek komutta çağırır.
+ONNX dönüşümünü yeniden denemek için `python scripts/prepare_default_ocr_models.py --backend onnx` kullanılabilir. Manuel dönüşüm veya hazırlanmış ONNX klasörlerini kurmak için `scripts/convert_paddle_models.py` ve `scripts/setup_ocr_models.py` ayrı ayrı kullanılabilir.
 
-Final klasörlerde `inference.onnx` ve `inference.yml` bulunur; `models/ocr/model-info.json` kullanılan resmî model adlarını kaydeder. Binary dosyalar `.gitignore` kapsamındadır.
+ONNX modelleri `models/ocr/onnx/`, native modeller `models/ocr/paddle/` altında tutulur. Eski `models/ocr/detection|recognition` ONNX yapısı geriye uyumluluk için hâlâ tanınır. Her backend klasöründeki `model-info.json` kullanılan resmî model adlarını kaydeder. Binary dosyalar `.gitignore` kapsamındadır.
 
 ### ROI ve tanıma ayarları
 
@@ -114,11 +119,12 @@ Final klasörlerde `inference.onnx` ve `inference.yml` bulunur; `models/ocr/mode
 - `confirmations_required`: Plakanın kaydedilmeden önce kaç frame'de görülmesi gerektiği.
 - `confirmation_window_seconds`: Confirmation oylarının geçerli olduğu süre.
 - `duplicate_cooldown_seconds`: Aynı kamera ve plakanın tekrar kaydedilmesini engelleyen süre.
+- `ocr_backend`: `auto`, `onnx` veya `paddle`. Varsayılan `auto`.
 - `roi.ENTRY` / `roi.EXIT`: `x`, `y`, `width`, `height` şeklinde normalize `0-1` koordinatları.
 
 Geçersiz ROI uygulamayı kapatmaz; varsayılan ROI kullanılır ve OCR durum mesajında uyarı gösterilir. Dashboard preview üzerindeki yeşil çerçeve OCR'ın taradığı alanı belirtir.
 
-Admin kullanıcı **Ayarlar → Plaka Alanını Kalibre Et** ile son kamera frame'i üzerinde ROI çizebilir. Ayar atomik kaydedilir ve kamera preview kapanmadan OCR'a uygulanır. Aynı sayfadaki **Modelleri Kontrol Et** işlemi ağır ONNX doğrulamasını arka planda çalıştırır.
+Admin kullanıcı **Ayarlar → Plaka Alanını Kalibre Et** ile son kamera frame'i üzerinde ROI çizebilir. Ayar atomik kaydedilir ve kamera preview kapanmadan OCR'a uygulanır. Aynı sayfadaki **Modelleri Kontrol Et** işlemi seçilen backend'i ve yerel modelleri arka planda doğrular.
 
 ### Tek görsel OCR testi
 

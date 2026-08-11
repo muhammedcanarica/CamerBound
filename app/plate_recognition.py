@@ -18,7 +18,12 @@ from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 
 from app.camera import CameraService, Direction
 from app.config import NormalizedRoi, PlateRecognitionConfig, application_root
-from app.ocr_models import OcrModelError, OcrModelNotFound, validate_ocr_models
+from app.ocr_models import (
+    OcrBackend,
+    OcrModelError,
+    OcrModelNotFound,
+    select_ocr_backend,
+)
 from app.plate_service import (
     DuplicatePlateDetection,
     PlateRecord,
@@ -58,32 +63,52 @@ class OcrProvider(Protocol):
 
 
 class PaddleOcrProvider:
-    """PaddleOCR 3.7 adapter configured for local ONNX Runtime inference."""
+    """Offline PaddleOCR adapter selecting ONNX Runtime or native Paddle."""
 
-    def __init__(self, model_root: Path) -> None:
-        detection_dir = model_root / "detection"
-        recognition_dir = model_root / "recognition"
-        validate_ocr_models(model_root, load_onnx=True)
+    def __init__(
+        self,
+        model_root: Path,
+        backend: str | OcrBackend = OcrBackend.AUTO,
+        *,
+        pipeline_factory=None,
+    ) -> None:
+        selection = select_ocr_backend(model_root, backend, load_onnx=True)
+        self.backend = selection.backend
+        self.backend_label = selection.label
+        detection_dir = selection.model_root / "detection"
+        recognition_dir = selection.model_root / "recognition"
 
         os.environ.setdefault(
             "PADDLE_PDX_CACHE_HOME",
             str(application_root() / "data" / "paddlex-cache"),
         )
-        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-        try:
-            from paddleocr import PaddleOCR
-        except (ImportError, OSError) as exc:
-            raise RuntimeError("PaddleOCR veya ONNX Runtime yüklenemedi.") from exc
+        os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+        if pipeline_factory is None:
+            try:
+                if self.backend is OcrBackend.PADDLE:
+                    import paddle  # noqa: F401 - verifies the native runtime
+                from paddleocr import PaddleOCR
+            except (ImportError, OSError) as exc:
+                dependency = (
+                    "PaddlePaddle/PaddleOCR"
+                    if self.backend is OcrBackend.PADDLE
+                    else "PaddleOCR/ONNX Runtime"
+                )
+                raise RuntimeError(f"{dependency} yüklenemedi.") from exc
+            pipeline_factory = PaddleOCR
 
-        self._pipeline = PaddleOCR(
-            text_detection_model_dir=str(detection_dir),
-            text_recognition_model_dir=str(recognition_dir),
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            device="cpu",
-            engine="onnxruntime",
-        )
+        options = {
+            "text_detection_model_dir": str(detection_dir),
+            "text_recognition_model_dir": str(recognition_dir),
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": False,
+            "device": "cpu",
+            "enable_hpi": False,
+        }
+        if self.backend is OcrBackend.ONNX:
+            options["engine"] = "onnxruntime"
+        self._pipeline = pipeline_factory(**options)
 
     def recognize(self, images: Sequence[np.ndarray]) -> list[OcrSegment]:
         segments: list[OcrSegment] = []
@@ -467,7 +492,10 @@ class PlateRecognitionService(QObject):
             self.start()
 
     def _default_provider_factory(self) -> OcrProvider:
-        return PaddleOcrProvider(self.config.model_root)
+        return PaddleOcrProvider(
+            self.config.model_root,
+            backend=self.config.ocr_backend,
+        )
 
     @Slot(int, object)
     def _receive_frame(self, camera_id: int, frame: object) -> None:
