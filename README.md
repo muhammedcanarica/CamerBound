@@ -66,7 +66,7 @@ ADMIN kullanıcı Ayarlar > Veri Saklama bölümünden 30 / 90 / 180 gün veya S
 - Yalnızca confirmation tamamlanıp veritabanına eklenen plaka olayında, mevcut OpenCV frame'inden bir JPEG kaydedilir.
 - Sürekli video veya aday OCR görüntüsü arşivlenmez; her confirmed kayıt için en fazla bir fotoğraf üretilir.
 - Görüntüler varsayılan olarak maksimum 960 px genişlik ve 60 JPEG kalitesiyle `data/captures/YYYY/MM/` altında tutulur.
-- Kayıtlar sayfasındaki **Fotoğrafı Aç** butonu ilişkili görüntüyü varsayılan görüntüleyicide açar. Eski kayıtlarda fotoğraf bulunmayabilir.
+- Kayıtlar sayfasında satıra çift tıklanınca metadata ve araç fotoğrafını gösteren **Kayıt Detayı** penceresi açılır; güvenli capture dosyaları buradaki **Dosyada Aç** butonuyla görüntüleyiciye gönderilebilir. Eski kayıtlarda fotoğraf bulunmayabilir.
 - Retention veya **Tüm Plaka Kayıtlarını Temizle** işlemi bir DB kaydını sildiğinde ilişkili capture dosyasını da silmeye çalışır; dosya silme hatası ana işlemi durdurmaz.
 
 ## Varsayılan geliştirme hesabı

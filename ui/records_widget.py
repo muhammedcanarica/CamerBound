@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
-
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -21,15 +18,8 @@ from PySide6.QtWidgets import (
 from app.auth import SessionUser
 from app.camera import Direction
 from app.plate_service import PlateRecord, PlateService, VehicleInside
-from app.time_utils import to_local_datetime
-
-
-def display_timestamp(value: str | datetime) -> str:
-    try:
-        local_time = to_local_datetime(value)
-        return local_time.strftime("%d.%m.%Y %H:%M:%S")
-    except (TypeError, ValueError):
-        return str(value)
+from ui.display_helpers import display_timestamp
+from ui.record_detail_dialog import RecordDetailDialog
 
 
 def prepare_table(table: QTableWidget, headers: list[str]) -> None:
@@ -47,6 +37,7 @@ class RecordsWidget(QWidget):
         super().__init__()
         self.plate_service = plate_service
         self.user = user
+        self._records: list[PlateRecord] = []
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -77,6 +68,7 @@ class RecordsWidget(QWidget):
             self.table,
             ["Plaka", "İşlem", "Kamera", "Güven", "Tarih / Saat", "Fotoğraf"],
         )
+        self.table.cellDoubleClicked.connect(self._show_record_detail)
         layout.addWidget(self.table, 1)
 
     def refresh(self) -> None:
@@ -92,6 +84,7 @@ class RecordsWidget(QWidget):
         self._populate(records)
 
     def _populate(self, records: list[PlateRecord]) -> None:
+        self._records = records
         self.table.setRowCount(len(records))
         for row_index, record in enumerate(records):
             values = (
@@ -106,35 +99,15 @@ class RecordsWidget(QWidget):
                 if column in (1, 3):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row_index, column, item)
-            if record.image_path:
-                open_button = QPushButton("Fotoğrafı Aç")
-                open_button.setObjectName("openCaptureButton")
-                open_button.clicked.connect(
-                    lambda _checked=False, path=record.image_path: self._open_capture(
-                        path
-                    )
-                )
-                self.table.setCellWidget(row_index, 5, open_button)
-            else:
-                missing_item = QTableWidgetItem("Yok")
-                missing_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.table.setItem(row_index, 5, missing_item)
+            photo_item = QTableWidgetItem("Var" if record.image_path else "Yok")
+            photo_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row_index, 5, photo_item)
 
-    def _open_capture(self, image_path: str) -> None:
-        resolved = self.plate_service.resolve_capture_path(image_path)
-        if resolved is None or not resolved.is_file():
-            QMessageBox.warning(
-                self,
-                "Fotoğraf bulunamadı",
-                "Bu kayıtla ilişkili fotoğraf dosyası bulunamadı.",
-            )
+    def _show_record_detail(self, row: int, _column: int) -> None:
+        if not 0 <= row < len(self._records):
             return
-        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(resolved))):
-            QMessageBox.warning(
-                self,
-                "Fotoğraf açılamadı",
-                "Fotoğraf varsayılan görüntüleyicide açılamadı.",
-            )
+        dialog = RecordDetailDialog(self._records[row], self.plate_service, self)
+        dialog.exec()
 
 
 class InsideVehiclesWidget(QWidget):

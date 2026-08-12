@@ -22,6 +22,16 @@ QFrame#loginCard, QFrame#contentCard, QFrame#cameraCard, QGroupBox {
     border: 1px solid #dce3ee;
     border-radius: 10px;
 }
+QFrame#recordPhotoFrame {
+    background: #e8edf5;
+    border: 1px solid #d5deeb;
+    border-radius: 10px;
+}
+QLabel#recordPhotoLabel {
+    background: transparent;
+    color: #6d7890;
+    font-size: 14px;
+}
 QLabel#appTitle {
     color: #14213d;
     font-size: 24px;
@@ -68,7 +78,7 @@ QPushButton {
 }
 QPushButton:hover { background: #2859b7; }
 QPushButton:pressed { background: #214b9b; }
-QPushButton#secondaryButton {
+QPushButton#secondaryButton, QPushButton#openCaptureFileButton {
     background: #e8edf5;
     color: #25334d;
 }

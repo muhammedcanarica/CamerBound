@@ -29,10 +29,10 @@ from app.plate_recognition import (
 )
 from app.plate_service import PlateRecord, PlateService
 from ui.admin_widget import CameraSettingsWidget, UsersAdminWidget
+from ui.display_helpers import display_timestamp
 from ui.records_widget import (
     InsideVehiclesWidget,
     RecordsWidget,
-    display_timestamp,
     prepare_table,
 )
 

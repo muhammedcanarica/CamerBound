@@ -248,10 +248,10 @@ class LoginFlowSmokeTest(unittest.TestCase):
             dashboard.findChild(QPushButton, "deleteAllPlateRecordsButton")
         )
 
-    def test_records_page_shows_and_opens_capture(self) -> None:
+    def test_records_page_opens_detail_on_double_click(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")
         camera = self.controller.camera_service.list_cameras()[0]
-        self.controller.plate_service.save_plate_detection(
+        record = self.controller.plate_service.save_plate_detection(
             "34UIIMG1",
             camera.id,
             0.94,
@@ -263,15 +263,29 @@ class LoginFlowSmokeTest(unittest.TestCase):
 
         self.assertEqual(records_page.table.columnCount(), 6)
         self.assertEqual(records_page.table.horizontalHeaderItem(5).text(), "Fotoğraf")
-        open_button = records_page.table.cellWidget(0, 5)
-        self.assertIsNotNone(open_button)
-        self.assertEqual(open_button.text(), "Fotoğrafı Aç")
+        self.assertEqual(records_page.table.item(0, 5).text(), "Var")
+        self.controller.dashboard_window.stack.setCurrentWidget(records_page)
+        self.application.processEvents()
+        click_position = records_page.table.visualItemRect(
+            records_page.table.item(0, 0)
+        ).center()
 
-        with patch(
-            "ui.records_widget.QDesktopServices.openUrl", return_value=True
-        ) as open_url:
-            open_button.click()
-        open_url.assert_called_once()
+        with patch("ui.records_widget.RecordDetailDialog") as dialog_factory:
+            QTest.mouseClick(
+                records_page.table.viewport(),
+                Qt.MouseButton.LeftButton,
+                pos=click_position,
+            )
+            QTest.mouseDClick(
+                records_page.table.viewport(),
+                Qt.MouseButton.LeftButton,
+                pos=click_position,
+            )
+            self.application.processEvents()
+
+        dialog_factory.assert_called_once()
+        self.assertEqual(dialog_factory.call_args.args[0].id, record.id)
+        dialog_factory.return_value.exec.assert_called_once()
 
     def test_delete_all_requires_exact_confirmation_text(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")
