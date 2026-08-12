@@ -270,7 +270,9 @@ class LoginFlowSmokeTest(unittest.TestCase):
 
         self.assertEqual(records_page.table.columnCount(), 6)
         self.assertEqual(records_page.table.horizontalHeaderItem(5).text(), "Fotoğraf")
-        self.assertEqual(records_page.table.item(0, 5).text(), "Var")
+        photo_button = records_page.table.cellWidget(0, 5)
+        self.assertIsInstance(photo_button, QPushButton)
+        self.assertEqual(photo_button.text(), "Aç")
         self.controller.dashboard_window.stack.setCurrentWidget(records_page)
         self.application.processEvents()
         click_position = records_page.table.visualItemRect(

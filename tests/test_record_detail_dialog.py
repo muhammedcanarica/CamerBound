@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -14,7 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPushButton
 
 from app.auth import AuthService, Role
 from app.camera import CameraService
@@ -71,7 +72,12 @@ class RecordDetailDialogTests(unittest.TestCase):
         self.temp_directory.cleanup()
 
     def test_dialog_displays_photo_and_formatted_metadata(self) -> None:
-        dialog = self._dialog(self.record)
+        launcher = Mock()
+        dialog = self._dialog(
+            self.record,
+            explorer_launcher=launcher,
+            system_name_provider=lambda: "Windows",
+        )
 
         self.assertEqual(dialog.plate_value.text(), "34 ABC 123")
         self.assertEqual(
@@ -84,11 +90,13 @@ class RecordDetailDialogTests(unittest.TestCase):
         self.assertFalse(dialog.photo_label.pixmap().isNull())
         self.assertTrue(dialog.open_file_button.isEnabled())
 
-        with patch(
-            "ui.record_detail_dialog.QDesktopServices.openUrl", return_value=True
-        ) as open_url:
-            dialog.open_file_button.click()
-        open_url.assert_called_once()
+        dialog.open_file_button.click()
+
+        resolved = self.capture_service.resolve_reference(self.record.image_path)
+        launcher.assert_called_once_with(
+            ["explorer.exe", f"/select,{resolved}"],
+            shell=False,
+        )
 
         dialog.photo_label.resize(500, 300)
         self.application.processEvents()
@@ -112,15 +120,98 @@ class RecordDetailDialogTests(unittest.TestCase):
         self.assertEqual(dialog.photo_label.text(), MISSING_PHOTO_TEXT)
         self.assertFalse(dialog.open_file_button.isEnabled())
 
+    def test_file_removed_after_preview_shows_warning_without_launching(self) -> None:
+        launcher = Mock()
+        dialog = self._dialog(
+            self.record,
+            explorer_launcher=launcher,
+            system_name_provider=lambda: "Windows",
+        )
+        resolved = self.capture_service.resolve_reference(self.record.image_path)
+        resolved.unlink()
+
+        with patch("ui.record_detail_dialog.QMessageBox.warning") as warning:
+            dialog.open_file_button.click()
+
+        launcher.assert_not_called()
+        self.assertFalse(dialog.open_file_button.isEnabled())
+        warning.assert_called_once()
+        self.assertEqual(warning.call_args.args[2], "Fotoğraf dosyası bulunamadı.")
+
     def test_unsafe_capture_path_is_not_loaded_or_opened(self) -> None:
         unsafe = replace(self.record, image_path="../../outside.jpg")
+        launcher = Mock()
 
         with patch("ui.record_detail_dialog.QPixmap") as pixmap:
-            dialog = self._dialog(unsafe)
+            dialog = self._dialog(
+                unsafe,
+                explorer_launcher=launcher,
+                system_name_provider=lambda: "Windows",
+            )
 
         pixmap.assert_not_called()
         self.assertEqual(dialog.photo_label.text(), MISSING_PHOTO_TEXT)
         self.assertFalse(dialog.open_file_button.isEnabled())
+
+        with patch("ui.record_detail_dialog.QMessageBox.warning"):
+            dialog._open_file()
+        launcher.assert_not_called()
+
+    def test_absolute_path_outside_capture_root_is_not_opened(self) -> None:
+        outside = self.root / "outside.jpg"
+        outside.write_bytes(b"not-an-image")
+        unsafe = replace(self.record, image_path=str(outside))
+        launcher = Mock()
+        dialog = self._dialog(
+            unsafe,
+            explorer_launcher=launcher,
+            system_name_provider=lambda: "Windows",
+        )
+
+        with patch("ui.record_detail_dialog.QMessageBox.warning") as warning:
+            dialog._open_file()
+
+        launcher.assert_not_called()
+        self.assertFalse(dialog.open_file_button.isEnabled())
+        self.assertEqual(warning.call_args.args[2], "Fotoğraf dosyası bulunamadı.")
+
+    def test_path_with_spaces_is_passed_as_one_safe_explorer_argument(self) -> None:
+        source = self.capture_service.resolve_reference(self.record.image_path)
+        spaced_directory = self.capture_service.capture_root / "folder with spaces"
+        spaced_directory.mkdir()
+        spaced_path = spaced_directory / "vehicle photo.jpg"
+        shutil.copyfile(source, spaced_path)
+        spaced_record = replace(
+            self.record,
+            image_path=spaced_path.relative_to(self.root).as_posix(),
+        )
+        launcher = Mock()
+        dialog = self._dialog(
+            spaced_record,
+            explorer_launcher=launcher,
+            system_name_provider=lambda: "Windows",
+        )
+
+        dialog.open_file_button.click()
+
+        launcher.assert_called_once_with(
+            ["explorer.exe", f"/select,{spaced_path}"],
+            shell=False,
+        )
+
+    def test_non_windows_environment_does_not_launch_process(self) -> None:
+        launcher = Mock()
+        dialog = self._dialog(
+            self.record,
+            explorer_launcher=launcher,
+            system_name_provider=lambda: "Linux",
+        )
+
+        with patch("ui.record_detail_dialog.QMessageBox.warning") as warning:
+            dialog.open_file_button.click()
+
+        launcher.assert_not_called()
+        self.assertIn("yalnızca Windows", warning.call_args.args[2])
 
     def test_records_table_does_not_eager_load_images(self) -> None:
         widget = self._records_widget(self.admin)
@@ -129,7 +220,71 @@ class RecordDetailDialogTests(unittest.TestCase):
             widget.refresh()
 
         pixmap.assert_not_called()
-        self.assertEqual(widget.table.item(0, 5).text(), "Var")
+        row = self._row_for_record(widget, self.record.id)
+        open_button = widget.table.cellWidget(row, 5)
+        self.assertIsInstance(open_button, QPushButton)
+        self.assertEqual(open_button.text(), "Aç")
+
+    def test_record_without_image_shows_dash_in_photo_column(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        record_without_image = self.plate_service.save_plate_detection(
+            "06NOPHOTO",
+            camera.id,
+            0.91,
+            datetime(2026, 8, 12, 8, 22, 0, tzinfo=timezone.utc),
+        )
+        widget = self._records_widget(self.admin)
+
+        widget.refresh()
+
+        row = self._row_for_record(widget, record_without_image.id)
+        self.assertIsNone(widget.table.cellWidget(row, 5))
+        self.assertEqual(widget.table.item(row, 5).text(), "-")
+
+    def test_photo_button_opens_existing_dialog_for_correct_record(self) -> None:
+        widget = self._records_widget(self.user)
+        widget.refresh()
+        row = self._row_for_record(widget, self.record.id)
+
+        with patch("ui.records_widget.RecordDetailDialog") as dialog_factory:
+            widget.table.cellWidget(row, 5).click()
+
+        dialog_factory.assert_called_once()
+        self.assertEqual(dialog_factory.call_args.args[0].id, self.record.id)
+        dialog_factory.return_value.exec.assert_called_once()
+
+    def test_photo_buttons_keep_record_mapping_after_sort_and_refresh(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        second_record = self.plate_service.save_plate_detection(
+            "06PHOTO2",
+            camera.id,
+            0.92,
+            datetime(2026, 8, 12, 8, 23, 0, tzinfo=timezone.utc),
+            np.full((300, 600, 3), 120, dtype=np.uint8),
+        )
+        widget = self._records_widget(self.user)
+        widget.table.setSortingEnabled(True)
+        widget.refresh()
+        widget.table.sortItems(0, Qt.SortOrder.DescendingOrder)
+
+        for expected_record in (self.record, second_record):
+            with self.subTest(record_id=expected_record.id), patch(
+                "ui.records_widget.RecordDetailDialog"
+            ) as dialog_factory:
+                row = self._row_for_record(widget, expected_record.id)
+                widget.table.cellWidget(row, 5).click()
+
+                dialog_factory.assert_called_once()
+                self.assertEqual(dialog_factory.call_args.args[0].id, expected_record.id)
+
+        widget.search_input.setText(second_record.plate)
+        with patch("ui.records_widget.RecordDetailDialog") as dialog_factory:
+            widget.refresh()
+            row = self._row_for_record(widget, second_record.id)
+            widget.table.cellWidget(row, 5).click()
+
+        self.assertEqual(widget.table.rowCount(), 1)
+        self.assertEqual(dialog_factory.call_args.args[0].id, second_record.id)
 
     def test_user_can_open_correct_record_by_double_clicking_row(self) -> None:
         widget = self._records_widget(self.user)
@@ -158,8 +313,8 @@ class RecordDetailDialogTests(unittest.TestCase):
         self.assertEqual(opened_record.id, self.record.id)
         dialog_factory.return_value.exec.assert_called_once()
 
-    def _dialog(self, record: PlateRecord) -> RecordDetailDialog:
-        dialog = RecordDetailDialog(record, self.plate_service)
+    def _dialog(self, record: PlateRecord, **kwargs: object) -> RecordDetailDialog:
+        dialog = RecordDetailDialog(record, self.plate_service, **kwargs)
         self.widgets.append(dialog)
         dialog.show()
         self.application.processEvents()
@@ -169,6 +324,14 @@ class RecordDetailDialogTests(unittest.TestCase):
         widget = RecordsWidget(self.plate_service, actor)
         self.widgets.append(widget)
         return widget
+
+    @staticmethod
+    def _row_for_record(widget: RecordsWidget, record_id: int) -> int:
+        for row in range(widget.table.rowCount()):
+            item = widget.table.item(row, 0)
+            if item.data(Qt.ItemDataRole.UserRole) == record_id:
+                return row
+        raise AssertionError(f"Record row not found: {record_id}")
 
 
 if __name__ == "__main__":

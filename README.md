@@ -82,6 +82,7 @@ OCR yalnızca belirlenen ROI alanında çalışır.
 ## Araç Fotoğrafları
 
 Confirmed plaka kayıtlarında mevcut kamera frame'inden küçük bir JPEG araç fotoğrafı oluşturulur.
+Kayıtlar ekranında fotoğrafı bulunan satırlarda `Aç` butonu gösterilir; bu buton mevcut Kayıt Detayı penceresini açar. Fotoğrafı olmayan satırlarda `-` gösterilir.
 
 Varsayılan ayarlar:
 

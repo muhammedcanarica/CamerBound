@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import partial
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
@@ -38,6 +40,7 @@ class RecordsWidget(QWidget):
         self.plate_service = plate_service
         self.user = user
         self._records: list[PlateRecord] = []
+        self._records_by_id: dict[int, PlateRecord] = {}
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -85,6 +88,10 @@ class RecordsWidget(QWidget):
 
     def _populate(self, records: list[PlateRecord]) -> None:
         self._records = records
+        self._records_by_id = {record.id: record for record in records}
+        sorting_enabled = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
         self.table.setRowCount(len(records))
         for row_index, record in enumerate(records):
             values = (
@@ -96,17 +103,40 @@ class RecordsWidget(QWidget):
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, record.id)
                 if column in (1, 3):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row_index, column, item)
-            photo_item = QTableWidgetItem("Var" if record.image_path else "Yok")
-            photo_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row_index, 5, photo_item)
+            if record.image_path:
+                open_button = QPushButton("Aç")
+                open_button.setObjectName("openRecordPhotoButton")
+                open_button.setProperty("recordId", record.id)
+                open_button.setToolTip("Kayıt detayını ve araç fotoğrafını aç")
+                open_button.clicked.connect(
+                    partial(self._open_record_detail, record.id)
+                )
+                self.table.setCellWidget(row_index, 5, open_button)
+            else:
+                photo_item = QTableWidgetItem("-")
+                photo_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row_index, 5, photo_item)
+        self.table.setSortingEnabled(sorting_enabled)
 
     def _show_record_detail(self, row: int, _column: int) -> None:
-        if not 0 <= row < len(self._records):
+        record_item = self.table.item(row, 0)
+        if record_item is None:
             return
-        dialog = RecordDetailDialog(self._records[row], self.plate_service, self)
+        record_id = record_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(record_id, int):
+            return
+        self._open_record_detail(record_id)
+
+    def _open_record_detail(self, record_id: int) -> None:
+        record = self._records_by_id.get(record_id)
+        if record is None:
+            return
+        dialog = RecordDetailDialog(record, self.plate_service, self)
         dialog.exec()
 
 

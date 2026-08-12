@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QPixmap, QResizeEvent
+import platform
+import subprocess
+from collections.abc import Callable
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QDialog,
     QFormLayout,
@@ -69,10 +73,15 @@ class RecordDetailDialog(QDialog):
         record: PlateRecord,
         plate_service: PlateService,
         parent: QWidget | None = None,
+        *,
+        explorer_launcher: Callable[..., object] = subprocess.Popen,
+        system_name_provider: Callable[[], str] = platform.system,
     ) -> None:
         super().__init__(parent)
         self.record = record
         self.plate_service = plate_service
+        self._explorer_launcher = explorer_launcher
+        self._system_name_provider = system_name_provider
         self.setObjectName("recordDetailDialog")
         self.setWindowTitle("Kayıt Detayı")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -152,12 +161,29 @@ class RecordDetailDialog(QDialog):
         if resolved is None or not resolved.is_file():
             self.open_file_button.setEnabled(False)
             self.photo_label.show_placeholder()
-            return
-        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(resolved))):
             QMessageBox.warning(
                 self,
-                "Fotoğraf açılamadı",
-                "Fotoğraf varsayılan görüntüleyicide açılamadı.",
+                "Fotoğraf bulunamadı",
+                "Fotoğraf dosyası bulunamadı.",
+            )
+            return
+        if self._system_name_provider() != "Windows":
+            QMessageBox.warning(
+                self,
+                "Dosya konumu açılamadı",
+                "Bu özellik yalnızca Windows'ta kullanılabilir.",
+            )
+            return
+        try:
+            self._explorer_launcher(
+                ["explorer.exe", f"/select,{resolved}"],
+                shell=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            QMessageBox.warning(
+                self,
+                "Dosya konumu açılamadı",
+                "Fotoğrafın bulunduğu klasör Windows Explorer'da açılamadı.",
             )
 
     @staticmethod
