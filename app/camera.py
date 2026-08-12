@@ -8,6 +8,7 @@ import logging
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 
+from app.audit import AuditAction, AuditService
 from app.auth import AuthService, SessionUser, ValidationError
 from app.camera_worker import (
     CameraStatus,
@@ -17,6 +18,7 @@ from app.camera_worker import (
 )
 from app.config import application_root
 from app.database import Database
+from app.security import sanitize_camera_source_for_log, sanitize_text_for_log
 
 
 LOGGER = logging.getLogger(__name__)
@@ -56,12 +58,14 @@ class CameraService(QObject):
         capture_factory: CaptureFactory = create_video_capture,
         retry_delay_seconds: float = 2.5,
         preview_fps: float = 12.0,
+        audit_service: AuditService | None = None,
     ) -> None:
         super().__init__()
         self.database = database
         self.capture_factory = capture_factory
         self.retry_delay_seconds = retry_delay_seconds
         self.preview_fps = preview_fps
+        self.audit_service = audit_service or AuditService(database)
         self._statuses: dict[int, CameraStatus] = {}
         self._runtimes: dict[int, _CameraRuntime] = {}
         self._latest_frames: dict[int, object] = {}
@@ -128,7 +132,17 @@ class CameraService(QObject):
             )
             if cursor.rowcount == 0:
                 raise ValidationError("Kamera bulunamadı.")
-        return self.get_camera(camera_id)
+        updated = self.get_camera(camera_id)
+        self.audit_service.try_log(
+            AuditAction.CAMERA_SETTINGS_CHANGED,
+            actor=actor,
+            details=(
+                f"camera_id={updated.id}; name={sanitize_text_for_log(updated.name)}; "
+                f"direction={updated.direction.value}; enabled={updated.enabled}; "
+                f"source={sanitize_camera_source_for_log(updated.stream_url)}"
+            ),
+        )
+        return updated
 
     def start_camera(self, camera_id: int) -> CameraStatus:
         camera = self.get_camera(camera_id)

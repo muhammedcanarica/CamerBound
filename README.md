@@ -76,6 +76,15 @@ ADMIN kullanıcı Ayarlar > Veri Saklama bölümünden 30 / 90 / 180 gün veya S
 
 **Bu hesap yalnızca ilk geliştirme içindir. Production kullanımı öncesinde varsayılan parola mutlaka değiştirilmelidir.**
 
+## Production Güvenliği
+
+- Güvenlik görevlileri günlük kullanımda `USER` rolüyle ve Windows'ta standart kullanıcı hesabıyla çalışmalıdır.
+- Başarılı/başarısız girişler ile kritik yönetim işlemleri silme özelliği sunulmayan güvenlik audit günlüğüne yazılır.
+- Kamera URL credential'ları uygulama loglarında ve audit detaylarında maskelenir; query-string içeriği loglanmaz.
+- `data/` klasörüne yalnızca CamerBound'u çalıştıran Windows hesabı ve sistem yöneticileri erişebilmelidir.
+- Güvenlik bilgisayarında mümkünse BitLocker etkinleştirilmelidir.
+- Production deployment'ta kamera credential'ları işletim sistemi tarafından korunan secret storage'a taşınmalıdır. Mevcut sürüm bunları yerel DB'de saklamaya devam eder.
+
 ## Testler
 
 Servis ve arayüz smoke testlerini çalıştırmak için:
@@ -254,6 +263,8 @@ CamerBound/
 
 - `app/database.py`: SQLite bağlantısı, transaction yönetimi, şema ve başlangıç kamera kayıtları.
 - `app/auth.py`: Parola hashleme, login, oturum modeli, kullanıcı oluşturma ve rol kontrolleri.
+- `app/audit.py`: Kritik güvenlik olaylarını UTC timestamp ile saklayan ve yalnızca ADMIN'e listeleyen audit servisi.
+- `app/security.py`: Kamera URL'lerindeki credential ve query bilgisini log/audit için merkezi olarak temizler.
 - `app/camera.py`: Kamera ayarları, worker/thread referansları ve capture yaşam döngüsünün servis sınırı.
 - `app/camera_worker.py`: OpenCV kaynağını UI thread'i dışında okur, önizleme FPS'ini sınırlar ve kesintide yeniden bağlanır.
 - `app/plate_recognition.py`: ROI, preprocessing, PaddleOCR adapter, plaka doğrulama, voting ve OCR worker yaşam döngüsü.

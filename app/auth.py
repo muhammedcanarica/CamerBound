@@ -6,6 +6,7 @@ from enum import StrEnum
 
 import bcrypt
 
+from app.audit import AuditAction, AuditService
 from app.database import Database
 from app.time_utils import to_utc_storage, utc_now
 
@@ -43,8 +44,13 @@ class AuthService:
     DEFAULT_ADMIN_USERNAME = "admin"
     DEFAULT_ADMIN_PASSWORD = "admin123"
 
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        audit_service: AuditService | None = None,
+    ) -> None:
         self.database = database
+        self.audit_service = audit_service or AuditService(database)
 
     def ensure_default_admin(self) -> bool:
         with self.database.connection() as connection:
@@ -68,6 +74,10 @@ class AuthService:
     def authenticate(self, username: str, password: str) -> SessionUser:
         normalized_username = username.strip()
         if not normalized_username or not password:
+            self.audit_service.try_log(
+                AuditAction.LOGIN_FAILURE,
+                username=normalized_username,
+            )
             raise AuthenticationError("Kullanıcı adı ve şifre zorunludur.")
 
         with self.database.connection() as connection:
@@ -77,11 +87,17 @@ class AuthService:
             ).fetchone()
 
         if row is None or not self._password_matches(password, row["password_hash"]):
+            self.audit_service.try_log(
+                AuditAction.LOGIN_FAILURE,
+                username=normalized_username,
+            )
             raise AuthenticationError("Kullanıcı adı veya şifre hatalı.")
 
-        return SessionUser(
+        user = SessionUser(
             id=row["id"], username=row["username"], role=Role(row["role"])
         )
+        self.audit_service.try_log(AuditAction.LOGIN_SUCCESS, actor=user)
+        return user
 
     def create_user(
         self, actor: SessionUser, username: str, password: str, role: Role | str
@@ -113,11 +129,19 @@ class AuthService:
         except sqlite3.IntegrityError as exc:
             raise UserExistsError("Bu kullanıcı adı zaten kullanılıyor.") from exc
 
-        return SessionUser(
+        created = SessionUser(
             id=user_id,
             username=normalized_username,
             role=normalized_role,
         )
+        self.audit_service.try_log(
+            AuditAction.USER_CREATED,
+            actor=actor,
+            details=(
+                f"created_username={created.username}; role={created.role.value}"
+            ),
+        )
+        return created
 
     def list_users(self, actor: SessionUser) -> list[sqlite3.Row]:
         self.require_admin(actor)

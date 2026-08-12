@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.audit import AuditService
 from app.auth import Role, SessionUser, ValidationError
 from app.camera import Camera, CameraService, CameraStatus, Direction
 from app.plate_recognition import (
@@ -377,6 +378,7 @@ class DashboardWindow(QMainWindow):
         plate_service: PlateService,
         camera_service: CameraService,
         recognition_service: PlateRecognitionService | None = None,
+        audit_service: AuditService | None = None,
     ) -> None:
         super().__init__()
         self.user = user
@@ -384,6 +386,7 @@ class DashboardWindow(QMainWindow):
         self.plate_service = plate_service
         self.camera_service = camera_service
         self.recognition_service = recognition_service
+        self.audit_service = audit_service
         self.pages: list[QWidget] = []
         self.nav_buttons: list[QPushButton] = []
         self._camera_shutdown_started = False
@@ -461,6 +464,7 @@ class DashboardWindow(QMainWindow):
                 self.user,
                 self.plate_service,
                 self.recognition_service,
+                self.audit_service,
             )
             settings_page.records_changed.connect(self._refresh_after_records_changed)
             self._add_page(

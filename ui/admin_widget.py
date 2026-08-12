@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QFrame,
 )
 
+from app.audit import AuditService
 from app.auth import AuthService, Role, SessionUser, UserExistsError, ValidationError
 from app.camera import Camera, CameraService, CameraStatus, Direction
 from app.config import (
@@ -40,7 +41,8 @@ from app.ocr_models import OcrModelError, collect_model_diagnostics, select_ocr_
 from app.plate_recognition import PlateRecognitionService
 from app.plate_service import PlateService
 from ui.roi_calibration_dialog import RoiCalibrationDialog
-from ui.records_widget import display_timestamp, prepare_table
+from ui.display_helpers import display_timestamp
+from ui.records_widget import prepare_table
 
 
 class UsersAdminWidget(QWidget):
@@ -128,12 +130,14 @@ class CameraSettingsWidget(QWidget):
         user: SessionUser,
         plate_service: PlateService,
         recognition_service: PlateRecognitionService | None = None,
+        audit_service: AuditService | None = None,
     ) -> None:
         super().__init__()
         self.camera_service = camera_service
         self.user = user
         self.plate_service = plate_service
         self.recognition_service = recognition_service
+        self.audit_service = audit_service
         self.settings_path = (
             recognition_service.settings_path
             if recognition_service is not None
@@ -166,7 +170,8 @@ class CameraSettingsWidget(QWidget):
         layout.addWidget(QLabel("Kamera Ayarları", objectName="pageTitle"))
         description = QLabel(
             "Webcam index, RTSP URL veya video dosyası kaynağı yerel veritabanında saklanır. "
-            "Kamera credential koruması sonraki aşamadadır.",
+            "Credential bilgileri loglarda maskelenir; OS korumalı secret storage "
+            "production için sonraki güvenlik aşamasıdır.",
             objectName="mutedLabel",
         )
         description.setWordWrap(True)
@@ -224,6 +229,19 @@ class CameraSettingsWidget(QWidget):
         self.delete_all_records_button.clicked.connect(self._delete_all_records)
         retention_layout.addWidget(self.delete_all_records_button)
         layout.addWidget(self.retention_group)
+        if self.audit_service is not None:
+            self.audit_group = QGroupBox("Güvenlik Günlüğü")
+            self.audit_group.setObjectName("securityAuditGroup")
+            audit_layout = QVBoxLayout(self.audit_group)
+            self.audit_table = QTableWidget()
+            self.audit_table.setObjectName("securityAuditTable")
+            prepare_table(
+                self.audit_table,
+                ["Tarih / Saat", "Kullanıcı", "İşlem", "Detay"],
+            )
+            self.audit_table.setMinimumHeight(260)
+            audit_layout.addWidget(self.audit_table)
+            layout.addWidget(self.audit_group)
         layout.addStretch()
         self.scroll_area.setWidget(self.content_widget)
         root_layout.addWidget(self.scroll_area)
@@ -239,6 +257,28 @@ class CameraSettingsWidget(QWidget):
         for camera in self.camera_service.list_cameras():
             self._add_camera_editor(camera)
         self._refresh_retention()
+        self._refresh_audit_logs()
+
+    def _refresh_audit_logs(self) -> None:
+        if self.audit_service is None:
+            return
+        try:
+            logs = self.audit_service.get_recent_logs(self.user, 200)
+        except (PermissionError, sqlite3.Error) as exc:
+            self.audit_group.setToolTip(str(exc))
+            self.audit_table.setRowCount(0)
+            return
+        self.audit_group.setToolTip("")
+        self.audit_table.setRowCount(len(logs))
+        for row_index, entry in enumerate(logs):
+            values = (
+                display_timestamp(entry.timestamp),
+                entry.username,
+                entry.action,
+                entry.details or "",
+            )
+            for column, value in enumerate(values):
+                self.audit_table.setItem(row_index, column, QTableWidgetItem(value))
 
     def _refresh_retention(self) -> None:
         index = self.retention_combo.findData(self.plate_service.record_retention_days)
@@ -276,7 +316,8 @@ class CameraSettingsWidget(QWidget):
                 retention_days,
             )
             self.plate_service.set_record_retention_days(
-                updated_config.record_retention_days
+                updated_config.record_retention_days,
+                actor=self.user,
             )
             if self.recognition_service is not None:
                 self.recognition_service.config = updated_config
@@ -285,6 +326,7 @@ class CameraSettingsWidget(QWidget):
             return
 
         self._refresh_retention()
+        self._refresh_audit_logs()
         if retention_days == 0:
             message = "Plaka kayıtları süresiz saklanacak."
         else:
@@ -316,6 +358,7 @@ class CameraSettingsWidget(QWidget):
             QMessageBox.warning(self, "Kayıtlar temizlenemedi", str(exc))
             return
         self._refresh_retention()
+        self._refresh_audit_logs()
         self.records_changed.emit()
         QMessageBox.information(
             self,
@@ -354,6 +397,7 @@ class CameraSettingsWidget(QWidget):
             QMessageBox.warning(self, "Kayıtlar temizlenemedi", str(exc))
             return
         self._refresh_retention()
+        self._refresh_audit_logs()
         self.records_changed.emit()
         QMessageBox.information(
             self,
@@ -433,6 +477,7 @@ class CameraSettingsWidget(QWidget):
             )
         else:
             message = "Kamera ayarları kaydedildi ve canlı akışa uygulandı."
+        self._refresh_audit_logs()
         QMessageBox.information(
             self,
             "Başarılı",

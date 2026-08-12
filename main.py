@@ -5,6 +5,7 @@ import logging
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from app.audit import AuditService
 from app.auth import AuthService, SessionUser
 from app.camera import CameraService
 from app.config import load_config
@@ -28,11 +29,13 @@ class ApplicationController:
         plate_service: PlateService,
         camera_service: CameraService,
         recognition_service: PlateRecognitionService | None = None,
+        audit_service: AuditService | None = None,
     ) -> None:
         self.auth_service = auth_service
         self.plate_service = plate_service
         self.camera_service = camera_service
         self.recognition_service = recognition_service
+        self.audit_service = audit_service or auth_service.audit_service
         self.login_window: LoginWindow | None = None
         self.dashboard_window: DashboardWindow | None = None
 
@@ -58,6 +61,7 @@ class ApplicationController:
             self.plate_service,
             self.camera_service,
             self.recognition_service,
+            self.audit_service,
         )
         self.dashboard_window.logout_requested.connect(self.show_login)
         self.dashboard_window.show()
@@ -72,7 +76,9 @@ def build_services() -> tuple[
     config = load_config()
     database = Database(config.database_path)
     database.initialize()
-    auth_service = AuthService(database)
+    LOGGER.info("Application data directory=%s", database.path.parent.resolve())
+    audit_service = AuditService(database)
+    auth_service = AuthService(database, audit_service)
     auth_service.ensure_default_admin()
     capture_config = config.plate_capture
     capture_service = PlateCaptureService(
@@ -89,9 +95,10 @@ def build_services() -> tuple[
         config.duplicate_cooldown_seconds,
         config.plate_recognition.record_retention_days,
         capture_service=capture_service,
+        audit_service=audit_service,
     )
     apply_startup_retention_cleanup(plate_service)
-    camera_service = CameraService(database)
+    camera_service = CameraService(database, audit_service=audit_service)
     recognition_service = PlateRecognitionService(
         camera_service,
         plate_service,

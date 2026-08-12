@@ -36,10 +36,22 @@ CREATE TABLE IF NOT EXISTS plate_records (
     FOREIGN KEY (camera_id) REFERENCES cameras(id) ON UPDATE CASCADE ON DELETE RESTRICT
 );
 
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NULL,
+    username TEXT NOT NULL,
+    action TEXT NOT NULL,
+    details TEXT NULL,
+    timestamp TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON UPDATE CASCADE ON DELETE SET NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_plate_records_plate ON plate_records(plate);
 CREATE INDEX IF NOT EXISTS idx_plate_records_timestamp ON plate_records(timestamp);
 CREATE INDEX IF NOT EXISTS idx_plate_records_camera_plate_time
 ON plate_records(camera_id, plate, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp
+ON audit_logs(timestamp DESC, id DESC);
 """
 
 
@@ -95,6 +107,7 @@ class Database:
         for table, column in (
             ("users", "created_at"),
             ("plate_records", "timestamp"),
+            ("audit_logs", "timestamp"),
         ):
             rows = connection.execute(
                 f"SELECT id, {column} FROM {table}"

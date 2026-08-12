@@ -194,6 +194,9 @@ class LoginFlowSmokeTest(unittest.TestCase):
                 QSizePolicy.Policy.Expanding,
             )
         self.assertIsInstance(camera_settings.retention_group, QGroupBox)
+        self.assertIsInstance(camera_settings.audit_group, QGroupBox)
+        self.assertEqual(camera_settings.audit_group.title(), "Güvenlik Günlüğü")
+        self.assertGreater(camera_settings.audit_table.rowCount(), 0)
         self.assertEqual(
             [
                 camera_settings.retention_combo.itemText(index)
@@ -247,6 +250,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
         self.assertIsNone(
             dashboard.findChild(QPushButton, "deleteAllPlateRecordsButton")
         )
+        self.assertIsNone(dashboard.findChild(QGroupBox, "securityAuditGroup"))
 
     def test_records_page_opens_detail_on_double_click(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")

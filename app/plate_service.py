@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from app.audit import AuditAction, AuditService
 from app.auth import AuthService, SessionUser, ValidationError
 from app.camera import Direction
 from app.config import (
@@ -68,19 +69,32 @@ class PlateService:
         duplicate_cooldown_seconds: int,
         record_retention_days: int = DEFAULT_RECORD_RETENTION_DAYS,
         capture_service: PlateCaptureService | None = None,
+        audit_service: AuditService | None = None,
     ) -> None:
         self.database = database
         self.duplicate_cooldown_seconds = duplicate_cooldown_seconds
         self.capture_service = capture_service
+        self.audit_service = audit_service or AuditService(database)
         self.set_record_retention_days(record_retention_days)
 
-    def set_record_retention_days(self, retention_days: int) -> None:
+    def set_record_retention_days(
+        self,
+        retention_days: int,
+        actor: SessionUser | None = None,
+    ) -> None:
         if (
             isinstance(retention_days, bool)
             or retention_days not in SUPPORTED_RECORD_RETENTION_DAYS
         ):
             raise ValidationError("Saklama süresi 30, 90, 180 veya 0 olmalıdır.")
+        previous = getattr(self, "record_retention_days", None)
         self.record_retention_days = retention_days
+        if actor is not None and previous is not None:
+            self.audit_service.try_log(
+                AuditAction.RETENTION_CHANGED,
+                actor=actor,
+                details=f"old={previous}; new={retention_days}",
+            )
 
     def save_plate_detection(
         self,
@@ -292,11 +306,24 @@ class PlateService:
         AuthService.require_admin(actor)
         days = self.record_retention_days if retention_days is None else retention_days
         self._validate_retention_days(days)
-        return self._delete_records_older_than(days, now)
+        deleted = self._delete_records_older_than(days, now)
+        self.audit_service.try_log(
+            AuditAction.OLD_RECORDS_DELETED,
+            actor=actor,
+            details=f"count={deleted}",
+        )
+        return deleted
 
     def apply_retention_policy(self, now: datetime | None = None) -> int:
         """Apply the configured startup policy without requiring an interactive actor."""
-        return self._delete_records_older_than(self.record_retention_days, now)
+        deleted = self._delete_records_older_than(self.record_retention_days, now)
+        if deleted:
+            self.audit_service.try_log(
+                AuditAction.OLD_RECORDS_DELETED,
+                username="SYSTEM",
+                details=f"count={deleted}; trigger=startup",
+            )
+        return deleted
 
     def delete_all_records(self, actor: SessionUser) -> int:
         AuthService.require_admin(actor)
@@ -311,6 +338,11 @@ class PlateService:
             cursor = connection.execute("DELETE FROM plate_records")
             deleted = max(0, cursor.rowcount)
         self._delete_capture_files(image_paths)
+        self.audit_service.try_log(
+            AuditAction.ALL_RECORDS_DELETED,
+            actor=actor,
+            details=f"count={deleted}",
+        )
         return deleted
 
     def resolve_capture_path(self, image_path: str | None) -> Path | None:

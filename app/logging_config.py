@@ -5,6 +5,12 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from app.config import application_root
+from app.security import sanitize_text_for_log
+
+
+class CredentialSafeFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return sanitize_text_for_log(super().format(record))
 
 
 def configure_logging(log_path: Path | None = None) -> Path:
@@ -23,7 +29,9 @@ def configure_logging(log_path: Path | None = None) -> Path:
             encoding="utf-8",
         )
         handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+            CredentialSafeFormatter(
+                "%(asctime)s %(levelname)s %(name)s: %(message)s"
+            )
         )
         root_logger.addHandler(handler)
     root_logger.setLevel(logging.INFO)
