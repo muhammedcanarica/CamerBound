@@ -35,7 +35,13 @@ from app.camera import CameraService
 from app.config import load_config
 from app.database import Database
 from app.plate_capture import PlateCaptureService
-from app.plate_recognition import PlateRecognitionService, RecognitionStatus
+from app.plate_recognition import (
+    PlateCandidate,
+    PlateRecognitionService,
+    RecognitionOutcome,
+    RecognitionState,
+    RecognitionStatus,
+)
 from app.plate_service import PlateService
 from main import ApplicationController
 from ui.admin_widget import CameraCredentialsDialog
@@ -143,6 +149,89 @@ class LoginFlowSmokeTest(unittest.TestCase):
             dashboard.dashboard_home.camera_cards[next(iter(dashboard.dashboard_home.camera_cards))]
             .ocr_status.text(),
         )
+
+        camera = self.controller.camera_service.list_cameras()[0]
+        dashboard.dashboard_home.camera_directions[camera.id] = camera.direction
+        candidate = PlateCandidate("34ABC123", 0.75, "34 ABC 123", camera.id)
+        low_confidence_candidate = PlateCandidate(
+            "34ABC123",
+            0.58,
+            "34 ABC 123",
+            camera.id,
+        )
+        high_confidence_candidate = PlateCandidate(
+            "34CLK536",
+            0.97,
+            "34 CLK 536",
+            camera.id,
+        )
+        card = dashboard.dashboard_home.camera_cards[camera.direction]
+        saved_plate_before_candidate = card.last_plate.text()
+        outcome_cases = (
+            (
+                RecognitionOutcome(
+                    candidate,
+                    None,
+                    RecognitionState.AWAITING_CONFIRMATION,
+                    confirmation_count=1,
+                    confirmation_required=2,
+                ),
+                "Durum: Doğrulanıyor (1/2)",
+                "OCR: 34 ABC 123 · %75",
+            ),
+            (
+                RecognitionOutcome(
+                    low_confidence_candidate,
+                    None,
+                    RecognitionState.LOW_CONFIDENCE,
+                ),
+                "Durum: Güven düşük, kaydedilmedi",
+                "OCR: 34 ABC 123 · %58",
+            ),
+            (
+                RecognitionOutcome(
+                    high_confidence_candidate,
+                    None,
+                    RecognitionState.SAVED,
+                ),
+                "Durum: Kaydedildi",
+                "OCR: 34 CLK 536 · %97",
+            ),
+            (
+                RecognitionOutcome(
+                    high_confidence_candidate,
+                    None,
+                    RecognitionState.DUPLICATE_SUPPRESSED,
+                    duplicate=True,
+                ),
+                "Durum: Zaten algılandı",
+                "OCR: 34 CLK 536 · %97",
+            ),
+        )
+        for outcome, expected_state, expected_ocr in outcome_cases:
+            dashboard.dashboard_home._show_recognition_outcome(camera.id, outcome)
+            ocr_text = card.ocr_status.text()
+            self.assertIn(expected_ocr, ocr_text)
+            self.assertIn(expected_state, ocr_text)
+            self.assertEqual(card.last_plate.text(), saved_plate_before_candidate)
+
+        dashboard.dashboard_home._show_recognition_outcome(
+            camera.id,
+            RecognitionOutcome(None, None, RecognitionState.NO_OCR_TEXT),
+        )
+        self.assertIn(
+            "Durum: Plaka aranıyor",
+            card.ocr_status.text(),
+        )
+        self.assertEqual(card.last_plate.text(), saved_plate_before_candidate)
+
+        saved_record = self.controller.plate_service.save_plate_detection(
+            "34CLK536",
+            camera.id,
+            0.97,
+        )
+        dashboard.dashboard_home._record_saved(saved_record)
+        self.assertEqual(card.last_plate.text(), "Son okunan plaka: 34CLK536")
 
         users_page = dashboard.pages[3]
         for username, role in (("ui-user", Role.USER), ("ui-admin", Role.ADMIN)):

@@ -19,6 +19,7 @@ from app.database import Database
 from app.plate_capture import PlateCaptureService
 from app.plate_recognition import (
     ConfirmationTracker,
+    HIGH_CONFIDENCE_THRESHOLD,
     OcrModelNotFound,
     OcrSegment,
     PaddleOcrProvider,
@@ -26,6 +27,7 @@ from app.plate_recognition import (
     PlatePresenceTracker,
     PlateRecognitionProcessor,
     PlateRecognitionWorker,
+    RecognitionState,
     TurkishPlateValidator,
     correct_plate_candidate,
     normalize_plate_text,
@@ -40,7 +42,7 @@ from app.plate_service import PlateService
 
 
 class FakeOcrProvider:
-    def __init__(self, text: str = "34 ABC 123", confidence: float = 0.91) -> None:
+    def __init__(self, text: str = "34 ABC 123", confidence: float = 0.75) -> None:
         self.text = text
         self.confidence = confidence
 
@@ -58,6 +60,11 @@ class RecoveringOcrProvider(FakeOcrProvider):
         if self.calls == 1:
             raise RuntimeError("temporary")
         return super().recognize(images)
+
+
+class EmptyOcrProvider:
+    def recognize(self, _images: object) -> list[OcrSegment]:
+        return []
 
 
 def recognition_config(model_root: Path, confirmations: int = 2) -> PlateRecognitionConfig:
@@ -220,7 +227,7 @@ class RecognitionPipelineTests(unittest.TestCase):
     def test_processor_saves_only_after_confirmation(self) -> None:
         camera = self.camera_service.list_cameras()[0]
         processor = PlateRecognitionProcessor(
-            FakeOcrProvider(), self.plate_service, self.config
+            FakeOcrProvider(confidence=0.89), self.plate_service, self.config
         )
         frame = np.zeros((200, 400, 3), dtype=np.uint8)
         detected_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -234,13 +241,83 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
 
         self.assertIsNone(first.record)
+        self.assertIs(first.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertEqual((first.confirmation_count, first.confirmation_required), (1, 2))
         self.assertIsNotNone(second.record)
+        self.assertIs(second.state, RecognitionState.SAVED)
         self.assertEqual(second.record.plate, "34ABC123")
         self.assertEqual(second.record.direction, Direction.ENTRY)
         self.assertIsNotNone(second.record.image_path)
         self.assertTrue(
             self.capture_service.resolve_reference(second.record.image_path).is_file()
         )
+
+    def test_very_high_confidence_valid_plate_saves_on_first_observation(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.97), self.plate_service, self.config
+        )
+
+        with patch.object(
+            self.plate_service,
+            "save_plate_detection",
+            wraps=self.plate_service.save_plate_detection,
+        ) as save_plate_detection:
+            outcome = processor.process(
+                camera.id,
+                camera.direction,
+                np.zeros((200, 400, 3), dtype=np.uint8),
+                monotonic_at=1.0,
+            )
+
+        self.assertEqual(HIGH_CONFIDENCE_THRESHOLD, 0.90)
+        save_plate_detection.assert_called_once()
+        self.assertIs(outcome.state, RecognitionState.SAVED)
+        self.assertEqual((outcome.confirmation_count, outcome.confirmation_required), (1, 1))
+        self.assertIsNotNone(outcome.record)
+        self.assertEqual(self._record_count(), 1)
+
+    def test_low_confidence_and_invalid_plate_have_distinct_outcomes(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        low = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.64), self.plate_service, self.config
+        ).process(camera.id, camera.direction, frame, monotonic_at=1.0)
+        invalid = PlateRecognitionProcessor(
+            FakeOcrProvider(text="99 ABC 123", confidence=0.99),
+            self.plate_service,
+            self.config,
+        ).process(camera.id, camera.direction, frame, monotonic_at=2.0)
+        no_text = PlateRecognitionProcessor(
+            EmptyOcrProvider(), self.plate_service, self.config
+        ).process(camera.id, camera.direction, frame, monotonic_at=3.0)
+
+        self.assertIs(low.state, RecognitionState.LOW_CONFIDENCE)
+        self.assertIsNotNone(low.candidate)
+        self.assertIs(invalid.state, RecognitionState.NO_VALID_PLATE)
+        self.assertIsNone(invalid.candidate)
+        self.assertIs(no_text.state, RecognitionState.NO_OCR_TEXT)
+        self.assertEqual(self._record_count(), 0)
+
+    def test_very_high_confidence_repeat_is_suppressed_by_presence(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.97), self.plate_service, self.config
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        saved = processor.process(
+            camera.id, camera.direction, frame, monotonic_at=1.0
+        )
+        duplicate = processor.process(
+            camera.id, camera.direction, frame, monotonic_at=2.0
+        )
+
+        self.assertIs(saved.state, RecognitionState.SAVED)
+        self.assertIs(duplicate.state, RecognitionState.DUPLICATE_SUPPRESSED)
+        self.assertTrue(duplicate.duplicate)
+        self.assertEqual(self._record_count(), 1)
+        self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 1)
 
     def test_ocr_diagnostics_are_throttled_and_contain_safe_dimensions(self) -> None:
         camera = self.camera_service.list_cameras()[0]
@@ -257,6 +334,7 @@ class RecognitionPipelineTests(unittest.TestCase):
                 camera.direction,
                 frame,
                 monotonic_at=1.0,
+                frame_received_at=9.95,
             )
             processor.process(
                 camera.id,
@@ -277,6 +355,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIn("variants=3", diagnostic)
         self.assertIn("processing_ms=100.0", diagnostic)
         self.assertIn("inference_ms=80.0", diagnostic)
+        self.assertIn("frame_wait_ms=50.0", diagnostic)
         self.assertIn("candidate=yes", diagnostic)
 
     def test_duplicate_after_a_new_confirmation_does_not_store_a_second_image(self) -> None:
@@ -358,30 +437,19 @@ class RecognitionPipelineTests(unittest.TestCase):
     def test_same_plate_can_be_recorded_again_after_presence_release(self) -> None:
         camera = self.camera_service.list_cameras()[0]
         processor = PlateRecognitionProcessor(
-            FakeOcrProvider(), self.plate_service, self.config
+            FakeOcrProvider(confidence=0.97), self.plate_service, self.config
         )
         frame = np.zeros((200, 400, 3), dtype=np.uint8)
         detected_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
-        processor.process(
-            camera.id, camera.direction, frame, detected_at, monotonic_at=1.0
-        )
         first = processor.process(
-            camera.id, camera.direction, frame, detected_at, monotonic_at=2.0
-        )
-
-        processor.process(
-            camera.id,
-            camera.direction,
-            frame,
-            detected_at + timedelta(seconds=17),
-            monotonic_at=18.0,
+            camera.id, camera.direction, frame, detected_at, monotonic_at=1.0
         )
         second = processor.process(
             camera.id,
             camera.direction,
             frame,
-            detected_at + timedelta(seconds=18),
-            monotonic_at=19.0,
+            detected_at + timedelta(seconds=16),
+            monotonic_at=17.0,
         )
 
         self.assertIsNotNone(first.record)
@@ -394,7 +462,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             camera.direction: camera for camera in self.camera_service.list_cameras()
         }
         processor = PlateRecognitionProcessor(
-            FakeOcrProvider(),
+            FakeOcrProvider(confidence=0.97),
             self.plate_service,
             recognition_config(Path(self.temp_directory.name), confirmations=1),
         )
@@ -508,6 +576,24 @@ class RecognitionPipelineTests(unittest.TestCase):
         with patch("app.plate_recognition.time.monotonic", return_value=10.0):
             _camera_id, pending = worker._take_due_frame()
         self.assertIs(pending.frame, latest_frame)
+
+    def test_worker_round_robin_prevents_busy_camera_starvation(self) -> None:
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        worker.submit_frame(10, Direction.ENTRY, object())
+        worker.submit_frame(20, Direction.EXIT, object())
+
+        with patch("app.plate_recognition.time.monotonic", return_value=10.0):
+            first_camera_id, _ = worker._take_due_frame()
+        worker.submit_frame(10, Direction.ENTRY, object())
+        with patch("app.plate_recognition.time.monotonic", return_value=10.3):
+            second_camera_id, _ = worker._take_due_frame()
+
+        self.assertEqual((first_camera_id, second_camera_id), (10, 20))
+        self.assertEqual(worker.pending_frame_count, 1)
 
     def test_missing_model_is_reported_without_importing_paddle(self) -> None:
         with self.assertRaisesRegex(OcrModelNotFound, "Detection model"):

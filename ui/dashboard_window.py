@@ -26,11 +26,13 @@ from app.camera import Camera, CameraService, CameraStatus, Direction
 from app.plate_recognition import (
     PlateCandidate,
     PlateRecognitionService,
+    RecognitionOutcome,
+    RecognitionState,
     RecognitionStatus,
 )
 from app.plate_service import PlateRecord, PlateService
 from ui.admin_widget import CameraSettingsWidget, UsersAdminWidget
-from ui.display_helpers import display_timestamp
+from ui.display_helpers import display_plate, display_timestamp
 from ui.records_widget import (
     InsideVehiclesWidget,
     RecordsWidget,
@@ -69,6 +71,9 @@ class DashboardHome(QWidget):
         if self.recognition_service is not None:
             self.recognition_service.status_changed.connect(self._show_ocr_status)
             self.recognition_service.candidate_changed.connect(self._show_candidate)
+            self.recognition_service.outcome_changed.connect(
+                self._show_recognition_outcome
+            )
             self.recognition_service.record_saved.connect(self._record_saved)
             QTimer.singleShot(0, self._sync_ocr_status)
         QTimer.singleShot(0, self._start_enabled_cameras)
@@ -252,17 +257,49 @@ class DashboardHome(QWidget):
         if direction is None:
             return
         self.camera_cards[direction].ocr_status.setText(
-            f"OCR: Aktif · Son: {candidate.plate} · %{candidate.confidence * 100:.0f}"
+            f"OCR: {display_plate(candidate.plate)} · %{candidate.confidence * 100:.0f}\n"
+            "Durum: Değerlendiriliyor"
         )
         self.camera_cards[direction].ocr_status.setToolTip(
             f"Ham OCR: {candidate.raw_text}"
         )
 
+    @Slot(int, object)
+    def _show_recognition_outcome(
+        self,
+        camera_id: int,
+        outcome: RecognitionOutcome,
+    ) -> None:
+        direction = self.camera_directions.get(camera_id)
+        if direction is None:
+            return
+
+        card = self.camera_cards[direction]
+        candidate = outcome.candidate
+        if candidate is None:
+            card.ocr_status.setText("OCR: Aktif\nDurum: Plaka aranıyor")
+            return
+
+        state_texts = {
+            RecognitionState.LOW_CONFIDENCE: "Güven düşük, kaydedilmedi",
+            RecognitionState.SAVED: "Kaydedildi",
+            RecognitionState.DUPLICATE_SUPPRESSED: "Zaten algılandı",
+        }
+        if outcome.state is RecognitionState.AWAITING_CONFIRMATION:
+            state_text = (
+                "Doğrulanıyor "
+                f"({outcome.confirmation_count}/{outcome.confirmation_required})"
+            )
+        else:
+            state_text = state_texts.get(outcome.state, "Plaka aranıyor")
+        card.ocr_status.setText(
+            f"OCR: {display_plate(candidate.plate)} · "
+            f"%{candidate.confidence * 100:.0f}\n"
+            f"Durum: {state_text}"
+        )
+
     @Slot(object)
     def _record_saved(self, record: PlateRecord) -> None:
-        card = self.camera_cards.get(record.direction)
-        if card is not None:
-            card.last_plate.setText(f"Son okunan plaka: {record.plate}")
         self.refresh()
 
     @Slot(int, object, str)

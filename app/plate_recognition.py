@@ -42,6 +42,7 @@ class RecognitionStatus(StrEnum):
 
 LOGGER = logging.getLogger(__name__)
 PLATE_PRESENCE_RELEASE_SECONDS = 15
+HIGH_CONFIDENCE_THRESHOLD = 0.90
 OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS = 5.0
 OCR_VARIANT_NAMES = (
     "adaptive-color",
@@ -222,6 +223,13 @@ class ConfirmationTracker:
         self._confirmed_until: dict[tuple[int, str], float] = {}
 
     def observe(self, candidate: PlateCandidate, observed_at: float) -> PlateCandidate | None:
+        return self.observe_progress(candidate, observed_at).candidate
+
+    def observe_progress(
+        self,
+        candidate: PlateCandidate,
+        observed_at: float,
+    ) -> ConfirmationProgress:
         key = (candidate.camera_id, candidate.plate)
         cutoff = observed_at - self.window_seconds
         observations = self._observations[key]
@@ -229,21 +237,42 @@ class ConfirmationTracker:
             observations.popleft()
 
         if self._confirmed_until.get(key, 0.0) >= observed_at:
-            return None
+            return ConfirmationProgress(None, 0, self.required)
 
         observations.append((observed_at, candidate.confidence))
         if len(observations) < self.required:
-            return None
+            return ConfirmationProgress(None, len(observations), self.required)
 
         confidence = sum(value for _, value in observations) / len(observations)
         observations.clear()
         self._confirmed_until[key] = observed_at + self.window_seconds
-        return PlateCandidate(
-            plate=candidate.plate,
-            confidence=confidence,
-            raw_text=candidate.raw_text,
-            camera_id=candidate.camera_id,
+        return ConfirmationProgress(
+            PlateCandidate(
+                plate=candidate.plate,
+                confidence=confidence,
+                raw_text=candidate.raw_text,
+                camera_id=candidate.camera_id,
+            ),
+            self.required,
+            self.required,
         )
+
+    def confirm_immediately(
+        self,
+        candidate: PlateCandidate,
+        observed_at: float,
+    ) -> ConfirmationProgress:
+        key = (candidate.camera_id, candidate.plate)
+        self._observations[key].clear()
+        self._confirmed_until[key] = observed_at + self.window_seconds
+        return ConfirmationProgress(candidate, 1, 1)
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmationProgress:
+    candidate: PlateCandidate | None
+    observed_count: int
+    required_count: int
 
 
 @dataclass(slots=True)
@@ -298,10 +327,22 @@ class PlatePresenceTracker:
                 presence.record_claimed = False
 
 
+class RecognitionState(StrEnum):
+    NO_OCR_TEXT = "NO_OCR_TEXT"
+    NO_VALID_PLATE = "NO_VALID_PLATE"
+    LOW_CONFIDENCE = "LOW_CONFIDENCE"
+    AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
+    SAVED = "SAVED"
+    DUPLICATE_SUPPRESSED = "DUPLICATE_SUPPRESSED"
+
+
 @dataclass(frozen=True, slots=True)
 class RecognitionOutcome:
     candidate: PlateCandidate | None
     record: PlateRecord | None
+    state: RecognitionState
+    confirmation_count: int = 0
+    confirmation_required: int = 0
     duplicate: bool = False
 
 
@@ -322,6 +363,7 @@ class PlateRecognitionProcessor:
         self.presences = PlatePresenceTracker()
         self._last_ocr_started_at: dict[int, float] = {}
         self._last_diagnostic_logged_at: dict[int, float] = {}
+        self._last_pipeline_state: dict[int, tuple[RecognitionState, str | None]] = {}
 
     def process(
         self,
@@ -330,10 +372,11 @@ class PlateRecognitionProcessor:
         frame: object,
         detected_at: datetime | None = None,
         monotonic_at: float | None = None,
+        frame_received_at: float | None = None,
     ) -> RecognitionOutcome:
         crop = crop_roi(frame, self.config.roi_for(direction))
         if crop is None:
-            return RecognitionOutcome(candidate=None, record=None)
+            return self._outcome(camera_id, RecognitionState.NO_OCR_TEXT)
         ocr_started_at = time.perf_counter()
         previous_ocr_started_at = self._last_ocr_started_at.get(camera_id)
         self._last_ocr_started_at[camera_id] = ocr_started_at
@@ -354,21 +397,44 @@ class PlateRecognitionProcessor:
             previous_ocr_started_at=previous_ocr_started_at,
             processing_duration_ms=processing_duration_ms,
             inference_duration_ms=inference_duration_ms,
+            frame_received_at=frame_received_at,
             candidate_found=candidate is not None,
         )
-        if candidate is None or candidate.confidence < self.config.min_confidence:
-            return RecognitionOutcome(candidate=candidate, record=None)
+        if not segments:
+            return self._outcome(camera_id, RecognitionState.NO_OCR_TEXT)
+        if candidate is None:
+            return self._outcome(camera_id, RecognitionState.NO_VALID_PLATE)
+        if candidate.confidence < self.config.min_confidence:
+            return self._outcome(
+                camera_id,
+                RecognitionState.LOW_CONFIDENCE,
+                candidate=candidate,
+            )
 
         observed_at = monotonic_at if monotonic_at is not None else time.monotonic()
         self.presences.observe(candidate, observed_at)
-        confirmed = self.confirmations.observe(candidate, observed_at)
+        if candidate.confidence >= HIGH_CONFIDENCE_THRESHOLD:
+            progress = self.confirmations.confirm_immediately(candidate, observed_at)
+        else:
+            progress = self.confirmations.observe_progress(candidate, observed_at)
+        confirmed = progress.candidate
         if confirmed is None:
-            return RecognitionOutcome(candidate=candidate, record=None)
-        if not self.presences.claim_record(confirmed):
-            LOGGER.info(
-                "Active plate presence suppressed for camera_id=%s", camera_id
+            return self._outcome(
+                camera_id,
+                RecognitionState.AWAITING_CONFIRMATION,
+                candidate=candidate,
+                confirmation_count=progress.observed_count,
+                confirmation_required=progress.required_count,
             )
-            return RecognitionOutcome(candidate=confirmed, record=None, duplicate=True)
+        if not self.presences.claim_record(confirmed):
+            return self._outcome(
+                camera_id,
+                RecognitionState.DUPLICATE_SUPPRESSED,
+                candidate=confirmed,
+                confirmation_count=progress.observed_count,
+                confirmation_required=progress.required_count,
+                duplicate=True,
+            )
         try:
             record = self.plate_service.save_plate_detection(
                 confirmed.plate,
@@ -379,12 +445,65 @@ class PlateRecognitionProcessor:
             )
         except DuplicatePlateDetection:
             LOGGER.info("Duplicate plate detection suppressed for camera_id=%s", camera_id)
-            return RecognitionOutcome(candidate=confirmed, record=None, duplicate=True)
+            return self._outcome(
+                camera_id,
+                RecognitionState.DUPLICATE_SUPPRESSED,
+                candidate=confirmed,
+                confirmation_count=progress.observed_count,
+                confirmation_required=progress.required_count,
+                duplicate=True,
+            )
         except Exception:
             self.presences.release_record_claim(confirmed)
             raise
         LOGGER.info("Plate detection saved for camera_id=%s", camera_id)
-        return RecognitionOutcome(candidate=confirmed, record=record)
+        return self._outcome(
+            camera_id,
+            RecognitionState.SAVED,
+            candidate=confirmed,
+            record=record,
+            confirmation_count=progress.observed_count,
+            confirmation_required=progress.required_count,
+        )
+
+    def _outcome(
+        self,
+        camera_id: int,
+        state: RecognitionState,
+        *,
+        candidate: PlateCandidate | None = None,
+        record: PlateRecord | None = None,
+        confirmation_count: int = 0,
+        confirmation_required: int = 0,
+        duplicate: bool = False,
+    ) -> RecognitionOutcome:
+        signature = (state, candidate.plate if candidate is not None else None)
+        if (
+            LOGGER.isEnabledFor(logging.DEBUG)
+            and self._last_pipeline_state.get(camera_id) != signature
+        ):
+            confirmation_mode = (
+                "high-confidence-single"
+                if confirmation_count == confirmation_required == 1
+                else "standard"
+            )
+            LOGGER.debug(
+                "OCR pipeline state camera_id=%s state=%s confirmation=%s/%s mode=%s",
+                camera_id,
+                state.value,
+                confirmation_count,
+                confirmation_required,
+                confirmation_mode,
+            )
+        self._last_pipeline_state[camera_id] = signature
+        return RecognitionOutcome(
+            candidate=candidate,
+            record=record,
+            state=state,
+            confirmation_count=confirmation_count,
+            confirmation_required=confirmation_required,
+            duplicate=duplicate,
+        )
 
     def _log_ocr_diagnostics(
         self,
@@ -398,6 +517,7 @@ class PlateRecognitionProcessor:
         previous_ocr_started_at: float | None,
         processing_duration_ms: float,
         inference_duration_ms: float,
+        frame_received_at: float | None,
         candidate_found: bool,
     ) -> None:
         if not LOGGER.isEnabledFor(logging.DEBUG):
@@ -415,10 +535,15 @@ class PlateRecognitionProcessor:
             if previous_ocr_started_at is None
             else (ocr_started_at - previous_ocr_started_at) * 1000.0
         )
+        frame_wait_ms = (
+            None
+            if frame_received_at is None
+            else max(0.0, (ocr_started_at - frame_received_at) * 1000.0)
+        )
         LOGGER.debug(
             "OCR diagnostics camera_id=%s direction=%s frame=%s roi=%s "
             "variants=%s variant_sizes=%s processing_ms=%.1f inference_ms=%.1f "
-            "actual_interval_ms=%s candidate=%s",
+            "actual_interval_ms=%s frame_wait_ms=%s candidate=%s",
             camera_id,
             direction.value,
             _image_resolution(frame),
@@ -432,6 +557,7 @@ class PlateRecognitionProcessor:
                 if actual_interval_ms is None
                 else f"{actual_interval_ms:.1f}"
             ),
+            "unknown" if frame_wait_ms is None else f"{frame_wait_ms:.1f}",
             "yes" if candidate_found else "no",
         )
 
@@ -440,11 +566,13 @@ class PlateRecognitionProcessor:
 class _PendingFrame:
     direction: Direction
     frame: object
+    received_at: float
 
 
 class PlateRecognitionWorker(QObject):
     status_changed = Signal(object, str)
     candidate_changed = Signal(int, object)
+    outcome_changed = Signal(int, object)
     record_saved = Signal(object)
     finished = Signal()
 
@@ -463,10 +591,19 @@ class PlateRecognitionWorker(QObject):
         self._lock = threading.Lock()
         self._latest_frames: dict[int, _PendingFrame] = {}
         self._last_processed_at: dict[int, float] = {}
+        self._camera_order: deque[int] = deque()
+        self._known_camera_ids: set[int] = set()
 
     def submit_frame(self, camera_id: int, direction: Direction, frame: object) -> None:
         with self._lock:
-            self._latest_frames[camera_id] = _PendingFrame(direction, frame)
+            if camera_id not in self._known_camera_ids:
+                self._known_camera_ids.add(camera_id)
+                self._camera_order.append(camera_id)
+            self._latest_frames[camera_id] = _PendingFrame(
+                direction,
+                frame,
+                time.perf_counter(),
+            )
         self._wake_event.set()
 
     @property
@@ -512,7 +649,12 @@ class PlateRecognitionWorker(QObject):
                     continue
                 camera_id, item = pending
                 try:
-                    outcome = processor.process(camera_id, item.direction, item.frame)
+                    outcome = processor.process(
+                        camera_id,
+                        item.direction,
+                        item.frame,
+                        frame_received_at=item.received_at,
+                    )
                 except OcrModelError as exc:
                     LOGGER.error("Fatal OCR model error: %s", exc)
                     self.status_changed.emit(RecognitionStatus.UNAVAILABLE, str(exc))
@@ -530,9 +672,12 @@ class PlateRecognitionWorker(QObject):
                     self.candidate_changed.emit(camera_id, outcome.candidate)
                 if outcome.record is not None:
                     self.record_saved.emit(outcome.record)
+                self.outcome_changed.emit(camera_id, outcome)
         finally:
             with self._lock:
                 self._latest_frames.clear()
+                self._camera_order.clear()
+                self._known_camera_ids.clear()
             self.status_changed.emit(RecognitionStatus.STOPPED, "OCR durduruldu.")
             self.finished.emit()
 
@@ -540,15 +685,15 @@ class PlateRecognitionWorker(QObject):
         interval = self.config.recognition_interval_ms / 1000.0
         now = time.monotonic()
         with self._lock:
-            due_camera_id: int | None = None
-            for camera_id, item in self._latest_frames.items():
+            for _ in range(len(self._camera_order)):
+                camera_id = self._camera_order.popleft()
+                self._camera_order.append(camera_id)
+                if camera_id not in self._latest_frames:
+                    continue
                 if now - self._last_processed_at.get(camera_id, 0.0) < interval:
                     continue
-                due_camera_id = camera_id
-                break
-            if due_camera_id is not None:
-                self._last_processed_at[due_camera_id] = now
-                return due_camera_id, self._latest_frames.pop(due_camera_id)
+                self._last_processed_at[camera_id] = now
+                return camera_id, self._latest_frames.pop(camera_id)
         return None
 
 
@@ -561,6 +706,7 @@ class _RecognitionRuntime:
 class PlateRecognitionService(QObject):
     status_changed = Signal(object, str)
     candidate_changed = Signal(int, object)
+    outcome_changed = Signal(int, object)
     record_saved = Signal(object)
     STOP_TIMEOUT_MS = 5_000
 
@@ -600,6 +746,7 @@ class PlateRecognitionService(QObject):
         thread.started.connect(worker.run)
         worker.status_changed.connect(self._relay_status)
         worker.candidate_changed.connect(self.candidate_changed.emit)
+        worker.outcome_changed.connect(self.outcome_changed.emit)
         worker.record_saved.connect(self.record_saved.emit)
         worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.finished.connect(worker.deleteLater)
