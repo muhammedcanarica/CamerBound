@@ -61,6 +61,12 @@ Manuel alternatif:
 Varsayılan plaka kayıt saklama süresi 90 gündür.
 ADMIN kullanıcı Ayarlar > Veri Saklama bölümünden 30 / 90 / 180 gün veya Süresiz seçebilir.
 
+## Saat Senkronizasyonu
+
+CamerBound doğrudan bir NTP sunucusuna bağlanmaz. Uygulama zamanı Windows sistem saatinden alır ve plaka kayıtlarını UTC olarak saklar.
+
+Production bilgisayarında Windows Time Service'in güvenilir bir internet veya kurum zaman kaynağıyla senkronize edilmesi önerilir. ADMIN > Ayarlar > Saat Durumu bölümünden mevcut Windows Time kaynağı ve senkronizasyon durumu görüntülenebilir. Bu ekran yalnızca salt okunur tanılama yapar; sistem saatini veya NTP yapılandırmasını değiştirmez.
+
 ## Araç Fotoğrafı Kaydı
 
 - Yalnızca confirmation tamamlanıp veritabanına eklenen plaka olayında, mevcut OpenCV frame'inden bir JPEG kaydedilir.

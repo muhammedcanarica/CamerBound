@@ -40,6 +40,11 @@ from app.config import (
 from app.ocr_models import OcrModelError, collect_model_diagnostics, select_ocr_backend
 from app.plate_recognition import PlateRecognitionService
 from app.plate_service import PlateService
+from app.time_diagnostics import (
+    TimeDiagnosticsResult,
+    TimeDiagnosticsService,
+    TimeSyncStatus,
+)
 from ui.roi_calibration_dialog import RoiCalibrationDialog
 from ui.display_helpers import display_timestamp
 from ui.records_widget import prepare_table
@@ -122,6 +127,7 @@ class UsersAdminWidget(QWidget):
 
 class CameraSettingsWidget(QWidget):
     diagnostics_ready = Signal(str)
+    time_diagnostics_ready = Signal(object)
     records_changed = Signal()
 
     def __init__(
@@ -131,6 +137,7 @@ class CameraSettingsWidget(QWidget):
         plate_service: PlateService,
         recognition_service: PlateRecognitionService | None = None,
         audit_service: AuditService | None = None,
+        time_diagnostics_service: TimeDiagnosticsService | None = None,
     ) -> None:
         super().__init__()
         self.camera_service = camera_service
@@ -138,6 +145,10 @@ class CameraSettingsWidget(QWidget):
         self.plate_service = plate_service
         self.recognition_service = recognition_service
         self.audit_service = audit_service
+        self.time_diagnostics_service = (
+            time_diagnostics_service or TimeDiagnosticsService()
+        )
+        self._time_diagnostics_running = False
         self.settings_path = (
             recognition_service.settings_path
             if recognition_service is not None
@@ -148,6 +159,7 @@ class CameraSettingsWidget(QWidget):
         self._camera_layout: QVBoxLayout
         self._build_ui()
         self.diagnostics_ready.connect(self._show_diagnostics)
+        self.time_diagnostics_ready.connect(self._show_time_diagnostics)
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
@@ -188,6 +200,41 @@ class CameraSettingsWidget(QWidget):
         diagnostics_layout.addWidget(self.diagnostics_label)
         diagnostics_layout.addWidget(diagnostics_button)
         layout.addWidget(diagnostics_group)
+        self.time_group = QGroupBox("Saat Durumu")
+        self.time_group.setObjectName("timeDiagnosticsGroup")
+        time_layout = QVBoxLayout(self.time_group)
+        time_form = QFormLayout()
+        self.local_time_label = QLabel("-")
+        self.utc_time_label = QLabel("-")
+        self.timezone_name_label = QLabel("-")
+        self.utc_offset_label = QLabel("-")
+        self.windows_time_label = QLabel("Kontrol edilmedi")
+        self.time_source_label = QLabel("-")
+        for label in (
+            self.local_time_label,
+            self.utc_time_label,
+            self.timezone_name_label,
+            self.utc_offset_label,
+            self.windows_time_label,
+            self.time_source_label,
+        ):
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        time_form.addRow("Yerel Saat:", self.local_time_label)
+        time_form.addRow("UTC:", self.utc_time_label)
+        time_form.addRow("Saat Dilimi:", self.timezone_name_label)
+        time_form.addRow("UTC Ofseti:", self.utc_offset_label)
+        time_form.addRow("Windows Time:", self.windows_time_label)
+        time_form.addRow("Saat Kaynağı:", self.time_source_label)
+        time_layout.addLayout(time_form)
+        self.time_status_label = QLabel("Saat durumu kontrol edilmedi.")
+        self.time_status_label.setObjectName("timeDiagnosticsStatus")
+        self.time_status_label.setWordWrap(True)
+        time_layout.addWidget(self.time_status_label)
+        self.refresh_time_button = QPushButton("Yenile")
+        self.refresh_time_button.setObjectName("refreshTimeDiagnosticsButton")
+        self.refresh_time_button.clicked.connect(self._refresh_time_diagnostics)
+        time_layout.addWidget(self.refresh_time_button)
+        layout.addWidget(self.time_group)
         self.retention_group = QGroupBox("Veri Saklama")
         self.retention_group.setObjectName("dataRetentionGroup")
         retention_layout = QVBoxLayout(self.retention_group)
@@ -554,3 +601,36 @@ class CameraSettingsWidget(QWidget):
     @Slot(str)
     def _show_diagnostics(self, message: str) -> None:
         self.diagnostics_label.setText(message)
+
+    def _refresh_time_diagnostics(self) -> None:
+        if self._time_diagnostics_running:
+            return
+        self._time_diagnostics_running = True
+        self.refresh_time_button.setEnabled(False)
+        self.time_status_label.setText("Saat durumu kontrol ediliyor...")
+
+        def check() -> None:
+            result = self.time_diagnostics_service.check()
+            self.time_diagnostics_ready.emit(result)
+
+        threading.Thread(target=check, name="time-diagnostics", daemon=True).start()
+
+    @Slot(object)
+    def _show_time_diagnostics(self, result: TimeDiagnosticsResult) -> None:
+        self._time_diagnostics_running = False
+        self.refresh_time_button.setEnabled(True)
+        self.local_time_label.setText(result.local_time.strftime("%d.%m.%Y %H:%M:%S"))
+        self.utc_time_label.setText(result.utc_time.strftime("%d.%m.%Y %H:%M:%S"))
+        self.timezone_name_label.setText(result.timezone_name)
+        self.utc_offset_label.setText(result.utc_offset)
+        self.windows_time_label.setText(
+            "Çalışıyor" if result.windows_time_available else "Kullanılamıyor"
+        )
+        self.time_source_label.setText(result.time_source or "-")
+        prefix = {
+            TimeSyncStatus.SYNCED: "✓ ",
+            TimeSyncStatus.WARNING: "⚠ ",
+            TimeSyncStatus.UNAVAILABLE: "⚠ ",
+            TimeSyncStatus.UNKNOWN: "? ",
+        }[result.sync_status]
+        self.time_status_label.setText(prefix + result.status_message)
