@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from app.audit import AuditAction, AuditService
@@ -19,6 +19,7 @@ from app.time_utils import (
     as_utc,
     normalize_utc_timestamp,
     parse_utc_timestamp,
+    to_local_datetime,
     to_utc_storage,
     utc_now,
 )
@@ -51,6 +52,14 @@ class VehicleInside:
 class PlateRecordStats:
     total_records: int
     oldest_timestamp: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlateRecordDaySummary:
+    date: date
+    total_count: int
+    entry_count: int
+    exit_count: int
 
 
 class DuplicatePlateDetection(Exception):
@@ -231,27 +240,8 @@ class PlateService:
         direction: Direction | str | None = None,
         limit: int = 500,
     ) -> list[PlateRecord]:
-        try:
-            normalized_direction = (
-                direction
-                if direction is None or isinstance(direction, Direction)
-                else Direction(direction)
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValidationError(
-                "Geçersiz kamera yönü. ENTRY veya EXIT kullanın."
-            ) from exc
-
         AuthService.require_authenticated(actor)
-        conditions: list[str] = []
-        parameters: list[object] = []
-        normalized_query = "".join(plate_query.upper().split())
-        if normalized_query:
-            conditions.append("pr.plate LIKE ?")
-            parameters.append(f"%{normalized_query}%")
-        if normalized_direction is not None:
-            conditions.append("pr.direction = ?")
-            parameters.append(normalized_direction.value)
+        conditions, parameters = self._record_filters(plate_query, direction)
 
         query = self._record_select()
         if conditions:
@@ -262,6 +252,84 @@ class PlateService:
         with self.database.connection() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [self._record_from_row(row) for row in rows]
+
+    def get_record_day_summaries(
+        self,
+        actor: SessionUser,
+        plate_query: str = "",
+        direction: Direction | str | None = None,
+    ) -> list[PlateRecordDaySummary]:
+        """Group record metadata by the Windows local calendar date."""
+        AuthService.require_authenticated(actor)
+        conditions, parameters = self._record_filters(plate_query, direction)
+        query = "SELECT pr.direction, pr.timestamp FROM plate_records pr"
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+
+        with self.database.connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+
+        counts: dict[date, list[int]] = {}
+        for row in rows:
+            try:
+                local_date = to_local_datetime(row["timestamp"]).date()
+            except (TypeError, ValueError):
+                LOGGER.warning(
+                    "Skipping plate record with invalid timestamp in daily archive: %r",
+                    row["timestamp"],
+                )
+                continue
+            values = counts.setdefault(local_date, [0, 0, 0])
+            values[0] += 1
+            if row["direction"] == Direction.ENTRY.value:
+                values[1] += 1
+            elif row["direction"] == Direction.EXIT.value:
+                values[2] += 1
+
+        return [
+            PlateRecordDaySummary(
+                date=local_date,
+                total_count=values[0],
+                entry_count=values[1],
+                exit_count=values[2],
+            )
+            for local_date, values in sorted(counts.items(), reverse=True)
+        ]
+
+    def search_records_for_local_date(
+        self,
+        actor: SessionUser,
+        local_date: date,
+        plate_query: str = "",
+        direction: Direction | str | None = None,
+        limit: int | None = None,
+    ) -> list[PlateRecord]:
+        """Return only records whose UTC timestamp falls on the requested local day."""
+        if not isinstance(local_date, date) or isinstance(local_date, datetime):
+            raise ValidationError("Geçerli bir yerel kayıt tarihi seçin.")
+        AuthService.require_authenticated(actor)
+        conditions, parameters = self._record_filters(plate_query, direction)
+        query = self._record_select()
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY pr.timestamp DESC, pr.id DESC"
+
+        with self.database.connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+
+        safe_limit = None if limit is None else max(1, min(limit, 2000))
+        records: list[PlateRecord] = []
+        for row in rows:
+            try:
+                record_date = to_local_datetime(row["timestamp"]).date()
+            except (TypeError, ValueError):
+                continue
+            if record_date != local_date:
+                continue
+            records.append(self._record_from_row(row))
+            if safe_limit is not None and len(records) >= safe_limit:
+                break
+        return records
 
     def get_vehicles_inside(self, actor: SessionUser) -> list[VehicleInside]:
         AuthService.require_authenticated(actor)
@@ -413,6 +481,33 @@ class PlateService:
             FROM plate_records pr
             JOIN cameras c ON c.id = pr.camera_id
         """
+
+    @staticmethod
+    def _record_filters(
+        plate_query: str,
+        direction: Direction | str | None,
+    ) -> tuple[list[str], list[object]]:
+        try:
+            normalized_direction = (
+                direction
+                if direction is None or isinstance(direction, Direction)
+                else Direction(direction)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "Geçersiz kamera yönü. ENTRY veya EXIT kullanın."
+            ) from exc
+
+        conditions: list[str] = []
+        parameters: list[object] = []
+        normalized_query = "".join(plate_query.upper().split())
+        if normalized_query:
+            conditions.append("pr.plate LIKE ?")
+            parameters.append(f"%{normalized_query}%")
+        if normalized_direction is not None:
+            conditions.append("pr.direction = ?")
+            parameters.append(normalized_direction.value)
+        return conditions, parameters
 
     @staticmethod
     def _record_from_row(row: object) -> PlateRecord:

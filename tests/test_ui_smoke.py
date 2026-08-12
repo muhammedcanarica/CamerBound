@@ -16,10 +16,13 @@ from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QGroupBox,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -35,6 +38,7 @@ from app.plate_capture import PlateCaptureService
 from app.plate_recognition import PlateRecognitionService, RecognitionStatus
 from app.plate_service import PlateService
 from main import ApplicationController
+from ui.admin_widget import CameraCredentialsDialog
 from ui.styles import APP_STYLESHEET
 
 
@@ -191,7 +195,26 @@ class LoginFlowSmokeTest(unittest.TestCase):
                 f"cameraCredentialStatus-{camera.id}",
             )
             self.assertIsNotNone(credential_status)
-            self.assertEqual(credential_status.text(), "Yapılandırılmadı")
+            self.assertEqual(
+                credential_status.text(),
+                "⚠ Erişim bilgileri ayarlanmamış",
+            )
+            credential_button = camera_settings.findChild(
+                QPushButton,
+                f"cameraCredentialButton-{camera.id}",
+            )
+            self.assertIsNotNone(credential_button)
+            self.assertEqual(credential_button.text(), "Erişim Bilgilerini Ayarla")
+            credential_description = camera_settings.findChild(
+                QLabel,
+                f"cameraCredentialDescription-{camera.id}",
+            )
+            self.assertIsNotNone(credential_description)
+            self.assertEqual(
+                credential_description.text(),
+                "CamerBound, kameraya bağlanmak için bu kullanıcı adı ve şifreyi "
+                "kullanır.",
+            )
             self.assertIsNone(
                 camera_settings.findChild(QWidget, f"cameraUsernameInput-{camera.id}")
             )
@@ -256,7 +279,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
         self.assertFalse(camera_settings.cleanup_old_button.isEnabled())
         self.assertIn("Süresiz", camera_settings.cleanup_old_button.toolTip())
 
-    def test_camera_credentials_are_status_only_and_preserved_on_save(self) -> None:
+    def test_camera_credentials_dialog_is_clear_secure_and_preserves_blank_password(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")
         camera = self.controller.camera_service.list_cameras()[0]
         configured = self.controller.camera_service.update_camera(
@@ -282,7 +305,13 @@ class LoginFlowSmokeTest(unittest.TestCase):
             f"cameraCredentialStatus-{camera.id}",
         )
         self.assertIsNotNone(status)
-        self.assertEqual(status.text(), "Yapılandırıldı")
+        self.assertEqual(status.text(), "✓ Erişim bilgileri kayıtlı")
+        credential_button = settings_page.findChild(
+            QPushButton,
+            f"cameraCredentialButton-{camera.id}",
+        )
+        self.assertIsNotNone(credential_button)
+        self.assertEqual(credential_button.text(), "Erişim Bilgilerini Güncelle")
         self.assertIsNone(
             settings_page.findChild(QWidget, f"cameraUsernameInput-{camera.id}")
         )
@@ -310,6 +339,61 @@ class LoginFlowSmokeTest(unittest.TestCase):
         rendered_text = "\n".join(visible_text)
         self.assertNotIn("test-user", rendered_text)
         self.assertNotIn("test-password", rendered_text)
+
+        dialog = CameraCredentialsDialog(configured)
+        self.assertEqual(dialog.windowTitle(), "Kamera Erişim Bilgileri")
+        self.assertEqual(dialog.username_input.text(), "test-user")
+        self.assertEqual(dialog.password_input.text(), "")
+        self.assertIs(
+            dialog.password_input.echoMode(),
+            QLineEdit.EchoMode.Password,
+        )
+        dialog_text = "\n".join(
+            label.text() for label in dialog.findChildren(QLabel)
+        )
+        self.assertIn(
+            "Bu işlem kameranın kendi kullanıcı adı veya şifresini değiştirmez. "
+            "Yalnızca CamerBound'un kameraya bağlanırken kullandığı bilgileri günceller.",
+            dialog_text,
+        )
+        self.assertIn("Mevcut şifreyi korumak için boş bırakın.", dialog_text)
+        self.assertIn("Kamera Kullanıcı Adı", dialog_text)
+        self.assertIn("Bağlantı Şifresi", dialog_text)
+        self.assertNotIn("test-password", dialog_text)
+        for forbidden_text in (
+            "Şifre Değiştir",
+            "Kamera Şifresini Değiştir",
+            "Kimlik Bilgilerini Temizle",
+        ):
+            self.assertNotIn(forbidden_text, rendered_text + dialog_text)
+        self.assertEqual(
+            dialog.buttons.button(QDialogButtonBox.StandardButton.Cancel).text(),
+            "İptal",
+        )
+        self.assertEqual(
+            dialog.buttons.button(QDialogButtonBox.StandardButton.Save).text(),
+            "Kaydet",
+        )
+        dialog.close()
+
+        with patch("ui.admin_widget.CameraCredentialsDialog") as dialog_factory, patch(
+            "ui.admin_widget.QMessageBox.information"
+        ), patch("ui.admin_widget.QMessageBox.warning") as warning:
+            credential_dialog = dialog_factory.return_value
+            credential_dialog.exec.return_value = QDialog.DialogCode.Accepted
+            credential_dialog.username_input.text.return_value = "test-user"
+            credential_dialog.password_input.text.return_value = ""
+            settings_page._open_camera_credentials(camera.id)
+
+        warning.assert_not_called()
+        credential_dialog.password_input.clear.assert_called_once()
+        preserved = self.controller.camera_service.get_camera(camera.id)
+        self.assertEqual(preserved.username, configured.username)
+        self.assertEqual(
+            preserved.protected_password,
+            original_protected_password,
+        )
+        self.assertEqual(preserved.stream_url, configured.stream_url)
 
         with patch("ui.admin_widget.QMessageBox.information"), patch(
             "ui.admin_widget.QMessageBox.warning"
@@ -342,6 +426,38 @@ class LoginFlowSmokeTest(unittest.TestCase):
         )
         self.assertEqual(rejected.stream_url, configured.stream_url)
 
+    def test_camera_credentials_dialog_saves_new_password_with_existing_service(self) -> None:
+        admin = self.controller.auth_service.authenticate("admin", "admin123")
+        camera = self.controller.camera_service.list_cameras()[0]
+        configured = self.controller.camera_service.update_camera(
+            admin,
+            camera.id,
+            camera.name,
+            "http://CAMERA_IP/live",
+            camera.direction,
+            False,
+            username="test-user",
+            password="test-password",
+        )
+        self.controller.show_dashboard(admin)
+        settings_page = self.controller.dashboard_window.pages[4]
+        settings_page.refresh()
+
+        with patch("ui.admin_widget.CameraCredentialsDialog") as dialog_factory, patch(
+            "ui.admin_widget.QMessageBox.information"
+        ), patch("ui.admin_widget.QMessageBox.warning") as warning:
+            dialog = dialog_factory.return_value
+            dialog.exec.return_value = QDialog.DialogCode.Accepted
+            dialog.username_input.text.return_value = "test-user"
+            dialog.password_input.text.return_value = "new-test-password"
+            settings_page._open_camera_credentials(camera.id)
+
+        warning.assert_not_called()
+        updated = self.controller.camera_service.get_camera(camera.id)
+        self.assertNotEqual(updated.protected_password, configured.protected_password)
+        self.assertNotEqual(updated.protected_password, "new-test-password")
+        self.assertNotIn("new-test-password", updated.protected_password)
+
     def test_user_dashboard_has_no_admin_retention_controls(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")
         user = self.controller.auth_service.create_user(
@@ -356,6 +472,12 @@ class LoginFlowSmokeTest(unittest.TestCase):
 
         dashboard = self.controller.dashboard_window
         self.assertEqual(dashboard.stack.count(), 3)
+        self.assertFalse(
+            any(
+                button.objectName().startswith("cameraCredentialButton-")
+                for button in dashboard.findChildren(QPushButton)
+            )
+        )
         self.assertIsNone(dashboard.findChild(QGroupBox, "dataRetentionGroup"))
         self.assertIsNone(
             dashboard.findChild(QPushButton, "deleteAllPlateRecordsButton")
@@ -376,6 +498,11 @@ class LoginFlowSmokeTest(unittest.TestCase):
         records_page = self.controller.dashboard_window.pages[1]
         records_page.refresh()
 
+        self.assertEqual(records_page.table.columnCount(), 5)
+        day_button = records_page.table.cellWidget(0, 4)
+        self.assertIsInstance(day_button, QPushButton)
+        self.assertEqual(day_button.text(), "Aç")
+        day_button.click()
         self.assertEqual(records_page.table.columnCount(), 6)
         self.assertEqual(records_page.table.horizontalHeaderItem(5).text(), "Fotoğraf")
         photo_button = records_page.table.cellWidget(0, 5)

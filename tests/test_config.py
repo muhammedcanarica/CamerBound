@@ -18,6 +18,52 @@ from app.config import (
 
 
 class PlateRecognitionConfigTests(unittest.TestCase):
+    def test_ocr_sampling_interval_is_250_without_relaxing_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            settings_path = Path(temp_directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "database_path": "test.db",
+                        "plate_detection": {
+                            "recognition_interval_ms": 250,
+                            "min_confidence": 0.65,
+                            "confirmations_required": 2,
+                            "confirmation_window_seconds": 3,
+                            "duplicate_cooldown_seconds": 10,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(settings_path).plate_recognition
+
+        self.assertEqual(config.recognition_interval_ms, 250)
+        self.assertEqual(config.min_confidence, 0.65)
+        self.assertEqual(config.confirmations_required, 2)
+        self.assertEqual(config.confirmation_window_seconds, 3)
+        self.assertEqual(config.duplicate_cooldown_seconds, 10)
+
+    def test_missing_ocr_sampling_interval_defaults_to_250(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            settings_path = Path(temp_directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "database_path": "test.db",
+                        "plate_detection": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(settings_path).plate_recognition
+
+        self.assertEqual(config.recognition_interval_ms, 250)
+        self.assertEqual(config.min_confidence, 0.65)
+        self.assertEqual(config.confirmations_required, 2)
+
     def test_plate_capture_defaults_and_invalid_values_use_safe_fallbacks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             settings_path = Path(temp_directory) / "settings.json"

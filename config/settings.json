@@ -7,7 +7,7 @@
   },
   "plate_detection": {
     "ocr_backend": "auto",
-    "recognition_interval_ms": 500,
+    "recognition_interval_ms": 250,
     "min_confidence": 0.65,
     "confirmations_required": 2,
     "confirmation_window_seconds": 3,

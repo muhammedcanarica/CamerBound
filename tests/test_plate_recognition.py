@@ -6,6 +6,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PySide6.QtCore import Qt
@@ -21,6 +22,7 @@ from app.plate_recognition import (
     OcrSegment,
     PaddleOcrProvider,
     PlateCandidate,
+    PlatePresenceTracker,
     PlateRecognitionProcessor,
     PlateRecognitionWorker,
     TurkishPlateValidator,
@@ -57,7 +59,7 @@ class RecoveringOcrProvider(FakeOcrProvider):
 
 def recognition_config(model_root: Path, confirmations: int = 2) -> PlateRecognitionConfig:
     return PlateRecognitionConfig(
-        recognition_interval_ms=500,
+        recognition_interval_ms=250,
         min_confidence=0.65,
         confirmations_required=confirmations,
         confirmation_window_seconds=3.0,
@@ -95,6 +97,25 @@ class PlateTextTests(unittest.TestCase):
         confirmed = tracker.observe(candidate, 11.0)
         self.assertIsNotNone(confirmed)
         self.assertIsNone(tracker.observe(candidate, 12.0))
+
+    def test_presence_record_claim_is_thread_safe(self) -> None:
+        tracker = PlatePresenceTracker()
+        candidate = PlateCandidate("34ABC123", 0.9, "34 ABC 123", 7)
+        tracker.observe(candidate, 10.0)
+        barrier = threading.Barrier(8)
+        results: list[bool] = []
+
+        def claim() -> None:
+            barrier.wait()
+            results.append(tracker.claim_record(candidate))
+
+        threads = [threading.Thread(target=claim) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(results.count(True), 1)
 
     def test_multiple_ocr_segments_are_combined_left_to_right(self) -> None:
         segments = [
@@ -176,21 +197,154 @@ class RecognitionPipelineTests(unittest.TestCase):
             camera.id,
             camera.direction,
             frame,
-            detected_at,
-            monotonic_at=6.0,
+            detected_at + timedelta(seconds=8),
+            monotonic_at=10.0,
+        )
+        processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            detected_at + timedelta(seconds=18),
+            monotonic_at=20.0,
+        )
+        processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            detected_at + timedelta(seconds=28),
+            monotonic_at=30.0,
         )
         duplicate = processor.process(
             camera.id,
             camera.direction,
             frame,
-            detected_at + timedelta(seconds=5),
-            monotonic_at=7.0,
+            detected_at + timedelta(seconds=29),
+            monotonic_at=31.0,
         )
 
         self.assertIsNotNone(saved.record)
         self.assertTrue(duplicate.duplicate)
         self.assertIsNone(duplicate.record)
         self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 1)
+        self.assertEqual(self._record_count(), 1)
+
+    def test_candidate_updates_during_presence_without_creating_a_record(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(), self.plate_service, self.config
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        detected_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        processor.process(
+            camera.id, camera.direction, frame, detected_at, monotonic_at=1.0
+        )
+        processor.process(
+            camera.id, camera.direction, frame, detected_at, monotonic_at=2.0
+        )
+
+        outcome = processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            detected_at + timedelta(seconds=1),
+            monotonic_at=3.0,
+        )
+
+        self.assertIsNotNone(outcome.candidate)
+        self.assertEqual(outcome.candidate.plate, "34ABC123")
+        self.assertIsNone(outcome.record)
+        self.assertEqual(self._record_count(), 1)
+
+    def test_same_plate_can_be_recorded_again_after_presence_release(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(), self.plate_service, self.config
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        detected_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        processor.process(
+            camera.id, camera.direction, frame, detected_at, monotonic_at=1.0
+        )
+        first = processor.process(
+            camera.id, camera.direction, frame, detected_at, monotonic_at=2.0
+        )
+
+        processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            detected_at + timedelta(seconds=17),
+            monotonic_at=18.0,
+        )
+        second = processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            detected_at + timedelta(seconds=18),
+            monotonic_at=19.0,
+        )
+
+        self.assertIsNotNone(first.record)
+        self.assertIsNotNone(second.record)
+        self.assertEqual(self._record_count(), 2)
+        self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 2)
+
+    def test_same_plate_is_independent_for_entry_and_exit_cameras(self) -> None:
+        cameras = {
+            camera.direction: camera for camera in self.camera_service.list_cameras()
+        }
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(),
+            self.plate_service,
+            recognition_config(Path(self.temp_directory.name), confirmations=1),
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        detected_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+
+        entry = processor.process(
+            cameras[Direction.ENTRY].id,
+            Direction.ENTRY,
+            frame,
+            detected_at,
+            monotonic_at=1.0,
+        )
+        exit_record = processor.process(
+            cameras[Direction.EXIT].id,
+            Direction.EXIT,
+            frame,
+            detected_at,
+            monotonic_at=2.0,
+        )
+
+        self.assertIsNotNone(entry.record)
+        self.assertIsNotNone(exit_record.record)
+        self.assertEqual(self._record_count(), 2)
+
+    def test_different_plates_do_not_share_presence(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        provider = FakeOcrProvider()
+        processor = PlateRecognitionProcessor(
+            provider,
+            self.plate_service,
+            recognition_config(Path(self.temp_directory.name), confirmations=1),
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        detected_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        first = processor.process(
+            camera.id, camera.direction, frame, detected_at, monotonic_at=1.0
+        )
+        provider.text = "06 XYZ 99"
+        second = processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            detected_at + timedelta(seconds=1),
+            monotonic_at=2.0,
+        )
+
+        self.assertIsNotNone(first.record)
+        self.assertIsNotNone(second.record)
+        self.assertEqual(self._record_count(), 2)
 
     def test_worker_keeps_only_latest_frame_per_camera(self) -> None:
         worker = PlateRecognitionWorker(
@@ -204,6 +358,56 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(worker.pending_frame_count, 1)
         worker.submit_frame(20, Direction.EXIT, frame)
         self.assertEqual(worker.pending_frame_count, 2)
+
+    def test_worker_uses_250_ms_interval_per_camera(self) -> None:
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        first_entry = object()
+        latest_entry = object()
+        exit_frame = object()
+
+        worker.submit_frame(10, Direction.ENTRY, first_entry)
+        with patch("app.plate_recognition.time.monotonic", return_value=10.0):
+            camera_id, pending = worker._take_due_frame()
+        self.assertEqual(camera_id, 10)
+        self.assertIs(pending.frame, first_entry)
+
+        worker.submit_frame(10, Direction.ENTRY, object())
+        worker.submit_frame(10, Direction.ENTRY, latest_entry)
+        worker.submit_frame(20, Direction.EXIT, exit_frame)
+        with patch("app.plate_recognition.time.monotonic", return_value=10.249):
+            camera_id, pending = worker._take_due_frame()
+
+        self.assertEqual(camera_id, 20)
+        self.assertIs(pending.frame, exit_frame)
+        self.assertEqual(worker.pending_frame_count, 1)
+        with patch("app.plate_recognition.time.monotonic", return_value=10.249):
+            self.assertIsNone(worker._take_due_frame())
+        with patch("app.plate_recognition.time.monotonic", return_value=10.251):
+            camera_id, pending = worker._take_due_frame()
+
+        self.assertEqual(camera_id, 10)
+        self.assertIs(pending.frame, latest_entry)
+        self.assertEqual(worker.pending_frame_count, 0)
+
+    def test_worker_replaces_pending_frame_instead_of_building_backlog(self) -> None:
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        latest_frame = None
+        for _ in range(100):
+            latest_frame = object()
+            worker.submit_frame(10, Direction.ENTRY, latest_frame)
+
+        self.assertEqual(worker.pending_frame_count, 1)
+        with patch("app.plate_recognition.time.monotonic", return_value=10.0):
+            _camera_id, pending = worker._take_due_frame()
+        self.assertIs(pending.frame, latest_frame)
 
     def test_missing_model_is_reported_without_importing_paddle(self) -> None:
         with self.assertRaisesRegex(OcrModelNotFound, "Detection model"):
@@ -264,6 +468,11 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(paths), 4)
         self.assertTrue(all(path.is_file() for path in paths))
+
+    def _record_count(self) -> int:
+        with self.database.connection() as connection:
+            row = connection.execute("SELECT COUNT(*) FROM plate_records").fetchone()
+        return int(row[0])
 
 
 if __name__ == "__main__":

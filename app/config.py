@@ -203,7 +203,7 @@ def _load_plate_recognition(
 ) -> PlateRecognitionConfig:
     warnings: list[str] = []
     interval = _bounded_number(
-        raw.get("recognition_interval_ms"), 500, 100, 60_000, int,
+        raw.get("recognition_interval_ms"), 250, 100, 60_000, int,
         "recognition_interval_ms", warnings,
     )
     confidence = _bounded_number(

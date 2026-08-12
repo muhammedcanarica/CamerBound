@@ -41,6 +41,7 @@ class RecognitionStatus(StrEnum):
 
 
 LOGGER = logging.getLogger(__name__)
+PLATE_PRESENCE_RELEASE_SECONDS = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +240,58 @@ class ConfirmationTracker:
         )
 
 
+@dataclass(slots=True)
+class _PlatePresence:
+    last_seen: float
+    record_claimed: bool = False
+
+
+class PlatePresenceTracker:
+    """Track active plate appearances independently for each camera."""
+
+    def __init__(self, release_seconds: float = PLATE_PRESENCE_RELEASE_SECONDS) -> None:
+        self.release_seconds = max(0.1, release_seconds)
+        self._presences: dict[tuple[int, str], _PlatePresence] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(candidate: PlateCandidate) -> tuple[int, str]:
+        return candidate.camera_id, normalize_plate_text(candidate.plate)
+
+    def observe(self, candidate: PlateCandidate, observed_at: float) -> None:
+        """Refresh last_seen and start a new event after the release interval."""
+        key = self._key(candidate)
+        with self._lock:
+            presence = self._presences.get(key)
+            if (
+                presence is None
+                or observed_at - presence.last_seen > self.release_seconds
+            ):
+                self._presences[key] = _PlatePresence(last_seen=observed_at)
+                return
+            presence.last_seen = observed_at
+
+    def claim_record(self, candidate: PlateCandidate) -> bool:
+        """Atomically reserve the single record allowed for the active event."""
+        key = self._key(candidate)
+        with self._lock:
+            presence = self._presences.get(key)
+            if presence is None:
+                return False
+            if presence.record_claimed:
+                return False
+            presence.record_claimed = True
+            return True
+
+    def release_record_claim(self, candidate: PlateCandidate) -> None:
+        """Allow a retry when persistence failed before producing a record."""
+        key = self._key(candidate)
+        with self._lock:
+            presence = self._presences.get(key)
+            if presence is not None:
+                presence.record_claimed = False
+
+
 @dataclass(frozen=True, slots=True)
 class RecognitionOutcome:
     candidate: PlateCandidate | None
@@ -260,6 +313,7 @@ class PlateRecognitionProcessor:
             config.confirmations_required,
             config.confirmation_window_seconds,
         )
+        self.presences = PlatePresenceTracker()
 
     def process(
         self,
@@ -277,12 +331,16 @@ class PlateRecognitionProcessor:
         if candidate is None or candidate.confidence < self.config.min_confidence:
             return RecognitionOutcome(candidate=candidate, record=None)
 
-        confirmed = self.confirmations.observe(
-            candidate,
-            monotonic_at if monotonic_at is not None else time.monotonic(),
-        )
+        observed_at = monotonic_at if monotonic_at is not None else time.monotonic()
+        self.presences.observe(candidate, observed_at)
+        confirmed = self.confirmations.observe(candidate, observed_at)
         if confirmed is None:
             return RecognitionOutcome(candidate=candidate, record=None)
+        if not self.presences.claim_record(confirmed):
+            LOGGER.info(
+                "Active plate presence suppressed for camera_id=%s", camera_id
+            )
+            return RecognitionOutcome(candidate=confirmed, record=None, duplicate=True)
         try:
             record = self.plate_service.save_plate_detection(
                 confirmed.plate,
@@ -294,6 +352,9 @@ class PlateRecognitionProcessor:
         except DuplicatePlateDetection:
             LOGGER.info("Duplicate plate detection suppressed for camera_id=%s", camera_id)
             return RecognitionOutcome(candidate=confirmed, record=None, duplicate=True)
+        except Exception:
+            self.presences.release_record_claim(confirmed)
+            raise
         LOGGER.info("Plate detection saved for camera_id=%s", camera_id)
         return RecognitionOutcome(candidate=confirmed, record=record)
 

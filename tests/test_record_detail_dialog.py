@@ -22,6 +22,7 @@ from app.camera import CameraService
 from app.database import Database
 from app.plate_capture import PlateCaptureService
 from app.plate_service import PlateRecord, PlateService
+from app.time_utils import to_local_datetime
 from ui.display_helpers import display_timestamp
 from ui.record_detail_dialog import MISSING_PHOTO_TEXT, RecordDetailDialog
 from ui.records_widget import RecordsWidget
@@ -213,11 +214,14 @@ class RecordDetailDialogTests(unittest.TestCase):
         launcher.assert_not_called()
         self.assertIn("yalnızca Windows", warning.call_args.args[2])
 
-    def test_records_table_does_not_eager_load_images(self) -> None:
+    def test_daily_archive_and_records_table_do_not_eager_load_images(self) -> None:
         widget = self._records_widget(self.admin)
 
         with patch("ui.record_detail_dialog.QPixmap") as pixmap:
             widget.refresh()
+            self.assertEqual(widget.table.columnCount(), 5)
+            self.assertEqual(widget.table.cellWidget(0, 4).text(), "Aç")
+            self._open_record_day(widget, self.record)
 
         pixmap.assert_not_called()
         row = self._row_for_record(widget, self.record.id)
@@ -236,6 +240,7 @@ class RecordDetailDialogTests(unittest.TestCase):
         widget = self._records_widget(self.admin)
 
         widget.refresh()
+        self._open_record_day(widget, record_without_image)
 
         row = self._row_for_record(widget, record_without_image.id)
         self.assertIsNone(widget.table.cellWidget(row, 5))
@@ -244,6 +249,7 @@ class RecordDetailDialogTests(unittest.TestCase):
     def test_photo_button_opens_existing_dialog_for_correct_record(self) -> None:
         widget = self._records_widget(self.user)
         widget.refresh()
+        self._open_record_day(widget, self.record)
         row = self._row_for_record(widget, self.record.id)
 
         with patch("ui.records_widget.RecordDetailDialog") as dialog_factory:
@@ -265,6 +271,7 @@ class RecordDetailDialogTests(unittest.TestCase):
         widget = self._records_widget(self.user)
         widget.table.setSortingEnabled(True)
         widget.refresh()
+        self._open_record_day(widget, self.record)
         widget.table.sortItems(0, Qt.SortOrder.DescendingOrder)
 
         for expected_record in (self.record, second_record):
@@ -289,6 +296,7 @@ class RecordDetailDialogTests(unittest.TestCase):
     def test_user_can_open_correct_record_by_double_clicking_row(self) -> None:
         widget = self._records_widget(self.user)
         widget.refresh()
+        self._open_record_day(widget, self.record)
         widget.resize(900, 500)
         widget.show()
         self.application.processEvents()
@@ -313,6 +321,66 @@ class RecordDetailDialogTests(unittest.TestCase):
         self.assertEqual(opened_record.id, self.record.id)
         dialog_factory.return_value.exec.assert_called_once()
 
+    def test_day_detail_only_shows_selected_day_and_back_returns_to_archive(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        previous_day = self.plate_service.save_plate_detection(
+            "06OLD123",
+            camera.id,
+            0.91,
+            datetime(2026, 8, 11, 8, 21, 34, tzinfo=timezone.utc),
+        )
+        widget = self._records_widget(self.user)
+
+        widget.refresh()
+
+        self.assertEqual(widget.table.rowCount(), 2)
+        self._open_record_day(widget, self.record)
+        self.assertEqual(widget.table.rowCount(), 1)
+        record_id = widget.table.item(0, 0).data(Qt.ItemDataRole.UserRole)
+        self.assertEqual(record_id, self.record.id)
+        self.assertNotEqual(record_id, previous_day.id)
+        self.assertFalse(widget.back_button.isHidden())
+
+        widget._show_archive()
+
+        self.assertEqual(widget.table.columnCount(), 5)
+        self.assertEqual(widget.table.rowCount(), 2)
+        self.assertTrue(widget.back_button.isHidden())
+
+    def test_archive_search_and_direction_filter_apply_to_day_detail(self) -> None:
+        exit_camera = next(
+            camera
+            for camera in self.camera_service.list_cameras()
+            if camera.direction.value == "EXIT"
+        )
+        exit_record = self.plate_service.save_plate_detection(
+            "06EXIT99",
+            exit_camera.id,
+            0.92,
+            datetime(2026, 8, 12, 8, 25, 0, tzinfo=timezone.utc),
+        )
+        widget = self._records_widget(self.user)
+        widget.search_input.setText("06 EXIT")
+
+        widget.refresh()
+
+        self.assertEqual(widget.table.rowCount(), 1)
+        self.assertEqual(widget.table.item(0, 1).text(), "1")
+        widget.search_input.clear()
+        widget.direction_filter.setCurrentIndex(
+            widget.direction_filter.findData(exit_camera.direction)
+        )
+        self.assertEqual(widget.table.item(0, 2).text(), "0")
+        self.assertEqual(widget.table.item(0, 3).text(), "1")
+
+        self._open_record_day(widget, exit_record)
+
+        self.assertEqual(widget.table.rowCount(), 1)
+        self.assertEqual(
+            widget.table.item(0, 0).data(Qt.ItemDataRole.UserRole),
+            exit_record.id,
+        )
+
     def _dialog(self, record: PlateRecord, **kwargs: object) -> RecordDetailDialog:
         dialog = RecordDetailDialog(record, self.plate_service, **kwargs)
         self.widgets.append(dialog)
@@ -324,6 +392,10 @@ class RecordDetailDialogTests(unittest.TestCase):
         widget = RecordsWidget(self.plate_service, actor)
         self.widgets.append(widget)
         return widget
+
+    @staticmethod
+    def _open_record_day(widget: RecordsWidget, record: PlateRecord) -> None:
+        widget._open_day(to_local_datetime(record.timestamp).date())
 
     @staticmethod
     def _row_for_record(widget: RecordsWidget, record_id: int) -> int:

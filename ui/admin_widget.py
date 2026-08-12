@@ -9,6 +9,8 @@ from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -124,6 +126,56 @@ class UsersAdminWidget(QWidget):
             )
             for column, value in enumerate(values):
                 self.table.setItem(row_index, column, QTableWidgetItem(value))
+
+
+class CameraCredentialsDialog(QDialog):
+    def __init__(self, camera: Camera, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("cameraCredentialsDialog")
+        self.setWindowTitle("Kamera Erişim Bilgileri")
+        self.setModal(True)
+        self.setMinimumWidth(480)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(14)
+
+        description = QLabel(
+            "Bu işlem kameranın kendi kullanıcı adı veya şifresini değiştirmez. "
+            "Yalnızca CamerBound'un kameraya bağlanırken kullandığı bilgileri günceller."
+        )
+        description.setObjectName("cameraCredentialsDescription")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+        self.username_input = QLineEdit(camera.username or "")
+        self.username_input.setObjectName("cameraCredentialUsernameInput")
+        self.password_input = QLineEdit()
+        self.password_input.setObjectName("cameraCredentialPasswordInput")
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("Kamera Kullanıcı Adı", self.username_input)
+        form.addRow("Bağlantı Şifresi", self.password_input)
+        layout.addLayout(form)
+
+        if camera.username and camera.has_password:
+            password_help = QLabel("Mevcut şifreyi korumak için boş bırakın.")
+            password_help.setObjectName("cameraCredentialPasswordHelp")
+            password_help.setWordWrap(True)
+            password_help.setStyleSheet("color: #6d7890;")
+            layout.addWidget(password_help)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Save
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("İptal")
+        self.buttons.button(QDialogButtonBox.StandardButton.Save).setText("Kaydet")
+        self.buttons.rejected.connect(self.reject)
+        self.buttons.accepted.connect(self.accept)
+        layout.addWidget(self.buttons)
 
 
 class CameraSettingsWidget(QWidget):
@@ -468,12 +520,6 @@ class CameraSettingsWidget(QWidget):
         name_input = QLineEdit(camera.name)
         url_input = QLineEdit(camera.stream_url)
         url_input.setPlaceholderText("RTSP URL, video dosyası veya webcam index (örn. 0)")
-        credential_status = QLabel(
-            "Yapılandırıldı"
-            if camera.username and camera.has_password
-            else "Yapılandırılmadı"
-        )
-        credential_status.setObjectName(f"cameraCredentialStatus-{camera.id}")
         direction_input = QComboBox()
         direction_input.addItem("Giriş", Direction.ENTRY)
         direction_input.addItem("Çıkış", Direction.EXIT)
@@ -491,7 +537,36 @@ class CameraSettingsWidget(QWidget):
         roi_button.clicked.connect(partial(self._calibrate_roi, camera.id))
         form.addRow("Ad", name_input)
         form.addRow("Kamera Kaynağı", url_input)
-        form.addRow("Kimlik Bilgileri", credential_status)
+        if self.user.role is Role.ADMIN:
+            credential_group = QGroupBox("Kamera Erişim Bilgileri")
+            credential_group.setObjectName(f"cameraCredentialsGroup-{camera.id}")
+            credential_layout = QVBoxLayout(credential_group)
+            credential_status = QLabel(
+                "✓ Erişim bilgileri kayıtlı"
+                if camera.username and camera.has_password
+                else "⚠ Erişim bilgileri ayarlanmamış"
+            )
+            credential_status.setObjectName(f"cameraCredentialStatus-{camera.id}")
+            credential_description = QLabel(
+                "CamerBound, kameraya bağlanmak için bu kullanıcı adı ve şifreyi kullanır."
+            )
+            credential_description.setWordWrap(True)
+            credential_description.setObjectName(
+                f"cameraCredentialDescription-{camera.id}"
+            )
+            credential_button = QPushButton(
+                "Erişim Bilgilerini Güncelle"
+                if camera.username and camera.has_password
+                else "Erişim Bilgilerini Ayarla"
+            )
+            credential_button.setObjectName(f"cameraCredentialButton-{camera.id}")
+            credential_button.clicked.connect(
+                partial(self._open_camera_credentials, camera.id)
+            )
+            credential_layout.addWidget(credential_status)
+            credential_layout.addWidget(credential_description)
+            credential_layout.addWidget(credential_button)
+            form.addRow(credential_group)
         form.addRow("Yön", direction_input)
         form.addRow("Durum", enabled_input)
         form.addRow("", save_button)
@@ -514,8 +589,8 @@ class CameraSettingsWidget(QWidget):
             if source_has_credentials:
                 url.setText(previous.stream_url)
                 raise ValidationError(
-                    "Kamera kaynağı kimlik bilgisi içeremez. Kayıtlı kamera "
-                    "kimlik bilgileri bu ekrandan değiştirilemez."
+                    "Kamera kaynağı alanına kullanıcı adı veya şifre eklemeyin. "
+                    "Bunun için Kamera Erişim Bilgileri bölümünü kullanın."
                 )
             normalized_direction = Direction(direction.currentData())
             was_running = self.camera_service.is_camera_running(camera_id)
@@ -553,6 +628,64 @@ class CameraSettingsWidget(QWidget):
             self,
             "Başarılı",
             message,
+        )
+
+    def _open_camera_credentials(self, camera_id: int) -> None:
+        try:
+            AuthService.require_admin(self.user)
+            camera = self.camera_service.get_camera(camera_id)
+        except (PermissionError, ValidationError) as exc:
+            QMessageBox.warning(self, "Erişim bilgileri açılamadı", str(exc))
+            return
+
+        dialog = CameraCredentialsDialog(camera, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        username = dialog.username_input.text().strip()
+        password = dialog.password_input.text()
+        dialog.password_input.clear()
+        if not username:
+            QMessageBox.warning(
+                self,
+                "Erişim bilgileri kaydedilemedi",
+                "Kamera kullanıcı adı boş bırakılamaz.",
+            )
+            return
+        if not camera.has_password and not password:
+            QMessageBox.warning(
+                self,
+                "Erişim bilgileri kaydedilemedi",
+                "Bağlantı şifresi boş bırakılamaz.",
+            )
+            return
+
+        try:
+            self.camera_service.update_camera(
+                self.user,
+                camera.id,
+                camera.name,
+                camera.stream_url,
+                camera.direction,
+                camera.enabled,
+                username=username,
+                password=password,
+            )
+        except (TypeError, ValueError, ValidationError, PermissionError) as exc:
+            QMessageBox.warning(
+                self,
+                "Erişim bilgileri kaydedilemedi",
+                str(exc),
+            )
+            return
+        finally:
+            del password
+
+        self.refresh()
+        QMessageBox.information(
+            self,
+            "Başarılı",
+            "Kamera erişim bilgileri kaydedildi.",
         )
 
     def _calibrate_roi(self, camera_id: int) -> None:

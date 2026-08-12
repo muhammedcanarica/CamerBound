@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,7 +21,7 @@ from app.database import Database
 from app.plate_capture import PlateCaptureService
 from app.plate_service import PlateService
 from app.plate_service import DuplicatePlateDetection
-from app.time_utils import to_utc_storage
+from app.time_utils import parse_utc_timestamp, to_utc_storage
 from main import apply_startup_retention_cleanup
 
 
@@ -164,6 +164,88 @@ class ServiceTests(unittest.TestCase):
             self.plate_service.search_records(self.admin, direction="INVALID")
         vehicles_inside = self.plate_service.get_vehicles_inside(self.admin)
         self.assertEqual([vehicle.plate for vehicle in vehicles_inside], ["06XYZ99"])
+
+    def test_daily_archive_uses_local_date_across_utc_midnight_boundary(self) -> None:
+        cameras = {
+            camera.direction: camera for camera in self.camera_service.list_cameras()
+        }
+        before_midnight = datetime(2026, 8, 12, 20, 59, 59, tzinfo=timezone.utc)
+        after_midnight = datetime(2026, 8, 12, 21, 0, 1, tzinfo=timezone.utc)
+        next_record = datetime(2026, 8, 13, 8, 0, tzinfo=timezone.utc)
+        record_ids: dict[str, int] = {}
+        with self.database.connection() as connection:
+            for plate, direction, timestamp in (
+                ("34DAY12", Direction.ENTRY, before_midnight),
+                ("06DAY13", Direction.EXIT, after_midnight),
+                ("35DAY13", Direction.ENTRY, next_record),
+            ):
+                camera = cameras[direction]
+                cursor = connection.execute(
+                    """
+                    INSERT INTO plate_records
+                        (plate, direction, camera_id, confidence, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        plate,
+                        direction.value,
+                        camera.id,
+                        0.90,
+                        to_utc_storage(timestamp),
+                    ),
+                )
+                record_ids[plate] = int(cursor.lastrowid)
+
+        local_timezone = timezone(timedelta(hours=3))
+
+        def to_test_local(value: str | datetime) -> datetime:
+            return parse_utc_timestamp(value).astimezone(local_timezone)
+
+        with patch("app.plate_service.to_local_datetime", side_effect=to_test_local):
+            summaries = self.plate_service.get_record_day_summaries(self.admin)
+            august_12 = self.plate_service.search_records_for_local_date(
+                self.admin, date(2026, 8, 12)
+            )
+            august_13 = self.plate_service.search_records_for_local_date(
+                self.admin, date(2026, 8, 13)
+            )
+            filtered = self.plate_service.search_records_for_local_date(
+                self.admin,
+                date(2026, 8, 13),
+                plate_query="06",
+                direction=Direction.EXIT,
+            )
+
+        self.assertEqual(
+            [summary.date for summary in summaries],
+            [date(2026, 8, 13), date(2026, 8, 12)],
+        )
+        self.assertEqual(
+            (
+                summaries[0].total_count,
+                summaries[0].entry_count,
+                summaries[0].exit_count,
+            ),
+            (2, 1, 1),
+        )
+        self.assertEqual(
+            (
+                summaries[1].total_count,
+                summaries[1].entry_count,
+                summaries[1].exit_count,
+            ),
+            (1, 1, 0),
+        )
+        self.assertEqual(
+            [record.id for record in august_12], [record_ids["34DAY12"]]
+        )
+        self.assertEqual(
+            {record.id for record in august_13},
+            {record_ids["06DAY13"], record_ids["35DAY13"]},
+        )
+        self.assertEqual(
+            [record.id for record in filtered], [record_ids["06DAY13"]]
+        )
 
     def test_duplicate_cooldown_is_camera_specific(self) -> None:
         cameras = {camera.direction: camera for camera in self.camera_service.list_cameras()}
