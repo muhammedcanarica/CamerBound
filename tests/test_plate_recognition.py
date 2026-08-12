@@ -8,12 +8,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 from PySide6.QtCore import Qt
 
 from app.auth import AuthService
 from app.camera import CameraService, Direction
-from app.config import DEFAULT_ROI, PlateRecognitionConfig
+from app.config import DEFAULT_ROI, NormalizedRoi, PlateRecognitionConfig
 from app.database import Database
 from app.plate_capture import PlateCaptureService
 from app.plate_recognition import (
@@ -28,6 +29,8 @@ from app.plate_recognition import (
     TurkishPlateValidator,
     correct_plate_candidate,
     normalize_plate_text,
+    crop_roi,
+    preprocess_variants,
     select_best_candidate,
     RecognitionStatus,
 )
@@ -129,6 +132,66 @@ class PlateTextTests(unittest.TestCase):
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate.plate, "34ABC123")
 
+    def test_same_plate_from_multiple_variants_keeps_best_confidence(self) -> None:
+        segments = [
+            OcrSegment("34ABC123", 0.81, (0.0, 0.0, 100.0, 30.0), 0),
+            OcrSegment("34 ABC 123", 0.94, (0.0, 0.0, 200.0, 60.0), 2),
+        ]
+
+        candidate = select_best_candidate(segments, camera_id=5)
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.plate, "34ABC123")
+        self.assertEqual(candidate.confidence, 0.94)
+
+
+class PreprocessingTests(unittest.TestCase):
+    def test_existing_variants_are_preserved_and_third_variant_is_exactly_2x(self) -> None:
+        generator = np.random.default_rng(7)
+        crop = generator.integers(0, 256, (120, 400, 3), dtype=np.uint8)
+        expected_original = cv2.resize(
+            crop,
+            None,
+            fx=1.5,
+            fy=1.5,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        expected_gray = cv2.cvtColor(expected_original, cv2.COLOR_BGR2GRAY)
+        expected_contrasted = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8, 8),
+        ).apply(expected_gray)
+
+        variants = preprocess_variants(crop)
+
+        self.assertEqual(len(variants), 3)
+        np.testing.assert_array_equal(variants[0], expected_original)
+        np.testing.assert_array_equal(
+            variants[1],
+            cv2.cvtColor(expected_contrasted, cv2.COLOR_GRAY2BGR),
+        )
+        self.assertEqual(variants[2].shape, (240, 800, 3))
+
+    def test_upscale_does_not_mutate_input_crop(self) -> None:
+        crop = np.full((40, 80, 3), 127, dtype=np.uint8)
+        original_copy = crop.copy()
+
+        variants = preprocess_variants(crop)
+
+        np.testing.assert_array_equal(crop, original_copy)
+        self.assertFalse(np.shares_memory(crop, variants[2]))
+
+    def test_tiny_clamped_roi_does_not_crash_preprocessing(self) -> None:
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        roi = NormalizedRoi(x=-1.0, y=-1.0, width=0.0, height=0.0)
+
+        crop = crop_roi(frame, roi)
+        variants = preprocess_variants(crop)
+
+        self.assertEqual(crop.shape, (1, 1, 3))
+        self.assertEqual(len(variants), 3)
+        self.assertEqual(variants[2].shape, (2, 2, 3))
+
 
 class RecognitionPipelineTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -178,6 +241,43 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertTrue(
             self.capture_service.resolve_reference(second.record.image_path).is_file()
         )
+
+    def test_ocr_diagnostics_are_throttled_and_contain_safe_dimensions(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(), self.plate_service, self.config
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        with patch(
+            "app.plate_recognition.time.perf_counter",
+            side_effect=(10.0, 10.02, 10.1, 11.0, 11.02, 11.1),
+        ), self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            processor.process(
+                camera.id,
+                camera.direction,
+                frame,
+                monotonic_at=1.0,
+            )
+            processor.process(
+                camera.id,
+                camera.direction,
+                frame,
+                monotonic_at=2.0,
+            )
+
+        diagnostic_lines = [
+            line for line in captured.output if "OCR diagnostics" in line
+        ]
+        self.assertEqual(len(diagnostic_lines), 1)
+        diagnostic = diagnostic_lines[0]
+        self.assertIn(f"camera_id={camera.id}", diagnostic)
+        self.assertIn("direction=ENTRY", diagnostic)
+        self.assertIn("frame=400x200", diagnostic)
+        self.assertIn("roi=320x110", diagnostic)
+        self.assertIn("variants=3", diagnostic)
+        self.assertIn("processing_ms=100.0", diagnostic)
+        self.assertIn("inference_ms=80.0", diagnostic)
+        self.assertIn("candidate=yes", diagnostic)
 
     def test_duplicate_after_a_new_confirmation_does_not_store_a_second_image(self) -> None:
         camera = self.camera_service.list_cameras()[0]

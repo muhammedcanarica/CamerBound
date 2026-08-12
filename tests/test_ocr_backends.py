@@ -122,7 +122,11 @@ class OcrBackendTests(unittest.TestCase):
                 pipeline_factory=factory,
             )
             segments = provider.recognize(
-                [np.zeros((32, 128, 3), dtype=np.uint8)]
+                [
+                    np.zeros((32, 128, 3), dtype=np.uint8),
+                    np.zeros((48, 192, 3), dtype=np.uint8),
+                    np.zeros((64, 256, 3), dtype=np.uint8),
+                ]
             )
 
         self.assertIs(provider.backend, OcrBackend.PADDLE)
@@ -148,7 +152,8 @@ class OcrBackendTests(unittest.TestCase):
             "fake",
         )
         self.assertTrue(all(isinstance(segment, OcrSegment) for segment in segments))
-        self.assertEqual(segments[0].text, "34ABC123")
+        self.assertEqual([segment.text for segment in segments], ["34ABC123"] * 3)
+        self.assertEqual([segment.variant_index for segment in segments], [0, 1, 2])
 
     def test_onnx_provider_keeps_onnxruntime_engine(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

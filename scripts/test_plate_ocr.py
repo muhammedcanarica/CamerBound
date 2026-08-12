@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.camera import Direction
 from app.config import load_config
 from app.plate_recognition import (
+    OCR_VARIANT_NAMES,
     PaddleOcrProvider,
     OcrModelNotFound,
     TurkishPlateValidator,
@@ -56,15 +57,27 @@ def main() -> int:
     except OcrModelNotFound as exc:
         print(str(exc))
         return 2
+    processing_started_at = time.perf_counter()
     variants = preprocess_variants(crop)
-    started_at = time.perf_counter()
+    preprocess_ms = (time.perf_counter() - processing_started_at) * 1000
+    inference_started_at = time.perf_counter()
     segments = provider.recognize(variants)
-    inference_ms = (time.perf_counter() - started_at) * 1000
+    inference_ms = (time.perf_counter() - inference_started_at) * 1000
+    total_ocr_ms = (time.perf_counter() - processing_started_at) * 1000
     print(
         f"image={Path(args.image).resolve()} direction={direction.value} "
         f"source={image.shape[1]}x{image.shape[0]} roi={crop.shape[1]}x{crop.shape[0]} "
-        f"variants={len(variants)} inference_ms={inference_ms:.1f}"
+        f"variants={len(variants)} preprocess_ms={preprocess_ms:.1f} "
+        f"inference_ms={inference_ms:.1f} total_ocr_ms={total_ocr_ms:.1f}"
     )
+    print("ocr_variants:")
+    for index, variant in enumerate(variants):
+        name = (
+            OCR_VARIANT_NAMES[index]
+            if index < len(OCR_VARIANT_NAMES)
+            else f"variant-{index}"
+        )
+        print(f"  index={index} name={name} size={variant.shape[1]}x{variant.shape[0]}")
     if args.save_debug:
         paths = save_debug_images(args.save_debug.resolve(), image, crop, variants, segments)
         print("debug_files:")

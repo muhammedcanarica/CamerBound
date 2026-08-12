@@ -42,6 +42,12 @@ class RecognitionStatus(StrEnum):
 
 LOGGER = logging.getLogger(__name__)
 PLATE_PRESENCE_RELEASE_SECONDS = 15
+OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS = 5.0
+OCR_VARIANT_NAMES = (
+    "adaptive-color",
+    "adaptive-clahe",
+    "upscaled-2x-clahe-sharpened",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,6 +320,8 @@ class PlateRecognitionProcessor:
             config.confirmation_window_seconds,
         )
         self.presences = PlatePresenceTracker()
+        self._last_ocr_started_at: dict[int, float] = {}
+        self._last_diagnostic_logged_at: dict[int, float] = {}
 
     def process(
         self,
@@ -326,8 +334,28 @@ class PlateRecognitionProcessor:
         crop = crop_roi(frame, self.config.roi_for(direction))
         if crop is None:
             return RecognitionOutcome(candidate=None, record=None)
-        segments = self.provider.recognize(preprocess_variants(crop))
+        ocr_started_at = time.perf_counter()
+        previous_ocr_started_at = self._last_ocr_started_at.get(camera_id)
+        self._last_ocr_started_at[camera_id] = ocr_started_at
+        variants = preprocess_variants(crop)
+        inference_started_at = time.perf_counter()
+        segments = self.provider.recognize(variants)
+        ocr_finished_at = time.perf_counter()
+        processing_duration_ms = (ocr_finished_at - ocr_started_at) * 1000.0
+        inference_duration_ms = (ocr_finished_at - inference_started_at) * 1000.0
         candidate = select_best_candidate(segments, camera_id)
+        self._log_ocr_diagnostics(
+            camera_id=camera_id,
+            direction=direction,
+            frame=frame,
+            crop=crop,
+            variants=variants,
+            ocr_started_at=ocr_started_at,
+            previous_ocr_started_at=previous_ocr_started_at,
+            processing_duration_ms=processing_duration_ms,
+            inference_duration_ms=inference_duration_ms,
+            candidate_found=candidate is not None,
+        )
         if candidate is None or candidate.confidence < self.config.min_confidence:
             return RecognitionOutcome(candidate=candidate, record=None)
 
@@ -357,6 +385,55 @@ class PlateRecognitionProcessor:
             raise
         LOGGER.info("Plate detection saved for camera_id=%s", camera_id)
         return RecognitionOutcome(candidate=confirmed, record=record)
+
+    def _log_ocr_diagnostics(
+        self,
+        *,
+        camera_id: int,
+        direction: Direction,
+        frame: object,
+        crop: np.ndarray,
+        variants: Sequence[np.ndarray],
+        ocr_started_at: float,
+        previous_ocr_started_at: float | None,
+        processing_duration_ms: float,
+        inference_duration_ms: float,
+        candidate_found: bool,
+    ) -> None:
+        if not LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        last_logged_at = self._last_diagnostic_logged_at.get(camera_id)
+        if (
+            last_logged_at is not None
+            and ocr_started_at - last_logged_at
+            < OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._last_diagnostic_logged_at[camera_id] = ocr_started_at
+        actual_interval_ms = (
+            None
+            if previous_ocr_started_at is None
+            else (ocr_started_at - previous_ocr_started_at) * 1000.0
+        )
+        LOGGER.debug(
+            "OCR diagnostics camera_id=%s direction=%s frame=%s roi=%s "
+            "variants=%s variant_sizes=%s processing_ms=%.1f inference_ms=%.1f "
+            "actual_interval_ms=%s candidate=%s",
+            camera_id,
+            direction.value,
+            _image_resolution(frame),
+            _image_resolution(crop),
+            len(variants),
+            ",".join(_image_resolution(variant) for variant in variants),
+            processing_duration_ms,
+            inference_duration_ms,
+            (
+                "first"
+                if actual_interval_ms is None
+                else f"{actual_interval_ms:.1f}"
+            ),
+            "yes" if candidate_found else "no",
+        )
 
 
 @dataclass(slots=True)
@@ -615,7 +692,34 @@ def preprocess_variants(crop: np.ndarray) -> list[np.ndarray]:
     gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
     contrasted = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
     contrasted_bgr = cv2.cvtColor(contrasted, cv2.COLOR_GRAY2BGR)
-    return [original, contrasted_bgr]
+    upscaled = cv2.resize(
+        crop,
+        None,
+        fx=2.0,
+        fy=2.0,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    upscaled_gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+    upscaled_contrasted = cv2.createCLAHE(
+        clipLimit=1.8,
+        tileGridSize=(8, 8),
+    ).apply(upscaled_gray)
+    softened = cv2.GaussianBlur(upscaled_contrasted, (0, 0), sigmaX=1.0)
+    sharpened = cv2.addWeighted(
+        upscaled_contrasted,
+        1.25,
+        softened,
+        -0.25,
+        0,
+    )
+    enhanced_upscaled_bgr = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+    return [original, contrasted_bgr, enhanced_upscaled_bgr]
+
+
+def _image_resolution(image: object) -> str:
+    if not isinstance(image, np.ndarray) or image.ndim < 2:
+        return "unknown"
+    return f"{image.shape[1]}x{image.shape[0]}"
 
 
 def select_best_candidate(
