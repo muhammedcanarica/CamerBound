@@ -16,16 +16,15 @@ from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QFrame,
     QGroupBox,
     QInputDialog,
     QLabel,
-    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QWidget,
 )
 
 from app.auth import AuthService, Role
@@ -185,13 +184,26 @@ class LoginFlowSmokeTest(unittest.TestCase):
         )
         self.assertEqual(len(camera_settings._camera_buttons), 2)
         for editor in camera_settings._editors.values():
-            _name, _url, username, password, _direction, _enabled, clear = editor
-            self.assertIsInstance(username, QLineEdit)
-            self.assertIsInstance(password, QLineEdit)
-            self.assertEqual(password.echoMode(), QLineEdit.EchoMode.Password)
-            self.assertEqual(password.text(), "")
-            self.assertIsInstance(clear, QCheckBox)
-            self.assertFalse(clear.isChecked())
+            self.assertEqual(len(editor), 4)
+        for camera in self.controller.camera_service.list_cameras():
+            credential_status = camera_settings.findChild(
+                QLabel,
+                f"cameraCredentialStatus-{camera.id}",
+            )
+            self.assertIsNotNone(credential_status)
+            self.assertEqual(credential_status.text(), "Yapılandırılmadı")
+            self.assertIsNone(
+                camera_settings.findChild(QWidget, f"cameraUsernameInput-{camera.id}")
+            )
+            self.assertIsNone(
+                camera_settings.findChild(QWidget, f"cameraPasswordInput-{camera.id}")
+            )
+            self.assertIsNone(
+                camera_settings.findChild(
+                    QWidget,
+                    f"cameraClearCredentials-{camera.id}",
+                )
+            )
         for save_button, roi_button in camera_settings._camera_buttons.values():
             self.assertGreaterEqual(save_button.minimumHeight(), 36)
             self.assertGreaterEqual(roi_button.minimumHeight(), 36)
@@ -243,6 +255,92 @@ class LoginFlowSmokeTest(unittest.TestCase):
         camera_settings.refresh()
         self.assertFalse(camera_settings.cleanup_old_button.isEnabled())
         self.assertIn("Süresiz", camera_settings.cleanup_old_button.toolTip())
+
+    def test_camera_credentials_are_status_only_and_preserved_on_save(self) -> None:
+        admin = self.controller.auth_service.authenticate("admin", "admin123")
+        camera = self.controller.camera_service.list_cameras()[0]
+        configured = self.controller.camera_service.update_camera(
+            admin,
+            camera.id,
+            camera.name,
+            "http://CAMERA_IP/live",
+            camera.direction,
+            False,
+            username="test-user",
+            password="test-password",
+        )
+        original_protected_password = configured.protected_password
+
+        self.controller.show_dashboard(admin)
+        settings_page = self.controller.dashboard_window.pages[4]
+        self.controller.dashboard_window.stack.setCurrentWidget(settings_page)
+        settings_page.refresh()
+        self.application.processEvents()
+
+        status = settings_page.findChild(
+            QLabel,
+            f"cameraCredentialStatus-{camera.id}",
+        )
+        self.assertIsNotNone(status)
+        self.assertEqual(status.text(), "Yapılandırıldı")
+        self.assertIsNone(
+            settings_page.findChild(QWidget, f"cameraUsernameInput-{camera.id}")
+        )
+        self.assertIsNone(
+            settings_page.findChild(QWidget, f"cameraPasswordInput-{camera.id}")
+        )
+        self.assertIsNone(
+            settings_page.findChild(
+                QWidget,
+                f"cameraClearCredentials-{camera.id}",
+            )
+        )
+
+        visible_text: list[str] = []
+        for widget in settings_page.findChildren(QWidget):
+            text_method = getattr(widget, "text", None)
+            if callable(text_method):
+                try:
+                    visible_text.append(str(text_method()))
+                except TypeError:
+                    pass
+            placeholder_method = getattr(widget, "placeholderText", None)
+            if callable(placeholder_method):
+                visible_text.append(str(placeholder_method()))
+        rendered_text = "\n".join(visible_text)
+        self.assertNotIn("test-user", rendered_text)
+        self.assertNotIn("test-password", rendered_text)
+
+        with patch("ui.admin_widget.QMessageBox.information"), patch(
+            "ui.admin_widget.QMessageBox.warning"
+        ) as warning:
+            settings_page._save_camera(camera.id)
+
+        warning.assert_not_called()
+        preserved = self.controller.camera_service.get_camera(camera.id)
+        self.assertEqual(preserved.username, configured.username)
+        self.assertEqual(
+            preserved.protected_password,
+            original_protected_password,
+        )
+        self.assertEqual(preserved.stream_url, configured.stream_url)
+
+        _name, source, _direction, _enabled = settings_page._editors[camera.id]
+        source.setText(
+            "http://other-user:other-password@CAMERA_IP/live"
+        )
+        with patch("ui.admin_widget.QMessageBox.warning") as warning:
+            settings_page._save_camera(camera.id)
+
+        warning.assert_called_once()
+        self.assertEqual(source.text(), configured.stream_url)
+        rejected = self.controller.camera_service.get_camera(camera.id)
+        self.assertEqual(rejected.username, configured.username)
+        self.assertEqual(
+            rejected.protected_password,
+            original_protected_password,
+        )
+        self.assertEqual(rejected.stream_url, configured.stream_url)
 
     def test_user_dashboard_has_no_admin_retention_controls(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")

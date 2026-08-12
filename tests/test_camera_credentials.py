@@ -297,6 +297,25 @@ class CameraCredentialServiceTests(unittest.TestCase):
             "new-test-password",
         )
 
+    def test_non_credential_update_preserves_exact_stored_credentials(self) -> None:
+        camera = self._save_credentials("test-password")
+
+        updated = self.camera_service.update_camera(
+            self.admin,
+            camera.id,
+            "Updated Camera Name",
+            camera.stream_url,
+            camera.direction,
+            camera.enabled,
+        )
+
+        self.assertEqual(updated.username, camera.username)
+        self.assertEqual(updated.protected_password, camera.protected_password)
+        self.assertEqual(
+            self.protector.unprotect(updated.protected_password),
+            "test-password",
+        )
+
     def test_explicit_credential_clear_removes_username_and_password(self) -> None:
         camera = self._save_credentials("test-password")
 
