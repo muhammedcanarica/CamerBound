@@ -10,6 +10,12 @@ from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 
 from app.audit import AuditAction, AuditService
 from app.auth import AuthService, SessionUser, ValidationError
+from app.camera_credentials import (
+    PasswordProtector,
+    build_authenticated_camera_source,
+    is_authenticatable_camera_source,
+    split_camera_source_credentials,
+)
 from app.camera_worker import (
     CameraStatus,
     CameraWorker,
@@ -34,8 +40,14 @@ class Camera:
     id: int
     name: str
     stream_url: str
+    username: str
+    protected_password: str | None
     direction: Direction
     enabled: bool
+
+    @property
+    def has_password(self) -> bool:
+        return bool(self.protected_password)
 
 
 @dataclass(slots=True)
@@ -59,6 +71,7 @@ class CameraService(QObject):
         retry_delay_seconds: float = 2.5,
         preview_fps: float = 12.0,
         audit_service: AuditService | None = None,
+        password_protector: PasswordProtector | None = None,
     ) -> None:
         super().__init__()
         self.database = database
@@ -66,6 +79,7 @@ class CameraService(QObject):
         self.retry_delay_seconds = retry_delay_seconds
         self.preview_fps = preview_fps
         self.audit_service = audit_service or AuditService(database)
+        self.password_protector = password_protector or database.password_protector
         self._statuses: dict[int, CameraStatus] = {}
         self._runtimes: dict[int, _CameraRuntime] = {}
         self._latest_frames: dict[int, object] = {}
@@ -80,14 +94,24 @@ class CameraService(QObject):
     def list_cameras(self) -> list[Camera]:
         with self.database.connection() as connection:
             rows = connection.execute(
-                "SELECT id, name, stream_url, direction, enabled FROM cameras ORDER BY id"
+                """
+                SELECT id, name, stream_url, username, protected_password,
+                       direction, enabled
+                FROM cameras
+                ORDER BY id
+                """
             ).fetchall()
         return [self._from_row(row) for row in rows]
 
     def get_camera(self, camera_id: int) -> Camera:
         with self.database.connection() as connection:
             row = connection.execute(
-                "SELECT id, name, stream_url, direction, enabled FROM cameras WHERE id = ?",
+                """
+                SELECT id, name, stream_url, username, protected_password,
+                       direction, enabled
+                FROM cameras
+                WHERE id = ?
+                """,
                 (camera_id,),
             ).fetchone()
         if row is None:
@@ -102,6 +126,10 @@ class CameraService(QObject):
         stream_url: str,
         direction: Direction | str,
         enabled: bool,
+        *,
+        username: str | None = None,
+        password: str | None = None,
+        clear_credentials: bool = False,
     ) -> Camera:
         try:
             normalized_direction = (
@@ -115,16 +143,61 @@ class CameraService(QObject):
         if not normalized_name:
             raise ValidationError("Kamera adı boş olamaz.")
 
+        current = self.get_camera(camera_id)
+        try:
+            parsed_source = split_camera_source_credentials(stream_url)
+        except (UnicodeError, ValueError):
+            raise ValidationError(
+                "Kamera kaynağındaki kimlik bilgileri geçersiz."
+            ) from None
+
+        normalized_username = (
+            current.username if username is None else username.strip()
+        )
+        protected_password = current.protected_password
+        credential_change = "unchanged"
+        if clear_credentials:
+            normalized_username = ""
+            protected_password = None
+            credential_change = "cleared"
+        else:
+            if username is None and parsed_source.username is not None:
+                normalized_username = parsed_source.username
+            new_password = password if password else parsed_source.password
+            if new_password:
+                try:
+                    protected_password = self.password_protector.protect(new_password)
+                except Exception:
+                    raise ValidationError(
+                        "Kamera şifresi Windows DPAPI ile korunamadı."
+                    ) from None
+                credential_change = "updated"
+            if protected_password and not normalized_username:
+                raise ValidationError(
+                    "Kayıtlı şifre için kullanıcı adı gereklidir; "
+                    "kimlik bilgilerini kaldırmak için temizleme seçeneğini kullanın."
+                )
+            if protected_password and not is_authenticatable_camera_source(
+                parsed_source.stream_url
+            ):
+                raise ValidationError(
+                    "Kamera kimlik bilgileri yalnızca HTTP, HTTPS veya RTSP "
+                    "URL kaynaklarında kullanılabilir."
+                )
+
         with self.database.connection() as connection:
             cursor = connection.execute(
                 """
                 UPDATE cameras
-                SET name = ?, stream_url = ?, direction = ?, enabled = ?
+                SET name = ?, stream_url = ?, username = ?, protected_password = ?,
+                    direction = ?, enabled = ?
                 WHERE id = ?
                 """,
                 (
                     normalized_name,
-                    stream_url.strip(),
+                    parsed_source.stream_url,
+                    normalized_username,
+                    protected_password,
                     normalized_direction.value,
                     int(enabled),
                     camera_id,
@@ -139,7 +212,8 @@ class CameraService(QObject):
             details=(
                 f"camera_id={updated.id}; name={sanitize_text_for_log(updated.name)}; "
                 f"direction={updated.direction.value}; enabled={updated.enabled}; "
-                f"source={sanitize_camera_source_for_log(updated.stream_url)}"
+                f"source={sanitize_camera_source_for_log(updated.stream_url)}; "
+                f"credentials={credential_change}"
             ),
         )
         return updated
@@ -155,9 +229,10 @@ class CameraService(QObject):
             if camera_id in self._runtimes:
                 return self._statuses.get(camera_id, CameraStatus.CONNECTING)
 
+            worker_source = self._runtime_capture_source(camera)
             worker = CameraWorker(
                 camera_id=camera_id,
-                source=self._capture_source(camera.stream_url),
+                source=worker_source,
                 capture_factory=self.capture_factory,
                 retry_delay_seconds=self.retry_delay_seconds,
                 preview_fps=self.preview_fps,
@@ -343,12 +418,36 @@ class CameraService(QObject):
             local_path = application_root() / local_path
         return str(local_path.resolve())
 
+    def _runtime_capture_source(self, camera: Camera) -> str | int:
+        source = self._capture_source(camera.stream_url)
+        if not camera.protected_password:
+            return source
+        if not isinstance(source, str):
+            raise ValidationError(
+                "Kamera kimlik bilgileri yalnızca ağ URL kaynaklarında kullanılabilir."
+            )
+        try:
+            password = self.password_protector.unprotect(camera.protected_password)
+            authenticated_source = build_authenticated_camera_source(
+                source,
+                camera.username,
+                password,
+            )
+            del password
+            return authenticated_source
+        except Exception:
+            raise ValidationError(
+                "Kamera kimlik bilgileri Windows DPAPI ile açılamadı."
+            ) from None
+
     @staticmethod
     def _from_row(row: object) -> Camera:
         return Camera(
             id=row["id"],
             name=row["name"],
             stream_url=row["stream_url"],
+            username=row["username"],
+            protected_password=row["protected_password"],
             direction=Direction(row["direction"]),
             enabled=bool(row["enabled"]),
         )

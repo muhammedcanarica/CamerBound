@@ -5,6 +5,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from app.camera_credentials import (
+    CredentialProtectionError,
+    DpapiPasswordProtector,
+    PasswordProtector,
+    split_camera_source_credentials,
+)
 from app.time_utils import to_utc_storage
 
 
@@ -21,6 +27,8 @@ CREATE TABLE IF NOT EXISTS cameras (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     stream_url TEXT NOT NULL DEFAULT '',
+    username TEXT NOT NULL DEFAULT '',
+    protected_password TEXT NULL,
     direction TEXT NOT NULL CHECK (direction IN ('ENTRY', 'EXIT')),
     enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1))
 );
@@ -56,8 +64,13 @@ ON audit_logs(timestamp DESC, id DESC);
 
 
 class Database:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        password_protector: PasswordProtector | None = None,
+    ) -> None:
         self.path = path
+        self.password_protector = password_protector or DpapiPasswordProtector()
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -65,6 +78,7 @@ class Database:
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA secure_delete = ON")
         try:
             yield connection
             connection.commit()
@@ -77,6 +91,7 @@ class Database:
     def initialize(self) -> None:
         with self.connection() as connection:
             connection.executescript(SCHEMA)
+            self._migrate_cameras(connection)
             self._migrate_plate_records(connection)
             self._seed_cameras(connection)
             self._normalize_legacy_timestamps(connection)
@@ -126,3 +141,52 @@ class Database:
                     f"UPDATE {table} SET {column} = ? WHERE id = ?",
                     updates,
                 )
+
+    def _migrate_cameras(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(cameras)").fetchall()
+        }
+        if "username" not in columns:
+            connection.execute(
+                "ALTER TABLE cameras ADD COLUMN username TEXT NOT NULL DEFAULT ''"
+            )
+        if "protected_password" not in columns:
+            connection.execute(
+                "ALTER TABLE cameras ADD COLUMN protected_password TEXT NULL"
+            )
+
+        rows = connection.execute(
+            "SELECT id, stream_url, username, protected_password FROM cameras"
+        ).fetchall()
+        for row in rows:
+            try:
+                parsed = split_camera_source_credentials(row["stream_url"])
+                if not parsed.had_credentials:
+                    continue
+                username = (
+                    parsed.username
+                    if parsed.username is not None
+                    else row["username"]
+                )
+                protected_password = row["protected_password"]
+                if parsed.password:
+                    protected_password = self.password_protector.protect(parsed.password)
+            except Exception:
+                raise CredentialProtectionError(
+                    "Legacy camera credentials could not be protected; "
+                    "the migration was rolled back."
+                ) from None
+            connection.execute(
+                """
+                UPDATE cameras
+                SET stream_url = ?, username = ?, protected_password = ?
+                WHERE id = ?
+                """,
+                (
+                    parsed.stream_url,
+                    username or "",
+                    protected_password,
+                    row["id"],
+                ),
+            )

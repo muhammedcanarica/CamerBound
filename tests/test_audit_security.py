@@ -190,6 +190,10 @@ class CameraSourceSanitizationTests(unittest.TestCase):
                 "http://example.com/camera?password=secret",
                 "http://example.com/camera",
             ),
+            (
+                "ftp://test-user:test-password@CAMERA_IP/live?token=secret",
+                "ftp://camera_ip/live",
+            ),
         )
         for source, expected in cases:
             with self.subTest(source=source):

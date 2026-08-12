@@ -6,12 +6,17 @@ import logging
 import sys
 from enum import StrEnum
 from typing import Callable, Protocol
+from urllib.parse import urlsplit
 
 import cv2
 from PySide6.QtCore import QObject, Signal, Slot
 
 
 LOGGER = logging.getLogger(__name__)
+NETWORK_OPEN_TIMEOUT_MS = 5_000
+NETWORK_READ_TIMEOUT_MS = 5_000
+MAX_CONSECUTIVE_READ_FAILURES = 3
+NETWORK_SCHEMES = {"rtsp", "http", "https"}
 
 
 class CameraStatus(StrEnum):
@@ -42,16 +47,16 @@ def create_video_capture(source: CaptureSource) -> VideoCaptureLike:
         return _create_windows_webcam_capture(source)
 
     capture = cv2.VideoCapture()
-    is_network_source = isinstance(source, str) and "://" in source
+    is_network_source = _is_network_source(source)
     timeout_parameters: list[int] = []
     if is_network_source:
-        for property_name in (
-            "CAP_PROP_OPEN_TIMEOUT_MSEC",
-            "CAP_PROP_READ_TIMEOUT_MSEC",
+        for property_name, timeout_ms in (
+            ("CAP_PROP_OPEN_TIMEOUT_MSEC", NETWORK_OPEN_TIMEOUT_MS),
+            ("CAP_PROP_READ_TIMEOUT_MSEC", NETWORK_READ_TIMEOUT_MS),
         ):
             property_id = getattr(cv2, property_name, None)
             if property_id is not None:
-                timeout_parameters.extend((property_id, 2_000))
+                timeout_parameters.extend((property_id, timeout_ms))
 
     if timeout_parameters:
         try:
@@ -90,6 +95,15 @@ def _create_windows_webcam_capture(source: int) -> VideoCaptureLike:
         last_capture = capture
 
     return last_capture or cv2.VideoCapture()
+
+
+def _is_network_source(source: CaptureSource) -> bool:
+    if not isinstance(source, str):
+        return False
+    try:
+        return urlsplit(source).scheme.lower() in NETWORK_SCHEMES
+    except ValueError:
+        return False
 
 
 class CameraWorker(QObject):
@@ -139,9 +153,14 @@ class CameraWorker(QObject):
                         CameraStatus.CONNECTED,
                         "Kamera bağlantısı kuruldu.",
                     )
+                    if attempt == 0:
+                        LOGGER.info("Camera connected camera_id=%s", self.camera_id)
+                    else:
+                        LOGGER.info("Camera reconnected camera_id=%s", self.camera_id)
                     if self._read_frames(capture):
                         break
                     error_message = "Kamera görüntüsü kesildi."
+                    LOGGER.warning("Camera stream lost camera_id=%s", self.camera_id)
                 except Exception:
                     if self._stop_event.is_set():
                         break
@@ -151,6 +170,7 @@ class CameraWorker(QObject):
                         self._release_capture(capture)
 
                 self.status_changed.emit(self.camera_id, CameraStatus.ERROR, error_message)
+                LOGGER.info("Camera reconnecting camera_id=%s", self.camera_id)
                 self.status_changed.emit(
                     self.camera_id,
                     CameraStatus.RECONNECTING,
@@ -171,6 +191,8 @@ class CameraWorker(QObject):
         last_preview_at = 0.0
         file_frame_interval = self._file_frame_interval(capture)
         next_file_frame_at = time.monotonic()
+        is_network_source = _is_network_source(self.source)
+        consecutive_read_failures = 0
 
         while not self._stop_event.is_set():
             if file_frame_interval is not None:
@@ -180,7 +202,18 @@ class CameraWorker(QObject):
 
             frame_ok, frame = capture.read()
             if not frame_ok or frame is None:
+                if is_network_source:
+                    consecutive_read_failures += 1
+                    LOGGER.warning(
+                        "Transient camera read failure camera_id=%s count=%s",
+                        self.camera_id,
+                        consecutive_read_failures,
+                    )
+                    if consecutive_read_failures < MAX_CONSECUTIVE_READ_FAILURES:
+                        continue
                 return self._stop_event.is_set()
+
+            consecutive_read_failures = 0
 
             now = time.monotonic()
             if now - last_preview_at >= self.preview_interval:

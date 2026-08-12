@@ -16,10 +16,12 @@ from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFrame,
     QGroupBox,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -182,6 +184,14 @@ class LoginFlowSmokeTest(unittest.TestCase):
             "#f4f7fb",
         )
         self.assertEqual(len(camera_settings._camera_buttons), 2)
+        for editor in camera_settings._editors.values():
+            _name, _url, username, password, _direction, _enabled, clear = editor
+            self.assertIsInstance(username, QLineEdit)
+            self.assertIsInstance(password, QLineEdit)
+            self.assertEqual(password.echoMode(), QLineEdit.EchoMode.Password)
+            self.assertEqual(password.text(), "")
+            self.assertIsInstance(clear, QCheckBox)
+            self.assertFalse(clear.isChecked())
         for save_button, roi_button in camera_settings._camera_buttons.values():
             self.assertGreaterEqual(save_button.minimumHeight(), 36)
             self.assertGreaterEqual(roi_button.minimumHeight(), 36)

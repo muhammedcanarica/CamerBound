@@ -154,7 +154,18 @@ class CameraSettingsWidget(QWidget):
             if recognition_service is not None
             else application_root() / "config" / "settings.json"
         )
-        self._editors: dict[int, tuple[QLineEdit, QLineEdit, QComboBox, QCheckBox]] = {}
+        self._editors: dict[
+            int,
+            tuple[
+                QLineEdit,
+                QLineEdit,
+                QLineEdit,
+                QLineEdit,
+                QComboBox,
+                QCheckBox,
+                QCheckBox,
+            ],
+        ] = {}
         self._camera_buttons: dict[int, tuple[QPushButton, QPushButton]] = {}
         self._camera_layout: QVBoxLayout
         self._build_ui()
@@ -182,8 +193,8 @@ class CameraSettingsWidget(QWidget):
         layout.addWidget(QLabel("Kamera Ayarları", objectName="pageTitle"))
         description = QLabel(
             "Webcam index, RTSP URL veya video dosyası kaynağı yerel veritabanında saklanır. "
-            "Credential bilgileri loglarda maskelenir; OS korumalı secret storage "
-            "production için sonraki güvenlik aşamasıdır.",
+            "Kamera şifreleri Windows DPAPI ile mevcut Windows kullanıcısına bağlı "
+            "olarak korunur ve loglarda gösterilmez.",
             objectName="mutedLabel",
         )
         description.setWordWrap(True)
@@ -464,6 +475,21 @@ class CameraSettingsWidget(QWidget):
         name_input = QLineEdit(camera.name)
         url_input = QLineEdit(camera.stream_url)
         url_input.setPlaceholderText("RTSP URL, video dosyası veya webcam index (örn. 0)")
+        username_input = QLineEdit(camera.username)
+        username_input.setObjectName(f"cameraUsernameInput-{camera.id}")
+        username_input.setPlaceholderText("Kamera kullanıcı adı")
+        password_input = QLineEdit()
+        password_input.setObjectName(f"cameraPasswordInput-{camera.id}")
+        password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        password_input.setPlaceholderText(
+            "Kayıtlı şifreyi değiştirmek için yeni şifre girin"
+            if camera.has_password
+            else "Kamera şifresi"
+        )
+        clear_credentials_input = QCheckBox(
+            "Kayıtlı kullanıcı adı ve şifreyi temizle"
+        )
+        clear_credentials_input.setObjectName(f"cameraClearCredentials-{camera.id}")
         direction_input = QComboBox()
         direction_input.addItem("Giriş", Direction.ENTRY)
         direction_input.addItem("Çıkış", Direction.EXIT)
@@ -481,16 +507,39 @@ class CameraSettingsWidget(QWidget):
         roi_button.clicked.connect(partial(self._calibrate_roi, camera.id))
         form.addRow("Ad", name_input)
         form.addRow("Kamera Kaynağı", url_input)
+        form.addRow("Kullanıcı Adı", username_input)
+        form.addRow("Şifre", password_input)
+        form.addRow("Kimlik Bilgileri", clear_credentials_input)
         form.addRow("Yön", direction_input)
         form.addRow("Durum", enabled_input)
         form.addRow("", save_button)
         form.addRow("", roi_button)
         self._camera_layout.addWidget(group)
-        self._editors[camera.id] = (name_input, url_input, direction_input, enabled_input)
+        self._editors[camera.id] = (
+            name_input,
+            url_input,
+            username_input,
+            password_input,
+            direction_input,
+            enabled_input,
+            clear_credentials_input,
+        )
         self._camera_buttons[camera.id] = (save_button, roi_button)
 
     def _save_camera(self, camera_id: int) -> None:
-        name, url, direction, enabled = self._editors[camera_id]
+        name, url, username, password, direction, enabled, clear_credentials = (
+            self._editors[camera_id]
+        )
+        if clear_credentials.isChecked():
+            answer = QMessageBox.question(
+                self,
+                "Kamera kimlik bilgilerini temizle",
+                "Kayıtlı kamera kullanıcı adı ve şifresi kaldırılacak. Devam edilsin mi?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer is not QMessageBox.StandardButton.Yes:
+                return
         try:
             normalized_direction = Direction(direction.currentData())
             previous = self.camera_service.get_camera(camera_id)
@@ -502,7 +551,18 @@ class CameraSettingsWidget(QWidget):
                 url.text(),
                 normalized_direction,
                 enabled.isChecked(),
+                username=username.text(),
+                password=password.text(),
+                clear_credentials=clear_credentials.isChecked(),
             )
+            username.setText(updated.username)
+            password.clear()
+            password.setPlaceholderText(
+                "Kayıtlı şifreyi değiştirmek için yeni şifre girin"
+                if updated.has_password
+                else "Kamera şifresi"
+            )
+            clear_credentials.setChecked(False)
             restart_required = previous.direction is not updated.direction
             if was_running:
                 stop_status = self.camera_service.stop_camera(camera_id)

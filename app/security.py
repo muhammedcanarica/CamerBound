@@ -3,9 +3,9 @@ from __future__ import annotations
 import re
 from urllib.parse import urlsplit, urlunsplit
 
-
-SUPPORTED_CAMERA_URL_SCHEMES = {"rtsp", "http", "https"}
-CAMERA_URL_PATTERN = re.compile(r"(?i)\b(?:rtsp|https?)://[^\s'\"]+")
+CAMERA_URL_PATTERN = re.compile(
+    r"(?i)\b[a-z][a-z0-9+.-]*://[^\s'\"]+"
+)
 
 
 def sanitize_camera_source_for_log(source: object) -> str:
@@ -15,8 +15,10 @@ def sanitize_camera_source_for_log(source: object) -> str:
         parsed = urlsplit(value)
     except ValueError:
         return "<invalid-camera-source>"
-    if parsed.scheme.lower() not in SUPPORTED_CAMERA_URL_SCHEMES or not parsed.hostname:
+    if not parsed.scheme:
         return value
+    if not parsed.hostname:
+        return "<invalid-camera-source>"
 
     host = parsed.hostname
     if ":" in host and not host.startswith("["):
