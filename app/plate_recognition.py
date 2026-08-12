@@ -289,6 +289,7 @@ class PlateRecognitionProcessor:
                 camera_id,
                 confirmed.confidence,
                 detected_at,
+                frame,
             )
         except DuplicatePlateDetection:
             LOGGER.info("Duplicate plate detection suppressed for camera_id=%s", camera_id)

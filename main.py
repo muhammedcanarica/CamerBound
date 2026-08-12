@@ -10,6 +10,7 @@ from app.camera import CameraService
 from app.config import load_config
 from app.database import Database
 from app.logging_config import configure_logging
+from app.plate_capture import PlateCaptureService
 from app.plate_recognition import PlateRecognitionService
 from app.plate_service import PlateService
 from ui.dashboard_window import DashboardWindow
@@ -73,10 +74,21 @@ def build_services() -> tuple[
     database.initialize()
     auth_service = AuthService(database)
     auth_service.ensure_default_admin()
+    capture_config = config.plate_capture
+    capture_service = PlateCaptureService(
+        capture_config.capture_root,
+        capture_config.reference_root,
+        enabled=capture_config.enabled,
+        max_width=capture_config.max_width,
+        jpeg_quality=capture_config.jpeg_quality,
+    )
+    for warning in capture_config.warnings:
+        LOGGER.warning("Capture configuration: %s", warning)
     plate_service = PlateService(
         database,
         config.duplicate_cooldown_seconds,
         config.plate_recognition.record_retention_days,
+        capture_service=capture_service,
     )
     apply_startup_retention_cleanup(plate_service)
     camera_service = CameraService(database)

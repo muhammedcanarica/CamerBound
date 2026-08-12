@@ -1,5 +1,10 @@
 {
   "database_path": "data/plate_tracker.db",
+  "plate_capture": {
+    "enabled": true,
+    "max_width": 960,
+    "jpeg_quality": 60
+  },
   "plate_detection": {
     "ocr_backend": "auto",
     "recognition_interval_ms": 500,

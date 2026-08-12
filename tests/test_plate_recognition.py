@@ -4,7 +4,7 @@ import tempfile
 import unittest
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +14,7 @@ from app.auth import AuthService
 from app.camera import CameraService, Direction
 from app.config import DEFAULT_ROI, PlateRecognitionConfig
 from app.database import Database
+from app.plate_capture import PlateCaptureService
 from app.plate_recognition import (
     ConfirmationTracker,
     OcrModelNotFound,
@@ -117,7 +118,15 @@ class RecognitionPipelineTests(unittest.TestCase):
         auth_service = AuthService(self.database)
         auth_service.ensure_default_admin()
         self.camera_service = CameraService(self.database)
-        self.plate_service = PlateService(self.database, duplicate_cooldown_seconds=10)
+        self.capture_service = PlateCaptureService(
+            root / "data" / "captures",
+            root,
+        )
+        self.plate_service = PlateService(
+            self.database,
+            duplicate_cooldown_seconds=10,
+            capture_service=self.capture_service,
+        )
         self.config = recognition_config(root)
 
     def tearDown(self) -> None:
@@ -135,6 +144,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         first = processor.process(
             camera.id, camera.direction, frame, detected_at, monotonic_at=1.0
         )
+        self.assertEqual(list(Path(self.temp_directory.name).rglob("*.jpg")), [])
         second = processor.process(
             camera.id, camera.direction, frame, detected_at, monotonic_at=2.0
         )
@@ -143,6 +153,44 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIsNotNone(second.record)
         self.assertEqual(second.record.plate, "34ABC123")
         self.assertEqual(second.record.direction, Direction.ENTRY)
+        self.assertIsNotNone(second.record.image_path)
+        self.assertTrue(
+            self.capture_service.resolve_reference(second.record.image_path).is_file()
+        )
+
+    def test_duplicate_after_a_new_confirmation_does_not_store_a_second_image(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(), self.plate_service, self.config
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        detected_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        processor.process(
+            camera.id, camera.direction, frame, detected_at, monotonic_at=1.0
+        )
+        saved = processor.process(
+            camera.id, camera.direction, frame, detected_at, monotonic_at=2.0
+        )
+
+        processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            detected_at,
+            monotonic_at=6.0,
+        )
+        duplicate = processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            detected_at + timedelta(seconds=5),
+            monotonic_at=7.0,
+        )
+
+        self.assertIsNotNone(saved.record)
+        self.assertTrue(duplicate.duplicate)
+        self.assertIsNone(duplicate.record)
+        self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 1)
 
     def test_worker_keeps_only_latest_frame_per_camera(self) -> None:
         worker = PlateRecognitionWorker(

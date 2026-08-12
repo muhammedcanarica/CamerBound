@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS plate_records (
     camera_id INTEGER NOT NULL,
     confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
     timestamp TEXT NOT NULL,
+    image_path TEXT NULL,
     FOREIGN KEY (camera_id) REFERENCES cameras(id) ON UPDATE CASCADE ON DELETE RESTRICT
 );
 
@@ -64,8 +65,18 @@ class Database:
     def initialize(self) -> None:
         with self.connection() as connection:
             connection.executescript(SCHEMA)
+            self._migrate_plate_records(connection)
             self._seed_cameras(connection)
             self._normalize_legacy_timestamps(connection)
+
+    @staticmethod
+    def _migrate_plate_records(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(plate_records)").fetchall()
+        }
+        if "image_path" not in columns:
+            connection.execute("ALTER TABLE plate_records ADD COLUMN image_path TEXT NULL")
 
     @staticmethod
     def _seed_cameras(connection: sqlite3.Connection) -> None:

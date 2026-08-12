@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from app.auth import AuthService, SessionUser, ValidationError
 from app.camera import Direction
@@ -11,6 +13,7 @@ from app.config import (
     SUPPORTED_RECORD_RETENTION_DAYS,
 )
 from app.database import Database
+from app.plate_capture import PlateCaptureService
 from app.time_utils import (
     as_utc,
     normalize_utc_timestamp,
@@ -21,6 +24,7 @@ from app.time_utils import (
 
 
 PLATE_PATTERN = re.compile(r"^[A-Z0-9]{2,12}$")
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +36,7 @@ class PlateRecord:
     camera_name: str
     confidence: float
     timestamp: str
+    image_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,9 +67,11 @@ class PlateService:
         database: Database,
         duplicate_cooldown_seconds: int,
         record_retention_days: int = DEFAULT_RECORD_RETENTION_DAYS,
+        capture_service: PlateCaptureService | None = None,
     ) -> None:
         self.database = database
         self.duplicate_cooldown_seconds = duplicate_cooldown_seconds
+        self.capture_service = capture_service
         self.set_record_retention_days(record_retention_days)
 
     def set_record_retention_days(self, retention_days: int) -> None:
@@ -81,6 +88,7 @@ class PlateService:
         camera_id: int,
         confidence: float,
         detected_at: datetime | None = None,
+        frame: object | None = None,
     ) -> PlateRecord:
         normalized_plate = "".join(plate.upper().split())
         if not PLATE_PATTERN.fullmatch(normalized_plate):
@@ -124,6 +132,14 @@ class PlateService:
             )
             record_id = int(cursor.lastrowid)
 
+        image_path = self._save_capture(
+            record_id,
+            normalized_plate,
+            camera["direction"],
+            detection_time,
+            frame,
+        )
+
         return PlateRecord(
             id=record_id,
             plate=normalized_plate,
@@ -132,7 +148,42 @@ class PlateService:
             camera_name=camera["name"],
             confidence=confidence,
             timestamp=timestamp,
+            image_path=image_path,
         )
+
+    def _save_capture(
+        self,
+        record_id: int,
+        plate: str,
+        direction: str,
+        detection_time: datetime,
+        frame: object | None,
+    ) -> str | None:
+        if self.capture_service is None or frame is None:
+            return None
+
+        image_path: str | None = None
+        try:
+            image_path = self.capture_service.save_capture(
+                frame,
+                plate,
+                direction,
+                detection_time,
+                record_id,
+            )
+            if image_path is None:
+                return None
+            with self.database.connection() as connection:
+                connection.execute(
+                    "UPDATE plate_records SET image_path = ? WHERE id = ?",
+                    (image_path, record_id),
+                )
+            return image_path
+        except Exception:
+            if image_path is not None:
+                self.capture_service.delete_captures((image_path,))
+            LOGGER.exception("Plate capture save failed for %s", plate)
+            return None
 
     def _inside_cooldown(self, previous_value: str, current: datetime) -> bool:
         if self.duplicate_cooldown_seconds <= 0:
@@ -251,8 +302,21 @@ class PlateService:
         AuthService.require_admin(actor)
         with self.database.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            image_paths = [
+                row["image_path"]
+                for row in connection.execute(
+                    "SELECT image_path FROM plate_records WHERE image_path IS NOT NULL"
+                ).fetchall()
+            ]
             cursor = connection.execute("DELETE FROM plate_records")
-            return max(0, cursor.rowcount)
+            deleted = max(0, cursor.rowcount)
+        self._delete_capture_files(image_paths)
+        return deleted
+
+    def resolve_capture_path(self, image_path: str | None) -> Path | None:
+        if self.capture_service is None:
+            return None
+        return self.capture_service.resolve_reference(image_path)
 
     def get_record_stats(self, actor: SessionUser) -> PlateRecordStats:
         AuthService.require_admin(actor)
@@ -281,11 +345,25 @@ class PlateService:
         cutoff = to_utc_storage(current - timedelta(days=retention_days))
         with self.database.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            image_paths = [
+                row["image_path"]
+                for row in connection.execute(
+                    "SELECT image_path FROM plate_records "
+                    "WHERE timestamp < ? AND image_path IS NOT NULL",
+                    (cutoff,),
+                ).fetchall()
+            ]
             cursor = connection.execute(
                 "DELETE FROM plate_records WHERE timestamp < ?",
                 (cutoff,),
             )
-            return max(0, cursor.rowcount)
+            deleted = max(0, cursor.rowcount)
+        self._delete_capture_files(image_paths)
+        return deleted
+
+    def _delete_capture_files(self, image_paths: list[str]) -> None:
+        if self.capture_service is not None:
+            self.capture_service.delete_captures(image_paths)
 
     @staticmethod
     def _validate_retention_days(retention_days: int) -> None:
@@ -299,7 +377,7 @@ class PlateService:
     def _record_select() -> str:
         return """
             SELECT pr.id, pr.plate, pr.direction, pr.camera_id,
-                   c.name AS camera_name, pr.confidence, pr.timestamp
+                   c.name AS camera_name, pr.confidence, pr.timestamp, pr.image_path
             FROM plate_records pr
             JOIN cameras c ON c.id = pr.camera_id
         """
@@ -314,4 +392,5 @@ class PlateService:
             camera_name=row["camera_name"],
             confidence=row["confidence"],
             timestamp=normalize_utc_timestamp(row["timestamp"]),
+            image_path=row["image_path"],
         )

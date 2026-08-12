@@ -61,6 +61,14 @@ Manuel alternatif:
 Varsayılan plaka kayıt saklama süresi 90 gündür.
 ADMIN kullanıcı Ayarlar > Veri Saklama bölümünden 30 / 90 / 180 gün veya Süresiz seçebilir.
 
+## Araç Fotoğrafı Kaydı
+
+- Yalnızca confirmation tamamlanıp veritabanına eklenen plaka olayında, mevcut OpenCV frame'inden bir JPEG kaydedilir.
+- Sürekli video veya aday OCR görüntüsü arşivlenmez; her confirmed kayıt için en fazla bir fotoğraf üretilir.
+- Görüntüler varsayılan olarak maksimum 960 px genişlik ve 60 JPEG kalitesiyle `data/captures/YYYY/MM/` altında tutulur.
+- Kayıtlar sayfasındaki **Fotoğrafı Aç** butonu ilişkili görüntüyü varsayılan görüntüleyicide açar. Eski kayıtlarda fotoğraf bulunmayabilir.
+- Retention veya **Tüm Plaka Kayıtlarını Temizle** işlemi bir DB kaydını sildiğinde ilişkili capture dosyasını da silmeye çalışır; dosya silme hatası ana işlemi durdurmaz.
+
 ## Varsayılan geliştirme hesabı
 
 - Kullanıcı adı: `admin`
@@ -249,6 +257,7 @@ CamerBound/
 - `app/camera.py`: Kamera ayarları, worker/thread referansları ve capture yaşam döngüsünün servis sınırı.
 - `app/camera_worker.py`: OpenCV kaynağını UI thread'i dışında okur, önizleme FPS'ini sınırlar ve kesintide yeniden bağlanır.
 - `app/plate_recognition.py`: ROI, preprocessing, PaddleOCR adapter, plaka doğrulama, voting ve OCR worker yaşam döngüsü.
+- `app/plate_capture.py`: Confirmed frame'i küçültür, JPEG olarak güvenli klasör ve dosya adıyla saklar, capture referanslarını doğrular.
 - `app/plate_service.py`: Kayıt ekleme, arama, son kayıtlar ve içerideki araç sorgusu.
 - `ui/`: Servisleri kullanan PySide6 ekranları; doğrudan SQL çalıştırmaz.
 - `app/config.py`: `settings.json` okur ve relative yolları uygulama köküne göre çözer.
@@ -268,6 +277,11 @@ CamerBound/
 ```json
 {
   "database_path": "data/plate_tracker.db",
+  "plate_capture": {
+    "enabled": true,
+    "max_width": 960,
+    "jpeg_quality": 60
+  },
   "plate_detection": {
     "recognition_interval_ms": 500,
     "min_confidence": 0.65,

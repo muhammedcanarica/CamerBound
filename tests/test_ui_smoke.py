@@ -8,6 +8,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
@@ -28,6 +30,7 @@ from app.auth import AuthService, Role
 from app.camera import CameraService
 from app.config import load_config
 from app.database import Database
+from app.plate_capture import PlateCaptureService
 from app.plate_recognition import PlateRecognitionService, RecognitionStatus
 from app.plate_service import PlateService
 from main import ApplicationController
@@ -46,7 +49,15 @@ class LoginFlowSmokeTest(unittest.TestCase):
         database.initialize()
         auth_service = AuthService(database)
         auth_service.ensure_default_admin()
-        plate_service = PlateService(database, duplicate_cooldown_seconds=10)
+        capture_service = PlateCaptureService(
+            Path(self.temp_directory.name) / "data" / "captures",
+            Path(self.temp_directory.name),
+        )
+        plate_service = PlateService(
+            database,
+            duplicate_cooldown_seconds=10,
+            capture_service=capture_service,
+        )
         camera_service = CameraService(database)
         recognition_config = replace(
             load_config().plate_recognition,
@@ -236,6 +247,31 @@ class LoginFlowSmokeTest(unittest.TestCase):
         self.assertIsNone(
             dashboard.findChild(QPushButton, "deleteAllPlateRecordsButton")
         )
+
+    def test_records_page_shows_and_opens_capture(self) -> None:
+        admin = self.controller.auth_service.authenticate("admin", "admin123")
+        camera = self.controller.camera_service.list_cameras()[0]
+        self.controller.plate_service.save_plate_detection(
+            "34UIIMG1",
+            camera.id,
+            0.94,
+            frame=np.zeros((100, 200, 3), dtype=np.uint8),
+        )
+        self.controller.show_dashboard(admin)
+        records_page = self.controller.dashboard_window.pages[1]
+        records_page.refresh()
+
+        self.assertEqual(records_page.table.columnCount(), 6)
+        self.assertEqual(records_page.table.horizontalHeaderItem(5).text(), "Fotoğraf")
+        open_button = records_page.table.cellWidget(0, 5)
+        self.assertIsNotNone(open_button)
+        self.assertEqual(open_button.text(), "Fotoğrafı Aç")
+
+        with patch(
+            "ui.records_widget.QDesktopServices.openUrl", return_value=True
+        ) as open_url:
+            open_button.click()
+        open_url.assert_called_once()
 
     def test_delete_all_requires_exact_confirmation_text(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")

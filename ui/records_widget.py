@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -73,7 +74,8 @@ class RecordsWidget(QWidget):
 
         self.table = QTableWidget()
         prepare_table(
-            self.table, ["Plaka", "İşlem", "Kamera", "Güven", "Tarih / Saat"]
+            self.table,
+            ["Plaka", "İşlem", "Kamera", "Güven", "Tarih / Saat", "Fotoğraf"],
         )
         layout.addWidget(self.table, 1)
 
@@ -104,6 +106,35 @@ class RecordsWidget(QWidget):
                 if column in (1, 3):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row_index, column, item)
+            if record.image_path:
+                open_button = QPushButton("Fotoğrafı Aç")
+                open_button.setObjectName("openCaptureButton")
+                open_button.clicked.connect(
+                    lambda _checked=False, path=record.image_path: self._open_capture(
+                        path
+                    )
+                )
+                self.table.setCellWidget(row_index, 5, open_button)
+            else:
+                missing_item = QTableWidgetItem("Yok")
+                missing_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row_index, 5, missing_item)
+
+    def _open_capture(self, image_path: str) -> None:
+        resolved = self.plate_service.resolve_capture_path(image_path)
+        if resolved is None or not resolved.is_file():
+            QMessageBox.warning(
+                self,
+                "Fotoğraf bulunamadı",
+                "Bu kayıtla ilişkili fotoğraf dosyası bulunamadı.",
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(resolved))):
+            QMessageBox.warning(
+                self,
+                "Fotoğraf açılamadı",
+                "Fotoğraf varsayılan görüntüleyicide açılamadı.",
+            )
 
 
 class InsideVehiclesWidget(QWidget):

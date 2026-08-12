@@ -18,6 +18,30 @@ from app.config import (
 
 
 class PlateRecognitionConfigTests(unittest.TestCase):
+    def test_plate_capture_defaults_and_invalid_values_use_safe_fallbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            settings_path = Path(temp_directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "database_path": "test.db",
+                        "plate_capture": {
+                            "enabled": "yes",
+                            "max_width": 10,
+                            "jpeg_quality": 100,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            capture = load_config(settings_path).plate_capture
+
+        self.assertTrue(capture.enabled)
+        self.assertEqual(capture.max_width, 960)
+        self.assertEqual(capture.jpeg_quality, 60)
+        self.assertGreaterEqual(len(capture.warnings), 3)
+
     def test_ocr_backend_defaults_to_auto_and_invalid_value_warns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             settings_path = Path(temp_directory) / "settings.json"

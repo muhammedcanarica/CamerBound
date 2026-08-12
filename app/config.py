@@ -24,6 +24,18 @@ class NormalizedRoi:
 DEFAULT_ROI = NormalizedRoi(x=0.10, y=0.35, width=0.80, height=0.55)
 DEFAULT_RECORD_RETENTION_DAYS = 90
 SUPPORTED_RECORD_RETENTION_DAYS = (30, 90, 180, 0)
+DEFAULT_CAPTURE_MAX_WIDTH = 960
+DEFAULT_CAPTURE_JPEG_QUALITY = 60
+
+
+@dataclass(frozen=True, slots=True)
+class PlateCaptureConfig:
+    enabled: bool
+    max_width: int
+    jpeg_quality: int
+    capture_root: Path
+    reference_root: Path
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +69,7 @@ class AppConfig:
     database_path: Path
     duplicate_cooldown_seconds: int
     plate_recognition: PlateRecognitionConfig
+    plate_capture: PlateCaptureConfig
     settings_path: Path
 
 
@@ -85,11 +98,14 @@ def load_config(settings_path: Path | None = None) -> AppConfig:
     if not isinstance(plate_settings, dict):
         plate_settings = {}
     recognition = _load_plate_recognition(plate_settings, root)
+    capture_settings = raw_settings.get("plate_capture", {})
+    capture = _load_plate_capture(capture_settings, root)
 
     return AppConfig(
         database_path=database_path.resolve(),
         duplicate_cooldown_seconds=recognition.duplicate_cooldown_seconds,
         plate_recognition=recognition,
+        plate_capture=capture,
         settings_path=resolved_settings_path.resolve(),
     )
 
@@ -234,6 +250,46 @@ def _load_plate_recognition(
         exit_roi=_parse_roi(roi_settings.get("EXIT"), "EXIT", warnings),
         model_root=(root / "models" / "ocr").resolve(),
         ocr_backend=backend_value.lower(),
+        warnings=tuple(warnings),
+    )
+
+
+def _load_plate_capture(raw: object, root: Path) -> PlateCaptureConfig:
+    warnings: list[str] = []
+    if not isinstance(raw, dict):
+        raw = {}
+        warnings.append(
+            "plate_capture nesne olmalıdır; varsayılan değerler kullanıldı."
+        )
+
+    enabled_value = raw.get("enabled", True)
+    if not isinstance(enabled_value, bool):
+        enabled_value = True
+        warnings.append("plate_capture.enabled geçersiz; varsayılan true kullanıldı.")
+    max_width = _bounded_number(
+        raw.get("max_width"),
+        DEFAULT_CAPTURE_MAX_WIDTH,
+        320,
+        3840,
+        int,
+        "plate_capture.max_width",
+        warnings,
+    )
+    jpeg_quality = _bounded_number(
+        raw.get("jpeg_quality"),
+        DEFAULT_CAPTURE_JPEG_QUALITY,
+        20,
+        95,
+        int,
+        "plate_capture.jpeg_quality",
+        warnings,
+    )
+    return PlateCaptureConfig(
+        enabled=enabled_value,
+        max_width=max_width,
+        jpeg_quality=jpeg_quality,
+        capture_root=(root / "data" / "captures").resolve(),
+        reference_root=root.resolve(),
         warnings=tuple(warnings),
     )
 

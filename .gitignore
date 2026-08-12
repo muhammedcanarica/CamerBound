@@ -9,6 +9,7 @@ data/*.db-shm
 data/*.db-wal
 data/paddlex-cache/
 data/logs/
+data/captures/
 build/
 dist/
 *.spec
