@@ -3,3 +3,4 @@ bcrypt>=4.2,<5
 opencv-contrib-python==4.10.0.84
 paddleocr==3.7.0
 onnxruntime==1.27.0
+openvino>=2026.1,<2027

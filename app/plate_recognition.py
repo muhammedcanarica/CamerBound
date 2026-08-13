@@ -25,6 +25,14 @@ from app.ocr_models import (
     read_model_name,
     select_ocr_backend,
 )
+from app.plate_detector import (
+    OpenVinoPlateDetector,
+    PlateDetection,
+    PlateDetector,
+    PlateDetectorError,
+    crop_padded_plate,
+    select_plate_detections,
+)
 from app.plate_service import (
     DuplicatePlateDetection,
     PlateRecord,
@@ -44,10 +52,13 @@ LOGGER = logging.getLogger(__name__)
 PLATE_PRESENCE_RELEASE_SECONDS = 15
 HIGH_CONFIDENCE_THRESHOLD = 0.90
 OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS = 5.0
+LOW_LIGHT_THRESHOLD = 85.0
+LOW_LIGHT_GAMMA = 0.72
 OCR_VARIANT_NAMES = (
     "adaptive-color",
     "adaptive-clahe",
     "upscaled-2x-clahe-sharpened",
+    "low-light-gamma-clahe-sharpened",
 )
 
 
@@ -344,6 +355,8 @@ class RecognitionOutcome:
     confirmation_count: int = 0
     confirmation_required: int = 0
     duplicate: bool = False
+    detections: tuple[PlateDetection, ...] = ()
+    used_roi_fallback: bool = False
 
 
 class PlateRecognitionProcessor:
@@ -352,10 +365,12 @@ class PlateRecognitionProcessor:
         provider: OcrProvider,
         plate_service: PlateService,
         config: PlateRecognitionConfig,
+        detector: PlateDetector | None = None,
     ) -> None:
         self.provider = provider
         self.plate_service = plate_service
         self.config = config
+        self.detector = detector
         self.confirmations = ConfirmationTracker(
             config.confirmations_required,
             config.confirmation_window_seconds,
@@ -364,6 +379,7 @@ class PlateRecognitionProcessor:
         self._last_ocr_started_at: dict[int, float] = {}
         self._last_diagnostic_logged_at: dict[int, float] = {}
         self._last_pipeline_state: dict[int, tuple[RecognitionState, str | None]] = {}
+        self._last_detector_error_logged_at: dict[int, float] = {}
 
     def process(
         self,
@@ -374,13 +390,99 @@ class PlateRecognitionProcessor:
         monotonic_at: float | None = None,
         frame_received_at: float | None = None,
     ) -> RecognitionOutcome:
-        crop = crop_roi(frame, self.config.roi_for(direction))
-        if crop is None:
+        roi_crop = crop_roi(frame, self.config.roi_for(direction))
+        if roi_crop is None:
             return self._outcome(camera_id, RecognitionState.NO_OCR_TEXT)
-        ocr_started_at = time.perf_counter()
+
+        recognition_started_at = time.perf_counter()
         previous_ocr_started_at = self._last_ocr_started_at.get(camera_id)
-        self._last_ocr_started_at[camera_id] = ocr_started_at
-        variants = preprocess_variants(crop)
+        self._last_ocr_started_at[camera_id] = recognition_started_at
+        roi_brightness = roi_mean_brightness(roi_crop)
+        detector_config = self.config.plate_detector
+        detections: list[PlateDetection] = []
+        detector_ms = 0.0
+        used_roi_fallback = not detector_config.enabled
+        ocr_crops: list[np.ndarray] = []
+
+        if detector_config.enabled and self.detector is not None:
+            try:
+                detections = self.detector.detect(roi_crop)
+            except Exception as exc:
+                self._log_detector_error(
+                    camera_id,
+                    exc,
+                    recognition_started_at,
+                    detector_config.fallback_to_roi_ocr,
+                )
+                if not detector_config.fallback_to_roi_ocr:
+                    raise
+                used_roi_fallback = True
+                ocr_crops = [roi_crop]
+            detector_finished_at = time.perf_counter()
+            detector_ms = (
+                detector_finished_at - recognition_started_at
+            ) * 1000.0
+            if not used_roi_fallback:
+                selected = select_plate_detections(
+                    detections,
+                    detector_config.max_plate_candidates_per_frame,
+                )
+                ocr_crops = [
+                    plate_crop
+                    for detection in selected
+                    if (
+                        plate_crop := crop_padded_plate(
+                            roi_crop,
+                            detection,
+                            detector_config.crop_padding_ratio,
+                        )
+                    )
+                    is not None
+                ]
+            ocr_started_at = detector_finished_at
+        elif detector_config.enabled:
+            if not detector_config.fallback_to_roi_ocr:
+                raise PlateDetectorError(
+                    "Plate detector kullanılamıyor ve ROI OCR fallback kapalı."
+                )
+            used_roi_fallback = True
+            ocr_crops = [roi_crop]
+            ocr_started_at = recognition_started_at
+        else:
+            ocr_crops = [roi_crop]
+            ocr_started_at = recognition_started_at
+
+        if not ocr_crops:
+            self._log_ocr_diagnostics(
+                camera_id=camera_id,
+                direction=direction,
+                frame=frame,
+                crop=roi_crop,
+                variants=(),
+                brightness=roi_brightness,
+                ocr_started_at=recognition_started_at,
+                previous_ocr_started_at=previous_ocr_started_at,
+                processing_duration_ms=0.0,
+                inference_duration_ms=0.0,
+                detector_ms=detector_ms,
+                detections=detections,
+                plate_crops=(),
+                total_recognition_ms=detector_ms,
+                frame_received_at=frame_received_at,
+                candidate_found=False,
+                used_roi_fallback=used_roi_fallback,
+            )
+            return self._outcome(
+                camera_id,
+                RecognitionState.NO_OCR_TEXT,
+                detections=tuple(detections),
+                used_roi_fallback=used_roi_fallback,
+            )
+
+        variants: list[np.ndarray] = []
+        for ocr_crop in ocr_crops:
+            brightness = roi_mean_brightness(ocr_crop)
+            variants.extend(preprocess_variants(ocr_crop, brightness=brightness))
         inference_started_at = time.perf_counter()
         segments = self.provider.recognize(variants)
         ocr_finished_at = time.perf_counter()
@@ -391,24 +493,43 @@ class PlateRecognitionProcessor:
             camera_id=camera_id,
             direction=direction,
             frame=frame,
-            crop=crop,
+            crop=roi_crop,
             variants=variants,
-            ocr_started_at=ocr_started_at,
+            brightness=roi_brightness,
+            ocr_started_at=recognition_started_at,
             previous_ocr_started_at=previous_ocr_started_at,
             processing_duration_ms=processing_duration_ms,
             inference_duration_ms=inference_duration_ms,
+            detector_ms=detector_ms,
+            detections=detections,
+            plate_crops=ocr_crops,
+            total_recognition_ms=(ocr_finished_at - recognition_started_at) * 1000.0,
             frame_received_at=frame_received_at,
             candidate_found=candidate is not None,
+            used_roi_fallback=used_roi_fallback,
         )
+        detection_context = {
+            "detections": tuple(detections),
+            "used_roi_fallback": used_roi_fallback,
+        }
         if not segments:
-            return self._outcome(camera_id, RecognitionState.NO_OCR_TEXT)
+            return self._outcome(
+                camera_id,
+                RecognitionState.NO_OCR_TEXT,
+                **detection_context,
+            )
         if candidate is None:
-            return self._outcome(camera_id, RecognitionState.NO_VALID_PLATE)
+            return self._outcome(
+                camera_id,
+                RecognitionState.NO_VALID_PLATE,
+                **detection_context,
+            )
         if candidate.confidence < self.config.min_confidence:
             return self._outcome(
                 camera_id,
                 RecognitionState.LOW_CONFIDENCE,
                 candidate=candidate,
+                **detection_context,
             )
 
         observed_at = monotonic_at if monotonic_at is not None else time.monotonic()
@@ -425,6 +546,7 @@ class PlateRecognitionProcessor:
                 candidate=candidate,
                 confirmation_count=progress.observed_count,
                 confirmation_required=progress.required_count,
+                **detection_context,
             )
         if not self.presences.claim_record(confirmed):
             return self._outcome(
@@ -434,6 +556,7 @@ class PlateRecognitionProcessor:
                 confirmation_count=progress.observed_count,
                 confirmation_required=progress.required_count,
                 duplicate=True,
+                **detection_context,
             )
         try:
             record = self.plate_service.save_plate_detection(
@@ -452,6 +575,7 @@ class PlateRecognitionProcessor:
                 confirmation_count=progress.observed_count,
                 confirmation_required=progress.required_count,
                 duplicate=True,
+                **detection_context,
             )
         except Exception:
             self.presences.release_record_claim(confirmed)
@@ -464,6 +588,7 @@ class PlateRecognitionProcessor:
             record=record,
             confirmation_count=progress.observed_count,
             confirmation_required=progress.required_count,
+            **detection_context,
         )
 
     def _outcome(
@@ -476,6 +601,8 @@ class PlateRecognitionProcessor:
         confirmation_count: int = 0,
         confirmation_required: int = 0,
         duplicate: bool = False,
+        detections: tuple[PlateDetection, ...] = (),
+        used_roi_fallback: bool = False,
     ) -> RecognitionOutcome:
         signature = (state, candidate.plate if candidate is not None else None)
         if (
@@ -503,6 +630,8 @@ class PlateRecognitionProcessor:
             confirmation_count=confirmation_count,
             confirmation_required=confirmation_required,
             duplicate=duplicate,
+            detections=detections,
+            used_roi_fallback=used_roi_fallback,
         )
 
     def _log_ocr_diagnostics(
@@ -513,12 +642,18 @@ class PlateRecognitionProcessor:
         frame: object,
         crop: np.ndarray,
         variants: Sequence[np.ndarray],
+        brightness: float,
         ocr_started_at: float,
         previous_ocr_started_at: float | None,
         processing_duration_ms: float,
         inference_duration_ms: float,
+        detector_ms: float,
+        detections: Sequence[PlateDetection],
+        plate_crops: Sequence[np.ndarray],
+        total_recognition_ms: float,
         frame_received_at: float | None,
         candidate_found: bool,
+        used_roi_fallback: bool,
     ) -> None:
         if not LOGGER.isEnabledFor(logging.DEBUG):
             return
@@ -542,16 +677,36 @@ class PlateRecognitionProcessor:
         )
         LOGGER.debug(
             "OCR diagnostics camera_id=%s direction=%s frame=%s roi=%s "
-            "variants=%s variant_sizes=%s processing_ms=%.1f inference_ms=%.1f "
+            "brightness=%.1f low_light=%s variants=%s variant_sizes=%s "
+            "detector_ms=%.1f plates=%s det_conf=%s plate_crops=%s "
+            "ocr_ms=%.1f processing_ms=%.1f inference_ms=%.1f "
+            "total_recognition_ms=%.1f fallback=%s "
             "actual_interval_ms=%s frame_wait_ms=%s candidate=%s",
             camera_id,
             direction.value,
             _image_resolution(frame),
             _image_resolution(crop),
+            brightness,
+            "yes" if brightness < LOW_LIGHT_THRESHOLD else "no",
             len(variants),
             ",".join(_image_resolution(variant) for variant in variants),
+            detector_ms,
+            len(detections),
+            (
+                "none"
+                if not detections
+                else f"{max(item.confidence for item in detections):.3f}"
+            ),
+            (
+                "none"
+                if not plate_crops
+                else ",".join(_image_resolution(item) for item in plate_crops)
+            ),
+            processing_duration_ms,
             processing_duration_ms,
             inference_duration_ms,
+            total_recognition_ms,
+            "roi" if used_roi_fallback else "no",
             (
                 "first"
                 if actual_interval_ms is None
@@ -559,6 +714,27 @@ class PlateRecognitionProcessor:
             ),
             "unknown" if frame_wait_ms is None else f"{frame_wait_ms:.1f}",
             "yes" if candidate_found else "no",
+        )
+
+    def _log_detector_error(
+        self,
+        camera_id: int,
+        exc: Exception,
+        now: float,
+        fallback_enabled: bool,
+    ) -> None:
+        last_logged_at = self._last_detector_error_logged_at.get(camera_id)
+        if (
+            last_logged_at is not None
+            and now - last_logged_at < OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._last_detector_error_logged_at[camera_id] = now
+        LOGGER.warning(
+            "Plate detector inference failed camera_id=%s fallback=%s error_type=%s",
+            camera_id,
+            "roi" if fallback_enabled else "disabled",
+            type(exc).__name__,
         )
 
 
@@ -573,6 +749,7 @@ class PlateRecognitionWorker(QObject):
     status_changed = Signal(object, str)
     candidate_changed = Signal(int, object)
     outcome_changed = Signal(int, object)
+    detections_changed = Signal(int, object)
     record_saved = Signal(object)
     finished = Signal()
 
@@ -581,11 +758,13 @@ class PlateRecognitionWorker(QObject):
         plate_service: PlateService,
         config: PlateRecognitionConfig,
         provider_factory: Callable[[], OcrProvider],
+        detector_factory: Callable[[], PlateDetector] | None = None,
     ) -> None:
         super().__init__()
         self.plate_service = plate_service
         self.config = config
         self.provider_factory = provider_factory
+        self.detector_factory = detector_factory
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._lock = threading.Lock()
@@ -635,8 +814,37 @@ class PlateRecognitionWorker(QObject):
                 self._stop_event.wait()
                 return
 
-            processor = PlateRecognitionProcessor(provider, self.plate_service, self.config)
+            detector: PlateDetector | None = None
+            detector_message = ""
+            if self.config.plate_detector.enabled and self.detector_factory is not None:
+                try:
+                    detector = self.detector_factory()
+                except Exception as exc:
+                    if not self.config.plate_detector.fallback_to_roi_ocr:
+                        LOGGER.error(
+                            "Plate detector initialization failed error_type=%s",
+                            type(exc).__name__,
+                        )
+                        self.status_changed.emit(
+                            RecognitionStatus.UNAVAILABLE,
+                            "Plate detector başlatılamadı ve ROI OCR fallback kapalı.",
+                        )
+                        self._stop_event.wait()
+                        return
+                    LOGGER.warning(
+                        "Plate detector unavailable; ROI OCR fallback active error_type=%s",
+                        type(exc).__name__,
+                    )
+                    detector_message = " Plate detector kullanılamıyor; ROI OCR fallback aktif."
+
+            processor = PlateRecognitionProcessor(
+                provider,
+                self.plate_service,
+                self.config,
+                detector=detector,
+            )
             active_message = "OCR aktif."
+            active_message += detector_message
             if self.config.warnings:
                 active_message += " " + " ".join(self.config.warnings)
             self.status_changed.emit(RecognitionStatus.ACTIVE, active_message)
@@ -670,6 +878,7 @@ class PlateRecognitionWorker(QObject):
                     recovering_from_error = False
                 if outcome.candidate is not None:
                     self.candidate_changed.emit(camera_id, outcome.candidate)
+                self.detections_changed.emit(camera_id, outcome.detections)
                 if outcome.record is not None:
                     self.record_saved.emit(outcome.record)
                 self.outcome_changed.emit(camera_id, outcome)
@@ -707,6 +916,7 @@ class PlateRecognitionService(QObject):
     status_changed = Signal(object, str)
     candidate_changed = Signal(int, object)
     outcome_changed = Signal(int, object)
+    detections_changed = Signal(int, object)
     record_saved = Signal(object)
     STOP_TIMEOUT_MS = 5_000
 
@@ -716,6 +926,7 @@ class PlateRecognitionService(QObject):
         plate_service: PlateService,
         config: PlateRecognitionConfig,
         provider_factory: Callable[[], OcrProvider] | None = None,
+        detector_factory: Callable[[], PlateDetector] | None = None,
         settings_path: Path | None = None,
     ) -> None:
         super().__init__()
@@ -726,7 +937,9 @@ class PlateRecognitionService(QObject):
             settings_path or application_root() / "config" / "settings.json"
         ).resolve()
         self._custom_provider_factory = provider_factory
+        self._custom_detector_factory = detector_factory
         self.provider_factory = provider_factory or self._default_provider_factory
+        self.detector_factory = detector_factory or self._default_detector_factory
         self._runtime: _RecognitionRuntime | None = None
         self._directions: dict[int, Direction] = {}
         self._status = RecognitionStatus.STOPPED
@@ -739,6 +952,7 @@ class PlateRecognitionService(QObject):
             self.plate_service,
             self.config,
             self.provider_factory,
+            self.detector_factory,
         )
         thread = QThread()
         worker.moveToThread(thread)
@@ -747,6 +961,7 @@ class PlateRecognitionService(QObject):
         worker.status_changed.connect(self._relay_status)
         worker.candidate_changed.connect(self.candidate_changed.emit)
         worker.outcome_changed.connect(self.outcome_changed.emit)
+        worker.detections_changed.connect(self.detections_changed.emit)
         worker.record_saved.connect(self.record_saved.emit)
         worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.finished.connect(worker.deleteLater)
@@ -781,6 +996,8 @@ class PlateRecognitionService(QObject):
         self.config = config
         if self._custom_provider_factory is None:
             self.provider_factory = self._default_provider_factory
+        if self._custom_detector_factory is None:
+            self.detector_factory = self._default_detector_factory
         if was_running:
             self.start()
 
@@ -789,6 +1006,9 @@ class PlateRecognitionService(QObject):
             self.config.model_root,
             backend=self.config.ocr_backend,
         )
+
+    def _default_detector_factory(self) -> PlateDetector:
+        return OpenVinoPlateDetector(self.config.plate_detector)
 
     @Slot(int, object)
     def _receive_frame(self, camera_id: int, frame: object) -> None:
@@ -825,7 +1045,17 @@ def crop_roi(frame: object, roi: NormalizedRoi) -> np.ndarray | None:
     return crop.copy() if crop.size else None
 
 
-def preprocess_variants(crop: np.ndarray) -> list[np.ndarray]:
+def roi_mean_brightness(crop: np.ndarray) -> float:
+    """Return mean grayscale luminance on OpenCV's 0-255 uint8 scale."""
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    return float(np.mean(gray))
+
+
+def preprocess_variants(
+    crop: np.ndarray,
+    *,
+    brightness: float | None = None,
+) -> list[np.ndarray]:
     original = crop
     if crop.shape[1] < 600:
         scale = min(3.0, 600 / max(1, crop.shape[1]))
@@ -860,7 +1090,42 @@ def preprocess_variants(crop: np.ndarray) -> list[np.ndarray]:
         0,
     )
     enhanced_upscaled_bgr = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
-    return [original, contrasted_bgr, enhanced_upscaled_bgr]
+    variants = [original, contrasted_bgr, enhanced_upscaled_bgr]
+
+    measured_brightness = (
+        roi_mean_brightness(crop) if brightness is None else brightness
+    )
+    if measured_brightness < LOW_LIGHT_THRESHOLD:
+        low_light_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        gamma_lut = np.array(
+            [
+                ((value / 255.0) ** LOW_LIGHT_GAMMA) * 255.0
+                for value in range(256)
+            ],
+            dtype=np.uint8,
+        )
+        brightened = cv2.LUT(low_light_gray, gamma_lut)
+        low_light_contrasted = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8, 8),
+        ).apply(brightened)
+        low_light_softened = cv2.GaussianBlur(
+            low_light_contrasted,
+            (0, 0),
+            sigmaX=1.0,
+        )
+        low_light_sharpened = cv2.addWeighted(
+            low_light_contrasted,
+            1.10,
+            low_light_softened,
+            -0.10,
+            0,
+        )
+        variants.append(
+            cv2.cvtColor(low_light_sharpened, cv2.COLOR_GRAY2BGR)
+        )
+
+    return variants
 
 
 def _image_resolution(image: object) -> str:

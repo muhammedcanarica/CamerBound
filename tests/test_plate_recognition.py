@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -14,12 +15,19 @@ from PySide6.QtCore import Qt
 
 from app.auth import AuthService
 from app.camera import CameraService, Direction
-from app.config import DEFAULT_ROI, NormalizedRoi, PlateRecognitionConfig
+from app.config import (
+    DEFAULT_ROI,
+    NormalizedRoi,
+    PlateDetectorConfig,
+    PlateRecognitionConfig,
+)
 from app.database import Database
 from app.plate_capture import PlateCaptureService
+from app.plate_detector import PlateDetection, PlateDetectorError
 from app.plate_recognition import (
     ConfirmationTracker,
     HIGH_CONFIDENCE_THRESHOLD,
+    LOW_LIGHT_THRESHOLD,
     OcrModelNotFound,
     OcrSegment,
     PaddleOcrProvider,
@@ -33,6 +41,7 @@ from app.plate_recognition import (
     normalize_plate_text,
     crop_roi,
     preprocess_variants,
+    roi_mean_brightness,
     select_best_candidate,
     RecognitionStatus,
 )
@@ -65,6 +74,35 @@ class RecoveringOcrProvider(FakeOcrProvider):
 class EmptyOcrProvider:
     def recognize(self, _images: object) -> list[OcrSegment]:
         return []
+
+
+class RecordingOcrProvider(FakeOcrProvider):
+    def __init__(self, confidence: float = 0.97) -> None:
+        super().__init__(confidence=confidence)
+        self.images: list[np.ndarray] = []
+        self.calls = 0
+
+    def recognize(self, images: object) -> list[OcrSegment]:
+        self.calls += 1
+        self.images = list(images)
+        return super().recognize(images)
+
+
+class FakePlateDetector:
+    def __init__(
+        self,
+        detections: list[PlateDetection] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.detections = detections or []
+        self.error = error
+        self.calls = 0
+
+    def detect(self, _image: np.ndarray) -> list[PlateDetection]:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return list(self.detections)
 
 
 def recognition_config(model_root: Path, confirmations: int = 2) -> PlateRecognitionConfig:
@@ -153,6 +191,32 @@ class PlateTextTests(unittest.TestCase):
 
 
 class PreprocessingTests(unittest.TestCase):
+    def test_dark_roi_is_detected_as_low_light(self) -> None:
+        crop = np.full((40, 120, 3), 40, dtype=np.uint8)
+
+        brightness = roi_mean_brightness(crop)
+
+        self.assertLess(brightness, LOW_LIGHT_THRESHOLD)
+
+    def test_bright_roi_is_not_detected_as_low_light(self) -> None:
+        crop = np.full((40, 120, 3), 160, dtype=np.uint8)
+
+        brightness = roi_mean_brightness(crop)
+
+        self.assertGreaterEqual(brightness, LOW_LIGHT_THRESHOLD)
+
+    def test_low_light_variant_is_only_added_for_dark_roi(self) -> None:
+        dark_crop = np.full((40, 120, 3), 40, dtype=np.uint8)
+        bright_crop = np.full((40, 120, 3), 160, dtype=np.uint8)
+
+        dark_variants = preprocess_variants(dark_crop)
+        bright_variants = preprocess_variants(bright_crop)
+
+        self.assertEqual(len(dark_variants), 4)
+        self.assertEqual(len(bright_variants), 3)
+        self.assertEqual(dark_variants[-1].shape, dark_crop.shape)
+        self.assertEqual(dark_variants[-1].ndim, 3)
+
     def test_existing_variants_are_preserved_and_third_variant_is_exactly_2x(self) -> None:
         generator = np.random.default_rng(7)
         crop = generator.integers(0, 256, (120, 400, 3), dtype=np.uint8)
@@ -188,6 +252,17 @@ class PreprocessingTests(unittest.TestCase):
         np.testing.assert_array_equal(crop, original_copy)
         self.assertFalse(np.shares_memory(crop, variants[2]))
 
+    def test_low_light_preprocessing_does_not_mutate_input_frame(self) -> None:
+        frame = np.full((100, 200, 3), 40, dtype=np.uint8)
+        original_frame = frame.copy()
+        roi = NormalizedRoi(x=0.1, y=0.2, width=0.6, height=0.5)
+
+        crop = crop_roi(frame, roi)
+        variants = preprocess_variants(crop)
+
+        np.testing.assert_array_equal(frame, original_frame)
+        self.assertEqual(len(variants), 4)
+
     def test_tiny_clamped_roi_does_not_crash_preprocessing(self) -> None:
         frame = np.zeros((2, 2, 3), dtype=np.uint8)
         roi = NormalizedRoi(x=-1.0, y=-1.0, width=0.0, height=0.0)
@@ -196,7 +271,7 @@ class PreprocessingTests(unittest.TestCase):
         variants = preprocess_variants(crop)
 
         self.assertEqual(crop.shape, (1, 1, 3))
-        self.assertEqual(len(variants), 3)
+        self.assertEqual(len(variants), 4)
         self.assertEqual(variants[2].shape, (2, 2, 3))
 
 
@@ -319,6 +394,171 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(self._record_count(), 1)
         self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 1)
 
+    def test_detector_disabled_preserves_existing_roi_ocr_pipeline(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        provider = RecordingOcrProvider()
+        config = replace(
+            self.config,
+            plate_detector=replace(self.config.plate_detector, enabled=False),
+        )
+        processor = PlateRecognitionProcessor(provider, self.plate_service, config)
+
+        outcome = processor.process(
+            camera.id,
+            camera.direction,
+            np.zeros((200, 400, 3), dtype=np.uint8),
+            monotonic_at=1.0,
+        )
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(len(provider.images), 4)
+        self.assertTrue(outcome.used_roi_fallback)
+
+    def test_detector_plate_crop_is_sent_to_ocr_and_full_frame_is_saved(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        provider = RecordingOcrProvider()
+        detector = FakePlateDetector(
+            [PlateDetection(0.91, x=20, y=10, width=100, height=30)]
+        )
+        config = replace(
+            self.config,
+            plate_detector=replace(
+                self.config.plate_detector,
+                crop_padding_ratio=0.0,
+            ),
+        )
+        processor = PlateRecognitionProcessor(
+            provider,
+            self.plate_service,
+            config,
+            detector=detector,
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        with patch.object(
+            self.plate_service,
+            "save_plate_detection",
+            wraps=self.plate_service.save_plate_detection,
+        ) as save_plate_detection:
+            outcome = processor.process(
+                camera.id,
+                camera.direction,
+                frame,
+                monotonic_at=1.0,
+            )
+
+        self.assertEqual(detector.calls, 1)
+        self.assertEqual(len(provider.images), 4)
+        self.assertEqual(provider.images[2].shape, (60, 200, 3))
+        self.assertFalse(outcome.used_roi_fallback)
+        self.assertEqual(outcome.detections, tuple(detector.detections))
+        self.assertIs(save_plate_detection.call_args.args[4], frame)
+
+    def test_detector_limits_ocr_to_two_ranked_plate_crops(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        provider = RecordingOcrProvider()
+        detector = FakePlateDetector(
+            [
+                PlateDetection(0.70, 0, 0, 80, 20),
+                PlateDetection(0.95, 20, 10, 60, 20),
+                PlateDetection(0.85, 100, 20, 70, 20),
+            ]
+        )
+        processor = PlateRecognitionProcessor(
+            provider,
+            self.plate_service,
+            self.config,
+            detector=detector,
+        )
+
+        processor.process(
+            camera.id,
+            camera.direction,
+            np.full((200, 400, 3), 160, dtype=np.uint8),
+            monotonic_at=1.0,
+        )
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(len(provider.images), 6)
+
+    def test_detector_runtime_failure_uses_roi_fallback_without_reinitializing(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        provider = RecordingOcrProvider()
+        detector = FakePlateDetector(error=PlateDetectorError("temporary"))
+        processor = PlateRecognitionProcessor(
+            provider,
+            self.plate_service,
+            self.config,
+            detector=detector,
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        first = processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            monotonic_at=1.0,
+        )
+        second = processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            monotonic_at=2.0,
+        )
+
+        self.assertEqual(detector.calls, 2)
+        self.assertEqual(provider.calls, 2)
+        self.assertTrue(first.used_roi_fallback)
+        self.assertTrue(second.used_roi_fallback)
+
+    def test_detector_with_no_plate_skips_ocr_for_that_frame(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        provider = RecordingOcrProvider()
+        detector = FakePlateDetector([])
+        processor = PlateRecognitionProcessor(
+            provider,
+            self.plate_service,
+            self.config,
+            detector=detector,
+        )
+
+        outcome = processor.process(
+            camera.id,
+            camera.direction,
+            np.zeros((200, 400, 3), dtype=np.uint8),
+            monotonic_at=1.0,
+        )
+
+        self.assertEqual(provider.calls, 0)
+        self.assertIs(outcome.state, RecognitionState.NO_OCR_TEXT)
+        self.assertFalse(outcome.used_roi_fallback)
+
+    def test_detector_pipeline_does_not_change_database_schema(self) -> None:
+        with self.database.connection() as connection:
+            before = connection.execute(
+                "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+        camera = self.camera_service.list_cameras()[0]
+        processor = PlateRecognitionProcessor(
+            RecordingOcrProvider(),
+            self.plate_service,
+            self.config,
+            detector=FakePlateDetector([]),
+        )
+
+        processor.process(
+            camera.id,
+            camera.direction,
+            np.zeros((200, 400, 3), dtype=np.uint8),
+            monotonic_at=1.0,
+        )
+
+        with self.database.connection() as connection:
+            after = connection.execute(
+                "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+        self.assertEqual([tuple(row) for row in after], [tuple(row) for row in before])
+
     def test_ocr_diagnostics_are_throttled_and_contain_safe_dimensions(self) -> None:
         camera = self.camera_service.list_cameras()[0]
         processor = PlateRecognitionProcessor(
@@ -352,10 +592,53 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIn("direction=ENTRY", diagnostic)
         self.assertIn("frame=400x200", diagnostic)
         self.assertIn("roi=320x110", diagnostic)
-        self.assertIn("variants=3", diagnostic)
+        self.assertIn("brightness=0.0", diagnostic)
+        self.assertIn("low_light=yes", diagnostic)
+        self.assertIn("variants=4", diagnostic)
+        self.assertIn("detector_ms=0.0", diagnostic)
+        self.assertIn("plates=0", diagnostic)
+        self.assertIn("det_conf=none", diagnostic)
+        self.assertIn("fallback=roi", diagnostic)
+        self.assertIn("total_recognition_ms=100.0", diagnostic)
         self.assertIn("processing_ms=100.0", diagnostic)
         self.assertIn("inference_ms=80.0", diagnostic)
         self.assertIn("frame_wait_ms=50.0", diagnostic)
+        self.assertIn("candidate=yes", diagnostic)
+
+    def test_detector_diagnostics_include_latency_count_confidence_and_crop(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(),
+            self.plate_service,
+            self.config,
+            detector=FakePlateDetector(
+                [PlateDetection(0.88, x=20, y=10, width=100, height=30)]
+            ),
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        with patch(
+            "app.plate_recognition.time.perf_counter",
+            side_effect=(10.0, 10.012, 10.020, 10.095),
+        ), self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            processor.process(
+                camera.id,
+                camera.direction,
+                frame,
+                monotonic_at=1.0,
+            )
+
+        diagnostic = next(
+            line for line in captured.output if "OCR diagnostics" in line
+        )
+        self.assertIn("direction=ENTRY", diagnostic)
+        self.assertIn("roi=320x110", diagnostic)
+        self.assertIn("detector_ms=12.0", diagnostic)
+        self.assertIn("plates=1", diagnostic)
+        self.assertIn("det_conf=0.880", diagnostic)
+        self.assertIn("plate_crops=130x40", diagnostic)
+        self.assertIn("ocr_ms=83.0", diagnostic)
+        self.assertIn("total_recognition_ms=95.0", diagnostic)
         self.assertIn("candidate=yes", diagnostic)
 
     def test_duplicate_after_a_new_confirmation_does_not_store_a_second_image(self) -> None:
@@ -465,6 +748,9 @@ class RecognitionPipelineTests(unittest.TestCase):
             FakeOcrProvider(confidence=0.97),
             self.plate_service,
             recognition_config(Path(self.temp_directory.name), confirmations=1),
+            detector=FakePlateDetector(
+                [PlateDetection(0.9, x=20, y=10, width=100, height=30)]
+            ),
         )
         frame = np.zeros((200, 400, 3), dtype=np.uint8)
         detected_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -594,6 +880,36 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         self.assertEqual((first_camera_id, second_camera_id), (10, 20))
         self.assertEqual(worker.pending_frame_count, 1)
+
+    def test_worker_detector_initialization_failure_keeps_roi_fallback_active(self) -> None:
+        factory_calls = 0
+
+        def missing_detector() -> object:
+            nonlocal factory_calls
+            factory_calls += 1
+            raise PlateDetectorError("missing model")
+
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+            detector_factory=missing_detector,
+        )
+        statuses: list[RecognitionStatus] = []
+        messages: list[str] = []
+        worker.status_changed.connect(
+            lambda status, message: (statuses.append(status), messages.append(message)),
+            Qt.ConnectionType.DirectConnection,
+        )
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        time.sleep(0.05)
+        worker.request_stop()
+        thread.join(1.0)
+
+        self.assertEqual(factory_calls, 1)
+        self.assertIn(RecognitionStatus.ACTIVE, statuses)
+        self.assertTrue(any("fallback" in message for message in messages))
 
     def test_missing_model_is_reported_without_importing_paddle(self) -> None:
         with self.assertRaisesRegex(OcrModelNotFound, "Detection model"):

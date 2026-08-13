@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from app.audit import AuditService
 from app.auth import Role, SessionUser, ValidationError
 from app.camera import Camera, CameraService, CameraStatus, Direction
+from app.plate_detector import PlateDetection
 from app.plate_recognition import (
     PlateCandidate,
     PlateRecognitionService,
@@ -65,6 +66,7 @@ class DashboardHome(QWidget):
         self.camera_cards: dict[Direction, CameraCardWidgets] = {}
         self.camera_directions: dict[int, Direction] = {}
         self._latest_images: dict[Direction, QImage] = {}
+        self._plate_detections: dict[Direction, tuple[PlateDetection, ...]] = {}
         self._build_ui()
         self.camera_service.frame_ready.connect(self._show_frame)
         self.camera_service.status_changed.connect(self._show_status)
@@ -73,6 +75,9 @@ class DashboardHome(QWidget):
             self.recognition_service.candidate_changed.connect(self._show_candidate)
             self.recognition_service.outcome_changed.connect(
                 self._show_recognition_outcome
+            )
+            self.recognition_service.detections_changed.connect(
+                self._show_plate_detections
             )
             self.recognition_service.record_saved.connect(self._record_saved)
             QTimer.singleShot(0, self._sync_ocr_status)
@@ -220,6 +225,7 @@ class DashboardHome(QWidget):
             return
 
         self._draw_roi(image, direction)
+        self._draw_plate_detections(image, direction)
         self._latest_images[direction] = image
         self._display_image(direction, image)
 
@@ -370,6 +376,46 @@ class DashboardHome(QWidget):
             max(1, round(roi.width * image.width())),
             max(1, round(roi.height * image.height())),
         )
+        painter.end()
+
+    @Slot(int, object)
+    def _show_plate_detections(
+        self,
+        camera_id: int,
+        detections: object,
+    ) -> None:
+        direction = self.camera_directions.get(camera_id)
+        if direction is None:
+            return
+        self._plate_detections[direction] = tuple(
+            item for item in detections if isinstance(item, PlateDetection)
+        )
+
+    def _draw_plate_detections(self, image: QImage, direction: Direction) -> None:
+        if (
+            self.recognition_service is None
+            or self.user.role is not Role.ADMIN
+            or not self.recognition_service.config.plate_detector.debug_overlay
+        ):
+            return
+        detections = self._plate_detections.get(direction, ())
+        if not detections:
+            return
+
+        roi = self.recognition_service.config.roi_for(direction)
+        roi_x = round(roi.x * image.width())
+        roi_y = round(roi.y * image.height())
+        painter = QPainter(image)
+        painter.setPen(QPen(QColor("#f97316"), 2))
+        for detection in detections:
+            x = roi_x + detection.x
+            y = roi_y + detection.y
+            painter.drawRect(x, y, detection.width, detection.height)
+            painter.drawText(
+                x,
+                max(14, y - 4),
+                f"PLATE {detection.confidence * 100:.0f}%",
+            )
         painter.end()
 
     def _clear_preview(self, direction: Direction, message: str) -> None:

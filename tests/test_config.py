@@ -11,6 +11,7 @@ from app.config import (
     DEFAULT_ROI,
     ConfigError,
     NormalizedRoi,
+    PLATE_DETECTOR_MODEL_NAME,
     load_config,
     update_plate_roi,
     update_record_retention,
@@ -18,6 +19,75 @@ from app.config import (
 
 
 class PlateRecognitionConfigTests(unittest.TestCase):
+    def test_plate_detector_settings_are_validated_and_model_path_is_local(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            settings_path = Path(temp_directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "database_path": "test.db",
+                        "plate_detection": {
+                            "plate_detector": {
+                                "enabled": True,
+                                "backend": "openvino",
+                                "min_confidence": 0.50,
+                                "crop_padding_ratio": 0.15,
+                                "max_plate_candidates_per_frame": 2,
+                                "fallback_to_roi_ocr": True,
+                                "debug_overlay": False,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            detector = load_config(settings_path).plate_recognition.plate_detector
+
+        self.assertTrue(detector.enabled)
+        self.assertEqual(detector.backend, "openvino")
+        self.assertEqual(detector.min_confidence, 0.50)
+        self.assertEqual(detector.crop_padding_ratio, 0.15)
+        self.assertEqual(detector.max_plate_candidates_per_frame, 2)
+        self.assertTrue(detector.fallback_to_roi_ocr)
+        self.assertFalse(detector.debug_overlay)
+        self.assertEqual(detector.model_dir.name, PLATE_DETECTOR_MODEL_NAME)
+        self.assertEqual(detector.model_xml.name, "model.xml")
+        self.assertEqual(detector.model_bin.name, "model.bin")
+
+    def test_invalid_plate_detector_values_use_safe_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            settings_path = Path(temp_directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "database_path": "test.db",
+                        "plate_detection": {
+                            "plate_detector": {
+                                "enabled": "yes",
+                                "backend": "unknown",
+                                "min_confidence": 2,
+                                "crop_padding_ratio": -1,
+                                "max_plate_candidates_per_frame": 0,
+                                "fallback_to_roi_ocr": "yes",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(settings_path).plate_recognition
+
+        detector = config.plate_detector
+        self.assertTrue(detector.enabled)
+        self.assertEqual(detector.backend, "openvino")
+        self.assertEqual(detector.min_confidence, 0.50)
+        self.assertEqual(detector.crop_padding_ratio, 0.15)
+        self.assertEqual(detector.max_plate_candidates_per_frame, 2)
+        self.assertTrue(detector.fallback_to_roi_ocr)
+        self.assertGreaterEqual(len(config.warnings), 6)
+
     def test_ocr_sampling_interval_is_250_without_relaxing_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             settings_path = Path(temp_directory) / "settings.json"

@@ -16,6 +16,10 @@ dist/
 models/ocr/**
 models/ocr-staging/
 models/ocr-backup/
+models/plate_detector/**
+!models/plate_detector/
+!models/plate_detector/vehicle-license-plate-detection-barrier-0123/
+!models/plate_detector/vehicle-license-plate-detection-barrier-0123/.gitkeep
 !models/ocr/model-info.json
 !models/ocr/detection/
 !models/ocr/detection/.gitkeep

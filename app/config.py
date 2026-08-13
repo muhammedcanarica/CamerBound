@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,10 @@ DEFAULT_RECORD_RETENTION_DAYS = 90
 SUPPORTED_RECORD_RETENTION_DAYS = (30, 90, 180, 0)
 DEFAULT_CAPTURE_MAX_WIDTH = 960
 DEFAULT_CAPTURE_JPEG_QUALITY = 60
+PLATE_DETECTOR_MODEL_NAME = "vehicle-license-plate-detection-barrier-0123"
+DEFAULT_PLATE_DETECTOR_MIN_CONFIDENCE = 0.50
+DEFAULT_PLATE_DETECTOR_CROP_PADDING_RATIO = 0.15
+DEFAULT_MAX_PLATE_CANDIDATES_PER_FRAME = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +40,26 @@ class PlateCaptureConfig:
     capture_root: Path
     reference_root: Path
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PlateDetectorConfig:
+    enabled: bool = True
+    backend: str = "openvino"
+    min_confidence: float = DEFAULT_PLATE_DETECTOR_MIN_CONFIDENCE
+    crop_padding_ratio: float = DEFAULT_PLATE_DETECTOR_CROP_PADDING_RATIO
+    max_plate_candidates_per_frame: int = DEFAULT_MAX_PLATE_CANDIDATES_PER_FRAME
+    fallback_to_roi_ocr: bool = True
+    debug_overlay: bool = False
+    model_dir: Path = Path("models") / "plate_detector" / PLATE_DETECTOR_MODEL_NAME
+
+    @property
+    def model_xml(self) -> Path:
+        return self.model_dir / "model.xml"
+
+    @property
+    def model_bin(self) -> Path:
+        return self.model_dir / "model.bin"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +74,7 @@ class PlateRecognitionConfig:
     model_root: Path
     record_retention_days: int = DEFAULT_RECORD_RETENTION_DAYS
     ocr_backend: str = "auto"
+    plate_detector: PlateDetectorConfig = field(default_factory=PlateDetectorConfig)
     warnings: tuple[str, ...] = ()
 
     def roi_for(self, direction: object) -> NormalizedRoi:
@@ -239,6 +264,8 @@ def _load_plate_recognition(
         roi_settings = {}
         warnings.append("roi nesne olmalıdır; varsayılan ROI kullanıldı.")
 
+    detector = _load_plate_detector(raw.get("plate_detector"), root, warnings)
+
     return PlateRecognitionConfig(
         recognition_interval_ms=interval,
         min_confidence=confidence,
@@ -250,7 +277,81 @@ def _load_plate_recognition(
         exit_roi=_parse_roi(roi_settings.get("EXIT"), "EXIT", warnings),
         model_root=(root / "models" / "ocr").resolve(),
         ocr_backend=backend_value.lower(),
+        plate_detector=detector,
         warnings=tuple(warnings),
+    )
+
+
+def _load_plate_detector(
+    raw: object,
+    root: Path,
+    warnings: list[str],
+) -> PlateDetectorConfig:
+    if raw is None:
+        raw = {}
+    elif not isinstance(raw, dict):
+        raw = {}
+        warnings.append(
+            "plate_detector must be an object; default values were used."
+        )
+
+    enabled = _boolean_setting(
+        raw.get("enabled"), True, "plate_detector.enabled", warnings
+    )
+    fallback = _boolean_setting(
+        raw.get("fallback_to_roi_ocr"),
+        True,
+        "plate_detector.fallback_to_roi_ocr",
+        warnings,
+    )
+    debug_overlay = _boolean_setting(
+        raw.get("debug_overlay"),
+        False,
+        "plate_detector.debug_overlay",
+        warnings,
+    )
+    backend = raw.get("backend", "openvino")
+    if not isinstance(backend, str) or backend.lower() != "openvino":
+        backend = "openvino"
+        warnings.append(
+            "plate_detector.backend is invalid; default 'openvino' was used."
+        )
+
+    return PlateDetectorConfig(
+        enabled=enabled,
+        backend=backend.lower(),
+        min_confidence=_bounded_number(
+            raw.get("min_confidence"),
+            DEFAULT_PLATE_DETECTOR_MIN_CONFIDENCE,
+            0.0,
+            1.0,
+            float,
+            "plate_detector.min_confidence",
+            warnings,
+        ),
+        crop_padding_ratio=_bounded_number(
+            raw.get("crop_padding_ratio"),
+            DEFAULT_PLATE_DETECTOR_CROP_PADDING_RATIO,
+            0.0,
+            1.0,
+            float,
+            "plate_detector.crop_padding_ratio",
+            warnings,
+        ),
+        max_plate_candidates_per_frame=_bounded_number(
+            raw.get("max_plate_candidates_per_frame"),
+            DEFAULT_MAX_PLATE_CANDIDATES_PER_FRAME,
+            1,
+            10,
+            int,
+            "plate_detector.max_plate_candidates_per_frame",
+            warnings,
+        ),
+        fallback_to_roi_ocr=fallback,
+        debug_overlay=debug_overlay,
+        model_dir=(
+            root / "models" / "plate_detector" / PLATE_DETECTOR_MODEL_NAME
+        ).resolve(),
     )
 
 
@@ -328,6 +429,20 @@ def _bounded_number(
         warnings.append(f"{name} sınır dışında; varsayılan değer kullanıldı.")
         return default
     return converted
+
+
+def _boolean_setting(
+    value: object,
+    default: bool,
+    name: str,
+    warnings: list[str],
+) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        warnings.append(f"{name} is invalid; the default value was used.")
+        return default
+    return value
 
 
 def _parse_roi(
