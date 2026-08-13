@@ -368,6 +368,7 @@ class PlateRecognitionProcessor:
         self._last_diagnostic_logged_at: dict[int, float] = {}
         self._last_pipeline_state: dict[int, tuple[RecognitionState, str | None]] = {}
         self._last_detector_error_logged_at: dict[int, float] = {}
+        self._last_zero_detection_fallback_at: dict[int, float] = {}
 
     def process(
         self,
@@ -390,6 +391,7 @@ class PlateRecognitionProcessor:
         detections: list[PlateDetection] = []
         detector_ms = 0.0
         used_roi_fallback = not detector_config.enabled
+        fallback_reason = "detector-disabled" if used_roi_fallback else None
         ocr_crops: list[np.ndarray] = []
 
         if detector_config.enabled and self.detector is not None:
@@ -405,6 +407,7 @@ class PlateRecognitionProcessor:
                 if not detector_config.fallback_to_roi_ocr:
                     raise
                 used_roi_fallback = True
+                fallback_reason = "detector-error"
                 ocr_crops = [roi_crop]
             detector_finished_at = time.perf_counter()
             detector_ms = (
@@ -427,6 +430,15 @@ class PlateRecognitionProcessor:
                     )
                     is not None
                 ]
+                if not ocr_crops and self._should_run_zero_detection_fallback(
+                    camera_id,
+                    monotonic_at,
+                    detector_config.zero_detection_roi_fallback_enabled,
+                    detector_config.zero_detection_roi_fallback_interval_ms,
+                ):
+                    used_roi_fallback = True
+                    fallback_reason = "zero-detection"
+                    ocr_crops = [roi_crop]
             ocr_started_at = detector_finished_at
         elif detector_config.enabled:
             if not detector_config.fallback_to_roi_ocr:
@@ -434,6 +446,7 @@ class PlateRecognitionProcessor:
                     "Plate detector kullanılamıyor ve ROI OCR fallback kapalı."
                 )
             used_roi_fallback = True
+            fallback_reason = "detector-error"
             ocr_crops = [roi_crop]
             ocr_started_at = recognition_started_at
         else:
@@ -459,6 +472,7 @@ class PlateRecognitionProcessor:
                 frame_received_at=frame_received_at,
                 candidate_found=False,
                 used_roi_fallback=used_roi_fallback,
+                fallback_reason=fallback_reason,
             )
             return self._outcome(
                 camera_id,
@@ -495,6 +509,7 @@ class PlateRecognitionProcessor:
             frame_received_at=frame_received_at,
             candidate_found=candidate is not None,
             used_roi_fallback=used_roi_fallback,
+            fallback_reason=fallback_reason,
         )
         detection_context = {
             "detections": tuple(detections),
@@ -633,6 +648,7 @@ class PlateRecognitionProcessor:
         frame_received_at: float | None,
         candidate_found: bool,
         used_roi_fallback: bool,
+        fallback_reason: str | None,
     ) -> None:
         if not LOGGER.isEnabledFor(logging.DEBUG):
             return
@@ -659,7 +675,7 @@ class PlateRecognitionProcessor:
             "brightness=%.1f low_light=%s variants=%s variant_sizes=%s "
             "detector_ms=%.1f plates=%s det_conf=%s plate_crops=%s "
             "ocr_ms=%.1f processing_ms=%.1f inference_ms=%.1f "
-            "total_recognition_ms=%.1f fallback=%s "
+            "total_recognition_ms=%.1f fallback=%s fallback_reason=%s "
             "actual_interval_ms=%s frame_wait_ms=%s candidate=%s",
             camera_id,
             direction.value,
@@ -686,6 +702,7 @@ class PlateRecognitionProcessor:
             inference_duration_ms,
             total_recognition_ms,
             "roi" if used_roi_fallback else "no",
+            fallback_reason or "none",
             (
                 "first"
                 if actual_interval_ms is None
@@ -694,6 +711,25 @@ class PlateRecognitionProcessor:
             "unknown" if frame_wait_ms is None else f"{frame_wait_ms:.1f}",
             "yes" if candidate_found else "no",
         )
+
+    def _should_run_zero_detection_fallback(
+        self,
+        camera_id: int,
+        observed_at: float | None,
+        enabled: bool,
+        interval_ms: int,
+    ) -> bool:
+        if not enabled:
+            return False
+        now = observed_at if observed_at is not None else time.monotonic()
+        last_fallback_at = self._last_zero_detection_fallback_at.get(camera_id)
+        if (
+            last_fallback_at is not None
+            and (now - last_fallback_at) * 1000.0 < interval_ms
+        ):
+            return False
+        self._last_zero_detection_fallback_at[camera_id] = now
+        return True
 
     def _log_detector_error(
         self,

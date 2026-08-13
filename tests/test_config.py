@@ -34,6 +34,8 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                                 "crop_padding_ratio": 0.15,
                                 "max_plate_candidates_per_frame": 2,
                                 "fallback_to_roi_ocr": True,
+                                "zero_detection_roi_fallback_enabled": True,
+                                "zero_detection_roi_fallback_interval_ms": 750,
                                 "debug_overlay": False,
                             }
                         },
@@ -50,6 +52,8 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(detector.crop_padding_ratio, 0.15)
         self.assertEqual(detector.max_plate_candidates_per_frame, 2)
         self.assertTrue(detector.fallback_to_roi_ocr)
+        self.assertTrue(detector.zero_detection_roi_fallback_enabled)
+        self.assertEqual(detector.zero_detection_roi_fallback_interval_ms, 750)
         self.assertFalse(detector.debug_overlay)
         self.assertEqual(detector.model_dir.name, PLATE_DETECTOR_MODEL_NAME)
         self.assertEqual(detector.model_xml.name, "model.xml")
@@ -70,6 +74,8 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                                 "crop_padding_ratio": -1,
                                 "max_plate_candidates_per_frame": 0,
                                 "fallback_to_roi_ocr": "yes",
+                                "zero_detection_roi_fallback_enabled": "yes",
+                                "zero_detection_roi_fallback_interval_ms": -1,
                             }
                         },
                     }
@@ -86,7 +92,9 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(detector.crop_padding_ratio, 0.15)
         self.assertEqual(detector.max_plate_candidates_per_frame, 2)
         self.assertTrue(detector.fallback_to_roi_ocr)
-        self.assertGreaterEqual(len(config.warnings), 6)
+        self.assertTrue(detector.zero_detection_roi_fallback_enabled)
+        self.assertEqual(detector.zero_detection_roi_fallback_interval_ms, 750)
+        self.assertGreaterEqual(len(config.warnings), 8)
 
     def test_ocr_sampling_interval_is_250_without_relaxing_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:

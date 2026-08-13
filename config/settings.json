@@ -16,24 +16,26 @@
     "plate_detector": {
       "enabled": true,
       "backend": "openvino",
-      "min_confidence": 0.5,
+      "min_confidence": 0.15,
       "crop_padding_ratio": 0.15,
       "max_plate_candidates_per_frame": 2,
       "fallback_to_roi_ocr": true,
-      "debug_overlay": false
+      "zero_detection_roi_fallback_enabled": true,
+      "zero_detection_roi_fallback_interval_ms": 750,
+      "debug_overlay": true
     },
     "roi": {
       "ENTRY": {
         "x": 0.001388888888888889,
-        "y": 0.4641975308641975,
-        "width": 0.9930555555555556,
-        "height": 0.5358024691358024
+        "y": 0.4246913580246914,
+        "width": 0.9986111111111111,
+        "height": 0.5753086419753086
       },
       "EXIT": {
-        "x": 0.005357142857142857,
-        "y": 0.36666666666666664,
-        "width": 0.9946428571428572,
-        "height": 0.3547619047619048
+        "x": 0.007142857142857143,
+        "y": 0.24047619047619048,
+        "width": 0.9928571428571429,
+        "height": 0.5880952380952381
       }
     }
   }

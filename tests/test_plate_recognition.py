@@ -474,6 +474,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(provider.calls, 2)
         self.assertEqual(len(provider.images), 4)
         self.assertEqual(provider.images[2].shape, (60, 200, 3))
+        self.assertNotEqual(provider.images[0].shape[:2], (110, 320))
         self.assertFalse(outcome.used_roi_fallback)
         self.assertEqual(outcome.detections, tuple(detector.detections))
         self.assertIs(save_plate_detection.call_args.args[4], frame)
@@ -517,25 +518,30 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
         frame = np.zeros((200, 400, 3), dtype=np.uint8)
 
-        first = processor.process(
-            camera.id,
-            camera.direction,
-            frame,
-            monotonic_at=1.0,
-        )
-        second = processor.process(
-            camera.id,
-            camera.direction,
-            frame,
-            monotonic_at=2.0,
-        )
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            first = processor.process(
+                camera.id,
+                camera.direction,
+                frame,
+                monotonic_at=1.0,
+            )
+            second = processor.process(
+                camera.id,
+                camera.direction,
+                frame,
+                monotonic_at=2.0,
+            )
 
         self.assertEqual(detector.calls, 2)
         self.assertEqual(provider.calls, 2)
         self.assertTrue(first.used_roi_fallback)
         self.assertTrue(second.used_roi_fallback)
+        diagnostic = next(
+            line for line in captured.output if "OCR diagnostics" in line
+        )
+        self.assertIn("fallback_reason=detector-error", diagnostic)
 
-    def test_detector_with_no_plate_skips_ocr_for_that_frame(self) -> None:
+    def test_zero_detection_uses_roi_fallback_when_interval_allows(self) -> None:
         camera = self.camera_service.list_cameras()[0]
         provider = RecordingOcrProvider()
         detector = FakePlateDetector([])
@@ -544,6 +550,118 @@ class RecognitionPipelineTests(unittest.TestCase):
             self.plate_service,
             self.config,
             detector=detector,
+        )
+
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            outcome = processor.process(
+                camera.id,
+                camera.direction,
+                np.zeros((200, 400, 3), dtype=np.uint8),
+                monotonic_at=1.0,
+            )
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.images[0].shape, (206, 600, 3))
+        self.assertEqual(provider.images[2].shape, (220, 640, 3))
+        self.assertTrue(outcome.used_roi_fallback)
+        diagnostic = next(
+            line for line in captured.output if "OCR diagnostics" in line
+        )
+        self.assertIn("fallback_reason=zero-detection", diagnostic)
+
+    def test_unusable_detector_crop_uses_zero_detection_fallback(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        provider = RecordingOcrProvider()
+        processor = PlateRecognitionProcessor(
+            provider,
+            self.plate_service,
+            self.config,
+            detector=FakePlateDetector(
+                [PlateDetection(0.90, x=20, y=10, width=1, height=1)]
+            ),
+        )
+
+        outcome = processor.process(
+            camera.id,
+            camera.direction,
+            np.zeros((200, 400, 3), dtype=np.uint8),
+            monotonic_at=1.0,
+        )
+
+        self.assertEqual(provider.calls, 1)
+        self.assertTrue(outcome.used_roi_fallback)
+        self.assertEqual(len(outcome.detections), 1)
+
+    def test_zero_detection_fallback_is_throttled_and_runs_again_after_interval(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        provider = RecordingOcrProvider()
+        processor = PlateRecognitionProcessor(
+            provider,
+            self.plate_service,
+            self.config,
+            detector=FakePlateDetector([]),
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        first = processor.process(
+            camera.id, camera.direction, frame, monotonic_at=1.0
+        )
+        throttled = processor.process(
+            camera.id, camera.direction, frame, monotonic_at=1.5
+        )
+        after_interval = processor.process(
+            camera.id, camera.direction, frame, monotonic_at=1.75
+        )
+
+        self.assertTrue(first.used_roi_fallback)
+        self.assertIs(throttled.state, RecognitionState.NO_OCR_TEXT)
+        self.assertFalse(throttled.used_roi_fallback)
+        self.assertTrue(after_interval.used_roi_fallback)
+        self.assertEqual(provider.calls, 2)
+
+    def test_zero_detection_fallback_throttle_is_camera_specific(self) -> None:
+        cameras = self.camera_service.list_cameras()
+        entry = next(camera for camera in cameras if camera.direction is Direction.ENTRY)
+        exit_camera = next(camera for camera in cameras if camera.direction is Direction.EXIT)
+        provider = RecordingOcrProvider()
+        processor = PlateRecognitionProcessor(
+            provider,
+            self.plate_service,
+            self.config,
+            detector=FakePlateDetector([]),
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        entry_outcome = processor.process(
+            entry.id, entry.direction, frame, monotonic_at=1.0
+        )
+        exit_outcome = processor.process(
+            exit_camera.id, exit_camera.direction, frame, monotonic_at=1.1
+        )
+        entry_throttled = processor.process(
+            entry.id, entry.direction, frame, monotonic_at=1.2
+        )
+
+        self.assertTrue(entry_outcome.used_roi_fallback)
+        self.assertTrue(exit_outcome.used_roi_fallback)
+        self.assertFalse(entry_throttled.used_roi_fallback)
+        self.assertEqual(provider.calls, 2)
+
+    def test_zero_detection_fallback_can_be_disabled(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        provider = RecordingOcrProvider()
+        config = replace(
+            self.config,
+            plate_detector=replace(
+                self.config.plate_detector,
+                zero_detection_roi_fallback_enabled=False,
+            ),
+        )
+        processor = PlateRecognitionProcessor(
+            provider,
+            self.plate_service,
+            config,
+            detector=FakePlateDetector([]),
         )
 
         outcome = processor.process(
@@ -556,6 +674,30 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(provider.calls, 0)
         self.assertIs(outcome.state, RecognitionState.NO_OCR_TEXT)
         self.assertFalse(outcome.used_roi_fallback)
+
+    def test_zero_detection_fallback_candidate_uses_standard_confirmation(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        provider = RecordingOcrProvider(confidence=0.99)
+        processor = PlateRecognitionProcessor(
+            provider,
+            self.plate_service,
+            self.config,
+            detector=FakePlateDetector([]),
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        first = processor.process(
+            camera.id, camera.direction, frame, monotonic_at=1.0
+        )
+        second = processor.process(
+            camera.id, camera.direction, frame, monotonic_at=1.75
+        )
+
+        self.assertIs(first.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertEqual((first.confirmation_count, first.confirmation_required), (1, 2))
+        self.assertIs(second.state, RecognitionState.SAVED)
+        self.assertEqual((second.confirmation_count, second.confirmation_required), (2, 2))
+        self.assertEqual(self._record_count(), 1)
 
     def test_detector_pipeline_does_not_change_database_schema(self) -> None:
         with self.database.connection() as connection:

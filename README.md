@@ -110,7 +110,7 @@ Same-camera same-plate duplicate cooldown: 120 saniye
 
 ### Dedicated plate detector (Phase 1)
 
-Detector açıkken OpenVINO modeli yalnızca yapılandırılmış ENTRY/EXIT ROI üzerinde çalışır. Yalnızca modelin `plate` sınıfı OCR'a gönderilir; `vehicle` sınıfı OCR'a gönderilmez. Detection confidence ve bbox alanına göre en iyi iki plaka crop'u seçilir. Detector kapalıysa veya initialization başarısız olup `fallback_to_roi_ocr=true` ise mevcut ROI OCR akışı korunur.
+Detector açıkken OpenVINO modeli yalnızca yapılandırılmış ENTRY/EXIT ROI üzerinde çalışır. Yalnızca modelin `plate` sınıfı OCR'a gönderilir; `vehicle` sınıfı OCR'a gönderilmez. Detection confidence ve bbox alanına göre en iyi iki plaka crop'u seçilir. Detector exception verirse `fallback_to_roi_ocr=true` ile mevcut ROI OCR akışı korunur. Detector başarıyla çalışıp hiç kullanılabilir plate crop üretmezse, kamera başına ayrı tutulan 750 ms throttle süresi dolduğunda safety fallback olarak ROI OCR bir kez denenir; aradaki recognition frame'lerinde pahalı OCR çağrısı yapılmaz.
 
 Varsayılan detector ayarları:
 
@@ -122,6 +122,8 @@ Varsayılan detector ayarları:
   "crop_padding_ratio": 0.15,
   "max_plate_candidates_per_frame": 2,
   "fallback_to_roi_ocr": true,
+  "zero_detection_roi_fallback_enabled": true,
+  "zero_detection_roi_fallback_interval_ms": 750,
   "debug_overlay": false
 }
 ```
@@ -141,7 +143,7 @@ Bu Open Model Zoo modeli MobileNetV2 + SSD tabanlı generic/pretrained bir araç
 Throttle edilmiş DEBUG diagnostic örneği:
 
 ```text
-OCR diagnostics camera_id=2 direction=EXIT roi=1280x460 detector_ms=12.0 plates=1 det_conf=0.880 plate_crops=180x52 ocr_ms=75.0 total_recognition_ms=87.0 fallback=no candidate=yes
+OCR diagnostics camera_id=2 direction=EXIT roi=1280x460 detector_ms=12.0 plates=0 det_conf=none plate_crops=1280x460 ocr_ms=75.0 total_recognition_ms=87.0 fallback=roi fallback_reason=zero-detection candidate=yes
 ```
 
 Aynı saha frame'inde detector açık/kapalı karşılaştırması:

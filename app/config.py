@@ -31,6 +31,8 @@ PLATE_DETECTOR_MODEL_NAME = "vehicle-license-plate-detection-barrier-0123"
 DEFAULT_PLATE_DETECTOR_MIN_CONFIDENCE = 0.50
 DEFAULT_PLATE_DETECTOR_CROP_PADDING_RATIO = 0.15
 DEFAULT_MAX_PLATE_CANDIDATES_PER_FRAME = 2
+DEFAULT_ZERO_DETECTION_ROI_FALLBACK_ENABLED = True
+DEFAULT_ZERO_DETECTION_ROI_FALLBACK_INTERVAL_MS = 750
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +53,12 @@ class PlateDetectorConfig:
     crop_padding_ratio: float = DEFAULT_PLATE_DETECTOR_CROP_PADDING_RATIO
     max_plate_candidates_per_frame: int = DEFAULT_MAX_PLATE_CANDIDATES_PER_FRAME
     fallback_to_roi_ocr: bool = True
+    zero_detection_roi_fallback_enabled: bool = (
+        DEFAULT_ZERO_DETECTION_ROI_FALLBACK_ENABLED
+    )
+    zero_detection_roi_fallback_interval_ms: int = (
+        DEFAULT_ZERO_DETECTION_ROI_FALLBACK_INTERVAL_MS
+    )
     debug_overlay: bool = False
     model_dir: Path = Path("models") / "plate_detector" / PLATE_DETECTOR_MODEL_NAME
 
@@ -309,6 +317,12 @@ def _load_plate_detector(
         "plate_detector.fallback_to_roi_ocr",
         warnings,
     )
+    zero_detection_fallback = _boolean_setting(
+        raw.get("zero_detection_roi_fallback_enabled"),
+        DEFAULT_ZERO_DETECTION_ROI_FALLBACK_ENABLED,
+        "plate_detector.zero_detection_roi_fallback_enabled",
+        warnings,
+    )
     debug_overlay = _boolean_setting(
         raw.get("debug_overlay"),
         False,
@@ -353,6 +367,16 @@ def _load_plate_detector(
             warnings,
         ),
         fallback_to_roi_ocr=fallback,
+        zero_detection_roi_fallback_enabled=zero_detection_fallback,
+        zero_detection_roi_fallback_interval_ms=_bounded_number(
+            raw.get("zero_detection_roi_fallback_interval_ms"),
+            DEFAULT_ZERO_DETECTION_ROI_FALLBACK_INTERVAL_MS,
+            0,
+            60_000,
+            int,
+            "plate_detector.zero_detection_roi_fallback_interval_ms",
+            warnings,
+        ),
         debug_overlay=debug_overlay,
         model_dir=(
             root / "models" / "plate_detector" / PLATE_DETECTOR_MODEL_NAME
