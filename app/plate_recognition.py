@@ -51,6 +51,11 @@ class RecognitionStatus(StrEnum):
 LOGGER = logging.getLogger(__name__)
 PLATE_PRESENCE_RELEASE_SECONDS = 15
 OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS = 5.0
+MOTION_ANALYSIS_WIDTH = 160
+MOTION_PIXEL_DIFFERENCE_THRESHOLD = 20
+MOTION_CONTINUE_THRESHOLD_RATIO = 0.60
+RECENT_PROCESSED_FRAME_ID_LIMIT = 256
+LIVE_FRAMES_PER_REPLAY_FRAME = 2
 LOW_LIGHT_THRESHOLD = 85.0
 LOW_LIGHT_GAMMA = 0.72
 OCR_VARIANT_NAMES = (
@@ -241,21 +246,23 @@ class ConfirmationTracker:
         observed_at: float,
     ) -> ConfirmationProgress:
         key = (candidate.camera_id, candidate.plate)
-        cutoff = observed_at - self.window_seconds
         observations = self._observations[key]
-        while observations and observations[0][0] < cutoff:
-            observations.popleft()
-
-        if self._confirmed_until.get(key, 0.0) >= observed_at:
+        confirmed_until = self._confirmed_until.get(key, 0.0)
+        if confirmed_until >= observed_at:
             return ConfirmationProgress(None, 0, self.required)
 
         observations.append((observed_at, candidate.confidence))
+        ordered = sorted(observations, key=lambda item: item[0])
+        newest_at = ordered[-1][0]
+        cutoff = newest_at - self.window_seconds
+        observations.clear()
+        observations.extend(item for item in ordered if item[0] >= cutoff)
         if len(observations) < self.required:
             return ConfirmationProgress(None, len(observations), self.required)
 
         confidence = sum(value for _, value in observations) / len(observations)
         observations.clear()
-        self._confirmed_until[key] = observed_at + self.window_seconds
+        self._confirmed_until[key] = newest_at + self.window_seconds
         return ConfirmationProgress(
             PlateCandidate(
                 plate=candidate.plate,
@@ -303,7 +310,7 @@ class PlatePresenceTracker:
             ):
                 self._presences[key] = _PlatePresence(last_seen=observed_at)
                 return
-            presence.last_seen = observed_at
+            presence.last_seen = max(presence.last_seen, observed_at)
 
     def claim_record(self, candidate: PlateCandidate) -> bool:
         """Atomically reserve the single record allowed for the active event."""
@@ -348,6 +355,325 @@ class RecognitionOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class FrameSnapshot:
+    frame_id: int
+    camera_id: int
+    direction: Direction
+    captured_at: datetime
+    observed_at: float
+    received_at: float
+    full_frame: np.ndarray
+    motion_score: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class MotionEvent:
+    event_id: int
+    camera_id: int
+    direction: Direction
+    started_at: float
+    ended_at: float
+    enqueued_at: float
+    frames: tuple[FrameSnapshot, ...]
+
+
+@dataclass(slots=True)
+class _ActiveMotionEvent:
+    event_id: int
+    camera_id: int
+    direction: Direction
+    started_at: float
+    last_motion_at: float
+    frames: deque[FrameSnapshot]
+
+
+class PreDetectionFrameBuffer:
+    """Thread-safe per-camera RAM ring and lightweight motion-event builder."""
+
+    def __init__(self, config: PlateRecognitionConfig) -> None:
+        self.config = config
+        self._rings: dict[int, deque[FrameSnapshot]] = defaultdict(deque)
+        self._previous_motion_frames: dict[int, np.ndarray] = {}
+        self._events: dict[int, _ActiveMotionEvent] = {}
+        self._next_event_id = 1
+        self._lock = threading.Lock()
+
+    def ingest(
+        self,
+        snapshot: FrameSnapshot,
+        *,
+        motion_score: float | None = None,
+    ) -> tuple[MotionEvent, ...]:
+        completed: list[MotionEvent] = []
+        with self._lock:
+            ring = self._rings[snapshot.camera_id]
+            if motion_score is None:
+                motion_score = self._motion_score(snapshot)
+            snapshot = FrameSnapshot(
+                frame_id=snapshot.frame_id,
+                camera_id=snapshot.camera_id,
+                direction=snapshot.direction,
+                captured_at=snapshot.captured_at,
+                observed_at=snapshot.observed_at,
+                received_at=snapshot.received_at,
+                full_frame=snapshot.full_frame,
+                motion_score=motion_score,
+            )
+            ring.append(snapshot)
+            self._trim_ring(ring, snapshot.observed_at)
+
+            active = self._events.get(snapshot.camera_id)
+            threshold = self.config.motion_changed_pixel_ratio
+            motion_active = motion_score >= (
+                threshold
+                if active is None
+                else threshold * MOTION_CONTINUE_THRESHOLD_RATIO
+            )
+            if active is None and motion_active:
+                pre_roll_cutoff = (
+                    snapshot.observed_at - self.config.motion_pre_roll_ms / 1000.0
+                )
+                pinned = deque(
+                    item for item in ring if item.observed_at >= pre_roll_cutoff
+                )
+                active = _ActiveMotionEvent(
+                    event_id=self._next_event_id,
+                    camera_id=snapshot.camera_id,
+                    direction=snapshot.direction,
+                    started_at=snapshot.observed_at,
+                    last_motion_at=snapshot.observed_at,
+                    frames=pinned,
+                )
+                self._next_event_id += 1
+                self._events[snapshot.camera_id] = active
+                LOGGER.debug(
+                    "Motion started camera_id=%s event_id=%s pre_roll_frames=%s",
+                    snapshot.camera_id,
+                    active.event_id,
+                    len(pinned),
+                )
+            elif active is not None:
+                if not active.frames or active.frames[-1].frame_id != snapshot.frame_id:
+                    active.frames.append(snapshot)
+                if motion_active:
+                    active.last_motion_at = snapshot.observed_at
+
+            if active is not None:
+                maximum_event_frames = (
+                    self.config.pre_detection_buffer_max_frames_per_camera
+                )
+                while len(active.frames) > maximum_event_frames:
+                    active.frames.popleft()
+                quiet_seconds = max(
+                    self.config.motion_quiet_ms,
+                    self.config.motion_post_roll_ms,
+                ) / 1000.0
+                maximum_seconds = self.config.motion_event_max_duration_ms / 1000.0
+                quiet_complete = (
+                    not motion_active
+                    and snapshot.observed_at - active.last_motion_at >= quiet_seconds
+                )
+                duration_complete = (
+                    snapshot.observed_at - active.started_at >= maximum_seconds
+                )
+                if quiet_complete or duration_complete:
+                    completed.append(self._finish_event(active, snapshot.observed_at))
+                    self._events.pop(snapshot.camera_id, None)
+        return tuple(completed)
+
+    def snapshots(self, camera_id: int) -> tuple[FrameSnapshot, ...]:
+        with self._lock:
+            return tuple(self._rings.get(camera_id, ()))
+
+    def ring_depth(self, camera_id: int) -> int:
+        with self._lock:
+            return len(self._rings.get(camera_id, ()))
+
+    def clear(self) -> None:
+        with self._lock:
+            self._rings.clear()
+            self._previous_motion_frames.clear()
+            self._events.clear()
+
+    def _motion_score(self, snapshot: FrameSnapshot) -> float:
+        roi_crop = crop_roi(snapshot.full_frame, self.config.roi_for(snapshot.direction))
+        if roi_crop is None:
+            return 0.0
+        gray = cv2.cvtColor(roi_crop, cv2.COLOR_BGR2GRAY)
+        scale = min(1.0, MOTION_ANALYSIS_WIDTH / max(1, gray.shape[1]))
+        if scale < 1.0:
+            gray = cv2.resize(
+                gray,
+                (MOTION_ANALYSIS_WIDTH, max(1, round(gray.shape[0] * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        previous = self._previous_motion_frames.get(snapshot.camera_id)
+        self._previous_motion_frames[snapshot.camera_id] = gray
+        if previous is None or previous.shape != gray.shape:
+            return 0.0
+        changed = cv2.absdiff(previous, gray) >= MOTION_PIXEL_DIFFERENCE_THRESHOLD
+        return float(np.count_nonzero(changed) / changed.size)
+
+    def _trim_ring(self, ring: deque[FrameSnapshot], now: float) -> None:
+        cutoff = now - self.config.pre_detection_buffer_duration_ms / 1000.0
+        while ring and ring[0].observed_at < cutoff:
+            ring.popleft()
+        while len(ring) > self.config.pre_detection_buffer_max_frames_per_camera:
+            ring.popleft()
+
+    @staticmethod
+    def _finish_event(active: _ActiveMotionEvent, ended_at: float) -> MotionEvent:
+        event = MotionEvent(
+            event_id=active.event_id,
+            camera_id=active.camera_id,
+            direction=active.direction,
+            started_at=active.started_at,
+            ended_at=ended_at,
+            enqueued_at=time.monotonic(),
+            frames=tuple(active.frames),
+        )
+        LOGGER.debug(
+            "Motion ended camera_id=%s event_id=%s duration_ms=%.1f frames=%s",
+            event.camera_id,
+            event.event_id,
+            (event.ended_at - event.started_at) * 1000.0,
+            len(event.frames),
+        )
+        return event
+
+
+def select_replay_frames(
+    frames: Sequence[FrameSnapshot],
+    maximum: int,
+    roi_for: Callable[[Direction], NormalizedRoi],
+) -> tuple[FrameSnapshot, ...]:
+    """Select a sharp frame from each temporal bin for broad event coverage."""
+    if maximum <= 0 or not frames:
+        return ()
+    ordered = sorted(frames, key=lambda item: (item.observed_at, item.frame_id))
+    if len(ordered) <= maximum:
+        return tuple(ordered)
+    selected: list[FrameSnapshot] = []
+    for bin_index in range(maximum):
+        start = bin_index * len(ordered) // maximum
+        end = (bin_index + 1) * len(ordered) // maximum
+        bucket = ordered[start:max(start + 1, end)]
+        selected.append(
+            max(
+                bucket,
+                key=lambda item: _snapshot_roi_sharpness(item, roi_for),
+            )
+        )
+    return tuple(sorted(selected, key=lambda item: item.observed_at))
+
+
+def _snapshot_roi_sharpness(
+    snapshot: FrameSnapshot,
+    roi_for: Callable[[Direction], NormalizedRoi],
+) -> float:
+    crop = crop_roi(snapshot.full_frame, roi_for(snapshot.direction))
+    if crop is None:
+        return 0.0
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+@dataclass(slots=True)
+class _ReplayEventWork:
+    event: MotionEvent
+    remaining: deque[FrameSnapshot]
+
+
+class ReplayEventBuffer:
+    """Camera-fair bounded queue of temporally selected historical snapshots."""
+
+    def __init__(self, config: PlateRecognitionConfig) -> None:
+        self.config = config
+        self._events: dict[int, deque[_ReplayEventWork]] = defaultdict(deque)
+        self._camera_order: deque[int] = deque()
+        self._known_camera_ids: set[int] = set()
+        self._lock = threading.Lock()
+        self.dropped_count = 0
+        self.stale_count = 0
+
+    def add(self, event: MotionEvent) -> bool:
+        selected = select_replay_frames(
+            event.frames,
+            self.config.max_replay_frames_per_event,
+            self.config.roi_for,
+        )
+        if not selected:
+            return False
+        queued_event = MotionEvent(
+            event_id=event.event_id,
+            camera_id=event.camera_id,
+            direction=event.direction,
+            started_at=event.started_at,
+            ended_at=event.ended_at,
+            enqueued_at=event.enqueued_at,
+            frames=selected,
+        )
+        with self._lock:
+            if event.camera_id not in self._known_camera_ids:
+                self._known_camera_ids.add(event.camera_id)
+                self._camera_order.append(event.camera_id)
+            camera_events = self._events[event.camera_id]
+            if len(camera_events) >= self.config.max_pending_replay_events_per_camera:
+                camera_events.popleft()
+                self.dropped_count += 1
+            camera_events.append(_ReplayEventWork(queued_event, deque(selected)))
+            depth = len(camera_events)
+        LOGGER.debug(
+            "Replay event queued camera_id=%s event_id=%s event_frames=%s "
+            "selected_frames=%s queue_depth=%s",
+            event.camera_id,
+            event.event_id,
+            len(event.frames),
+            len(selected),
+            depth,
+        )
+        return True
+
+    def take(self, now: float | None = None) -> FrameSnapshot | None:
+        now = time.monotonic() if now is None else now
+        maximum_age = self.config.replay_event_max_age_ms / 1000.0
+        with self._lock:
+            for _ in range(len(self._camera_order)):
+                camera_id = self._camera_order.popleft()
+                self._camera_order.append(camera_id)
+                camera_events = self._events[camera_id]
+                while camera_events and now - camera_events[0].event.enqueued_at > maximum_age:
+                    stale = camera_events.popleft()
+                    self.stale_count += 1
+                    LOGGER.debug(
+                        "Replay event dropped camera_id=%s event_id=%s reason=stale",
+                        camera_id,
+                        stale.event.event_id,
+                    )
+                if not camera_events:
+                    continue
+                work = camera_events[0]
+                snapshot = work.remaining.popleft()
+                if not work.remaining:
+                    camera_events.popleft()
+                return snapshot
+        return None
+
+    def pending_event_count(self, camera_id: int | None = None) -> int:
+        with self._lock:
+            if camera_id is not None:
+                return len(self._events.get(camera_id, ()))
+            return sum(len(items) for items in self._events.values())
+
+    def clear(self) -> None:
+        with self._lock:
+            self._events.clear()
+            self._camera_order.clear()
+            self._known_camera_ids.clear()
+
+
+@dataclass(frozen=True, slots=True)
 class OcrJob:
     """A bounded, in-memory OCR observation tied to its original camera frame."""
 
@@ -365,6 +691,8 @@ class OcrJob:
     fallback_reason: str | None
     detector_ms: float
     quality_score: float
+    frame_id: int | None = None
+    detector_source: str = "live"
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,7 +782,7 @@ class OcrJobBuffer:
                     camera_jobs = self._jobs[camera_id]
                     while (
                         camera_jobs
-                        and now - camera_jobs[0].observed_at > self.max_age_seconds
+                        and now - camera_jobs[0].queued_at > self.max_age_seconds
                     ):
                         camera_jobs.popleft()
                         self.stale_count += 1
@@ -504,6 +832,9 @@ class PlateDetectionProcessor:
         captured_at: datetime,
         observed_at: float,
         received_at: float,
+        frame_id: int | None = None,
+        detector_source: str = "live",
+        allow_zero_detection_fallback: bool = True,
     ) -> DetectionJobResult:
         roi_crop = crop_roi(frame, self.config.roi_for(direction))
         if roi_crop is None:
@@ -549,11 +880,15 @@ class PlateDetectionProcessor:
                     )
                     is not None
                 ]
-                if not ocr_crops and self._should_run_zero_detection_fallback(
+                if (
+                    not ocr_crops
+                    and allow_zero_detection_fallback
+                    and self._should_run_zero_detection_fallback(
                     camera_id,
                     observed_at,
                     detector_config.zero_detection_roi_fallback_enabled,
                     detector_config.zero_detection_roi_fallback_interval_ms,
+                    )
                 ):
                     used_roi_fallback = True
                     fallback_reason = "zero-detection"
@@ -607,6 +942,8 @@ class PlateDetectionProcessor:
             fallback_reason=fallback_reason,
             detector_ms=detector_ms,
             quality_score=ocr_job_quality_score(ocr_crops, selected),
+            frame_id=frame_id,
+            detector_source=detector_source,
         )
         return DetectionJobResult(
             job,
@@ -679,6 +1016,8 @@ class PlateRecognitionProcessor:
         self._last_pipeline_state: dict[int, tuple[RecognitionState, str | None]] = {}
         self._last_detector_error_logged_at: dict[int, float] = {}
         self._last_zero_detection_fallback_at: dict[int, float] = {}
+        self._observation_frame_ids: dict[int, deque[int]] = defaultdict(deque)
+        self._observation_frame_id_sets: dict[int, set[int]] = defaultdict(set)
 
     def process(
         self,
@@ -834,6 +1173,7 @@ class PlateRecognitionProcessor:
             ),
             detected_at=detected_at,
             full_frame=frame,
+            frame_id=None,
             **detection_context,
         )
 
@@ -874,6 +1214,7 @@ class PlateRecognitionProcessor:
             full_frame=job.full_frame,
             detections=job.detections,
             used_roi_fallback=job.used_roi_fallback,
+            frame_id=job.frame_id,
         )
 
     def _complete_observation(
@@ -887,6 +1228,7 @@ class PlateRecognitionProcessor:
         full_frame: object,
         detections: tuple[PlateDetection, ...],
         used_roi_fallback: bool,
+        frame_id: int | None,
     ) -> RecognitionOutcome:
         detection_context = {
             "detections": detections,
@@ -909,6 +1251,22 @@ class PlateRecognitionProcessor:
                 camera_id,
                 RecognitionState.LOW_CONFIDENCE,
                 candidate=candidate,
+                **detection_context,
+            )
+
+        if frame_id is not None and not self._claim_observation_frame(
+            camera_id, frame_id
+        ):
+            LOGGER.debug(
+                "Duplicate OCR observation skipped camera_id=%s frame_id=%s",
+                camera_id,
+                frame_id,
+            )
+            return self._outcome(
+                camera_id,
+                RecognitionState.DUPLICATE_SUPPRESSED,
+                candidate=candidate,
+                duplicate=True,
                 **detection_context,
             )
 
@@ -966,6 +1324,17 @@ class PlateRecognitionProcessor:
             confirmation_required=progress.required_count,
             **detection_context,
         )
+
+    def _claim_observation_frame(self, camera_id: int, frame_id: int) -> bool:
+        recent_set = self._observation_frame_id_sets[camera_id]
+        if frame_id in recent_set:
+            return False
+        recent = self._observation_frame_ids[camera_id]
+        recent.append(frame_id)
+        recent_set.add(frame_id)
+        while len(recent) > RECENT_PROCESSED_FRAME_ID_LIMIT:
+            recent_set.discard(recent.popleft())
+        return True
 
     def _outcome(
         self,
@@ -1198,6 +1567,7 @@ class _PendingFrame:
     received_at: float
     observed_at: float
     captured_at: datetime
+    frame_id: int = 0
 
 
 class PlateOcrWorker:
@@ -1313,26 +1683,54 @@ class PlateRecognitionWorker(QObject):
         self._camera_order: deque[int] = deque()
         self._known_camera_ids: set[int] = set()
         self._last_detection_diagnostic_at: dict[int, float] = {}
+        self._last_ring_diagnostic_at: dict[int, float] = {}
+        self._next_frame_id = 1
         self._job_buffer = OcrJobBuffer(
             config.max_pending_ocr_jobs_per_camera,
             config.ocr_job_max_age_ms,
         )
+        self._frame_buffer = PreDetectionFrameBuffer(config)
+        self._replay_buffer = ReplayEventBuffer(config)
+        self._processed_frame_ids: dict[int, deque[int]] = defaultdict(deque)
+        self._processed_frame_id_sets: dict[int, set[int]] = defaultdict(set)
+        self._live_frames_since_replay = 0
         self._ocr_worker: PlateOcrWorker | None = None
         self._ocr_thread: threading.Thread | None = None
 
     def submit_frame(self, camera_id: int, direction: Direction, frame: object) -> None:
+        observed_at = time.monotonic()
+        captured_at = datetime.now(timezone.utc)
+        with self._lock:
+            frame_id = self._next_frame_id
+            self._next_frame_id += 1
+        owned_frame = frame.copy() if isinstance(frame, np.ndarray) else frame
+        if isinstance(owned_frame, np.ndarray):
+            owned_frame.setflags(write=False)
+            snapshot = FrameSnapshot(
+                frame_id=frame_id,
+                camera_id=camera_id,
+                direction=direction,
+                captured_at=captured_at,
+                observed_at=observed_at,
+                received_at=observed_at,
+                full_frame=owned_frame,
+            )
+            for event in self._frame_buffer.ingest(snapshot):
+                self._replay_buffer.add(event)
+            self._log_ring_diagnostics(camera_id, observed_at)
+        item = _PendingFrame(
+            direction=direction,
+            frame=owned_frame,
+            received_at=observed_at,
+            observed_at=observed_at,
+            captured_at=captured_at,
+            frame_id=frame_id,
+        )
         with self._lock:
             if camera_id not in self._known_camera_ids:
                 self._known_camera_ids.add(camera_id)
                 self._camera_order.append(camera_id)
-            observed_at = time.monotonic()
-            self._latest_frames[camera_id] = _PendingFrame(
-                direction=direction,
-                frame=frame,
-                received_at=observed_at,
-                observed_at=observed_at,
-                captured_at=datetime.now(timezone.utc),
-            )
+            self._latest_frames[camera_id] = item
         self._wake_event.set()
 
     @property
@@ -1405,12 +1803,24 @@ class PlateRecognitionWorker(QObject):
                 if ocr_worker.failed.is_set():
                     self._stop_event.wait(0.05)
                     continue
-                pending = self._take_due_frame()
+                pending = self._take_detector_frame(
+                    replay_enabled=(
+                        detector is not None and self.config.plate_detector.enabled
+                    )
+                )
                 if pending is None:
                     self._wake_event.wait(0.05)
                     self._wake_event.clear()
                     continue
-                camera_id, item = pending
+                source, camera_id, item = pending
+                if not self._claim_detector_frame(camera_id, item.frame_id):
+                    LOGGER.debug(
+                        "Duplicate detector frame skipped camera_id=%s frame_id=%s source=%s",
+                        camera_id,
+                        item.frame_id,
+                        source,
+                    )
+                    continue
                 try:
                     result = detector_processor.prepare_job(
                         camera_id,
@@ -1419,6 +1829,9 @@ class PlateRecognitionWorker(QObject):
                         captured_at=item.captured_at,
                         observed_at=item.observed_at,
                         received_at=item.received_at,
+                        frame_id=item.frame_id,
+                        detector_source=source,
+                        allow_zero_detection_fallback=(source == "live"),
                     )
                 except Exception as exc:
                     LOGGER.exception("Transient plate detector error")
@@ -1427,19 +1840,23 @@ class PlateRecognitionWorker(QObject):
                         f"Plate detector hatası: {exc}",
                     )
                     continue
-                self.detections_changed.emit(camera_id, result.detections)
+                if source == "live":
+                    self.detections_changed.emit(camera_id, result.detections)
                 if result.job is None:
-                    self.outcome_changed.emit(
-                        camera_id,
-                        RecognitionOutcome(
-                            candidate=None,
-                            record=None,
-                            state=RecognitionState.NO_OCR_TEXT,
-                            detections=result.detections,
-                            used_roi_fallback=result.used_roi_fallback,
-                        ),
+                    if source == "live":
+                        self.outcome_changed.emit(
+                            camera_id,
+                            RecognitionOutcome(
+                                candidate=None,
+                                record=None,
+                                state=RecognitionState.NO_OCR_TEXT,
+                                detections=result.detections,
+                                used_roi_fallback=result.used_roi_fallback,
+                            ),
+                        )
+                    self._log_detection_diagnostics(
+                        camera_id, item, result, None, source
                     )
-                    self._log_detection_diagnostics(camera_id, item, result, None)
                     continue
                 buffer_result = self._job_buffer.add(result.job)
                 self._log_detection_diagnostics(
@@ -1447,16 +1864,21 @@ class PlateRecognitionWorker(QObject):
                     item,
                     result,
                     buffer_result,
+                    source,
                 )
         finally:
             self._stop_event.set()
             self._job_buffer.clear()
             self._job_buffer.wake_all()
+            self._frame_buffer.clear()
+            self._replay_buffer.clear()
             ocr_thread.join()
             with self._lock:
                 self._latest_frames.clear()
                 self._camera_order.clear()
                 self._known_camera_ids.clear()
+                self._processed_frame_ids.clear()
+                self._processed_frame_id_sets.clear()
             self.status_changed.emit(RecognitionStatus.STOPPED, "OCR durduruldu.")
             self.finished.emit()
 
@@ -1473,6 +1895,7 @@ class PlateRecognitionWorker(QObject):
         item: _PendingFrame,
         result: DetectionJobResult,
         buffer_result: OcrBufferAddResult | None,
+        source: str = "live",
     ) -> None:
         if not LOGGER.isEnabledFor(logging.DEBUG):
             return
@@ -1488,7 +1911,8 @@ class PlateRecognitionWorker(QObject):
             "Detector worker diagnostics camera_id=%s direction=%s detector_ms=%.1f "
             "detector_frame_age_ms=%.1f detections=%s ocr_queue_depth=%s "
             "camera_queue_depth=%s dropped=%s replaced=%s stale_total=%s "
-            "fallback_reason=%s",
+            "fallback_reason=%s source=%s frame_id=%s original_frame_age_ms=%.1f "
+            "replay_queue_depth=%s",
             camera_id,
             item.direction.value,
             result.detector_ms,
@@ -1500,7 +1924,95 @@ class PlateRecognitionWorker(QObject):
             self._job_buffer.replaced_count,
             self._job_buffer.stale_count,
             result.fallback_reason or "none",
+            source,
+            item.frame_id,
+            max(0.0, (now - item.observed_at) * 1000.0),
+            self._replay_buffer.pending_event_count(),
         )
+
+    def _log_ring_diagnostics(self, camera_id: int, now: float) -> None:
+        if not LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        last_logged_at = self._last_ring_diagnostic_at.get(camera_id)
+        if (
+            last_logged_at is not None
+            and now - last_logged_at < OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._last_ring_diagnostic_at[camera_id] = now
+        snapshots = self._frame_buffer.snapshots(camera_id)
+        oldest_age_ms = (
+            0.0
+            if not snapshots
+            else max(0.0, (now - snapshots[0].observed_at) * 1000.0)
+        )
+        newest_age_ms = (
+            0.0
+            if not snapshots
+            else max(0.0, (now - snapshots[-1].observed_at) * 1000.0)
+        )
+        LOGGER.debug(
+            "Pre-detection ring camera_id=%s depth=%s oldest_age_ms=%.1f "
+            "newest_age_ms=%.1f replay_queue_depth=%s",
+            camera_id,
+            len(snapshots),
+            oldest_age_ms,
+            newest_age_ms,
+            self._replay_buffer.pending_event_count(camera_id),
+        )
+
+    def _take_detector_frame(
+        self,
+        *,
+        replay_enabled: bool,
+    ) -> tuple[str, int, _PendingFrame] | None:
+        if (
+            replay_enabled
+            and self._live_frames_since_replay >= LIVE_FRAMES_PER_REPLAY_FRAME
+        ):
+            replay = self._take_replay_frame()
+            if replay is not None:
+                self._live_frames_since_replay = 0
+                return replay
+        live = self._take_due_frame()
+        if live is not None:
+            self._live_frames_since_replay += 1
+            camera_id, item = live
+            return "live", camera_id, item
+        if replay_enabled:
+            replay = self._take_replay_frame()
+            if replay is not None:
+                self._live_frames_since_replay = 0
+                return replay
+        return None
+
+    def _take_replay_frame(self) -> tuple[str, int, _PendingFrame] | None:
+        snapshot = self._replay_buffer.take()
+        if snapshot is None:
+            return None
+        return (
+            "replay",
+            snapshot.camera_id,
+            _PendingFrame(
+                direction=snapshot.direction,
+                frame=snapshot.full_frame,
+                received_at=snapshot.received_at,
+                observed_at=snapshot.observed_at,
+                captured_at=snapshot.captured_at,
+                frame_id=snapshot.frame_id,
+            ),
+        )
+
+    def _claim_detector_frame(self, camera_id: int, frame_id: int) -> bool:
+        recent_set = self._processed_frame_id_sets[camera_id]
+        if frame_id in recent_set:
+            return False
+        recent = self._processed_frame_ids[camera_id]
+        recent.append(frame_id)
+        recent_set.add(frame_id)
+        while len(recent) > RECENT_PROCESSED_FRAME_ID_LIMIT:
+            recent_set.discard(recent.popleft())
+        return True
 
     def _take_due_frame(self) -> tuple[int, _PendingFrame] | None:
         interval = self.config.recognition_interval_ms / 1000.0

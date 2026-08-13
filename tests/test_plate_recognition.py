@@ -26,17 +26,21 @@ from app.plate_capture import PlateCaptureService
 from app.plate_detector import PlateDetection, PlateDetectorError
 from app.plate_recognition import (
     ConfirmationTracker,
+    FrameSnapshot,
     LOW_LIGHT_THRESHOLD,
+    MotionEvent,
     OcrModelNotFound,
     OcrSegment,
     OcrJob,
     OcrJobBuffer,
+    PreDetectionFrameBuffer,
     PaddleOcrProvider,
     PlateCandidate,
     PlateDetectionProcessor,
     PlatePresenceTracker,
     PlateRecognitionProcessor,
     PlateRecognitionWorker,
+    ReplayEventBuffer,
     RecognitionState,
     TurkishPlateValidator,
     correct_plate_candidate,
@@ -44,8 +48,10 @@ from app.plate_recognition import (
     crop_roi,
     preprocess_variants,
     roi_mean_brightness,
+    select_replay_frames,
     select_best_candidate,
     RecognitionStatus,
+    _PendingFrame,
 )
 from app.ocr_models import OcrModelInvalid, OcrModelNotFound as ModelNotFound, validate_model_directory
 from app.ocr_debug import save_debug_images
@@ -324,6 +330,8 @@ class RecognitionPipelineTests(unittest.TestCase):
         quality_score: float = 1.0,
         frame_value: int = 0,
         fallback_reason: str | None = None,
+        frame_id: int | None = None,
+        queued_at: float | None = None,
     ) -> OcrJob:
         now = time.monotonic() if observed_at is None else observed_at
         frame = np.full((200, 400, 3), frame_value, dtype=np.uint8)
@@ -334,7 +342,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             captured_at=datetime(2026, 8, 13, 9, 0, tzinfo=timezone.utc),
             observed_at=now,
             received_at=now,
-            queued_at=time.monotonic(),
+            queued_at=time.monotonic() if queued_at is None else queued_at,
             full_frame=frame,
             roi_crop=crop,
             ocr_crops=(crop.copy(),),
@@ -343,6 +351,27 @@ class RecognitionPipelineTests(unittest.TestCase):
             fallback_reason=fallback_reason,
             detector_ms=12.0,
             quality_score=quality_score,
+            frame_id=frame_id,
+        )
+
+    def _make_snapshot(
+        self,
+        frame_id: int,
+        observed_at: float,
+        *,
+        camera_id: int = 1,
+        value: int = 0,
+    ) -> FrameSnapshot:
+        frame = np.full((200, 400, 3), value, dtype=np.uint8)
+        return FrameSnapshot(
+            frame_id=frame_id,
+            camera_id=camera_id,
+            direction=Direction.ENTRY if camera_id == 1 else Direction.EXIT,
+            captured_at=datetime(2026, 8, 13, tzinfo=timezone.utc)
+            + timedelta(seconds=observed_at),
+            observed_at=observed_at,
+            received_at=observed_at,
+            full_frame=frame,
         )
 
     def test_processor_saves_only_after_confirmation(self) -> None:
@@ -1104,6 +1133,206 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual((first_camera_id, second_camera_id), (10, 20))
         self.assertEqual(worker.pending_frame_count, 1)
 
+    def test_pre_detection_ring_is_bounded_by_count_duration_and_camera(self) -> None:
+        config = replace(
+            self.config,
+            pre_detection_buffer_duration_ms=500,
+            pre_detection_buffer_max_frames_per_camera=3,
+        )
+        buffer = PreDetectionFrameBuffer(config)
+        for frame_id, observed_at in enumerate((0.0, 0.2, 0.4, 0.6), start=1):
+            buffer.ingest(
+                self._make_snapshot(frame_id, observed_at), motion_score=0.0
+            )
+        buffer.ingest(
+            self._make_snapshot(20, 0.6, camera_id=2), motion_score=0.0
+        )
+
+        self.assertEqual(
+            [item.frame_id for item in buffer.snapshots(1)], [2, 3, 4]
+        )
+        self.assertEqual([item.frame_id for item in buffer.snapshots(2)], [20])
+
+    def test_motion_event_pins_pre_and_post_roll_and_closes_after_quiet(self) -> None:
+        config = replace(
+            self.config,
+            motion_pre_roll_ms=500,
+            motion_post_roll_ms=300,
+            motion_quiet_ms=200,
+            motion_event_max_duration_ms=4_000,
+        )
+        buffer = PreDetectionFrameBuffer(config)
+        sequence = (
+            (1, 0.0, 0.0),
+            (2, 0.2, 0.0),
+            (3, 0.4, 0.1),
+            (4, 0.5, 0.0),
+            (5, 0.65, 0.1),
+            (6, 0.8, 0.0),
+            (7, 1.0, 0.0),
+        )
+        completed: tuple[MotionEvent, ...] = ()
+        for frame_id, observed_at, motion_score in sequence:
+            completed = buffer.ingest(
+                self._make_snapshot(frame_id, observed_at),
+                motion_score=motion_score,
+            )
+
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(
+            [item.frame_id for item in completed[0].frames],
+            [1, 2, 3, 4, 5, 6, 7],
+        )
+
+    def test_static_frames_do_not_create_motion_event(self) -> None:
+        buffer = PreDetectionFrameBuffer(self.config)
+        completed = ()
+        for frame_id in range(1, 8):
+            completed = buffer.ingest(
+                self._make_snapshot(frame_id, frame_id * 0.1, value=40)
+            )
+
+        self.assertEqual(completed, ())
+        self.assertEqual(buffer.ring_depth(1), 7)
+
+    def test_replay_selection_is_temporally_distributed_and_bounded(self) -> None:
+        frames = tuple(
+            self._make_snapshot(index, index * 0.1, value=index)
+            for index in range(1, 21)
+        )
+
+        selected = select_replay_frames(frames, 4, self.config.roi_for)
+
+        self.assertEqual(len(selected), 4)
+        selected_ids = [item.frame_id for item in selected]
+        self.assertTrue(1 <= selected_ids[0] <= 5)
+        self.assertTrue(6 <= selected_ids[1] <= 10)
+        self.assertTrue(11 <= selected_ids[2] <= 15)
+        self.assertTrue(16 <= selected_ids[3] <= 20)
+
+    def test_replay_event_queue_is_bounded_stale_and_camera_fair(self) -> None:
+        config = replace(
+            self.config,
+            max_pending_replay_events_per_camera=2,
+            max_replay_frames_per_event=2,
+            replay_event_max_age_ms=1_000,
+        )
+        buffer = ReplayEventBuffer(config)
+
+        def event(event_id: int, camera_id: int, enqueued_at: float) -> MotionEvent:
+            frames = (
+                self._make_snapshot(event_id * 10, 1.0, camera_id=camera_id),
+                self._make_snapshot(event_id * 10 + 1, 1.1, camera_id=camera_id),
+            )
+            return MotionEvent(
+                event_id=event_id,
+                camera_id=camera_id,
+                direction=frames[0].direction,
+                started_at=1.0,
+                ended_at=1.1,
+                enqueued_at=enqueued_at,
+                frames=frames,
+            )
+
+        buffer.add(event(1, 1, 10.0))
+        buffer.add(event(2, 1, 10.0))
+        buffer.add(event(3, 1, 10.0))
+        buffer.add(event(4, 2, 10.0))
+
+        self.assertEqual(buffer.pending_event_count(1), 2)
+        self.assertEqual(buffer.dropped_count, 1)
+        self.assertEqual(
+            (buffer.take(now=10.1).camera_id, buffer.take(now=10.1).camera_id),
+            (1, 2),
+        )
+        stale = ReplayEventBuffer(config)
+        stale.add(event(5, 1, 5.0))
+        self.assertIsNone(stale.take(now=10.0))
+        self.assertEqual(stale.stale_count, 1)
+
+    def test_detector_scheduler_balances_two_live_frames_with_one_replay(self) -> None:
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        event = MotionEvent(
+            event_id=1,
+            camera_id=1,
+            direction=Direction.ENTRY,
+            started_at=1.0,
+            ended_at=1.1,
+            enqueued_at=time.monotonic(),
+            frames=(self._make_snapshot(99, 1.0),),
+        )
+        worker._replay_buffer.add(event)
+        live_one = self._make_snapshot(1, 10.0)
+        live_two = self._make_snapshot(2, 10.3)
+        with worker._lock:
+            worker._known_camera_ids.add(1)
+            worker._camera_order.append(1)
+            worker._latest_frames[1] = _PendingFrame(
+                live_one.direction,
+                live_one.full_frame,
+                live_one.received_at,
+                live_one.observed_at,
+                live_one.captured_at,
+                live_one.frame_id,
+            )
+        with patch("app.plate_recognition.time.monotonic", return_value=10.0):
+            first = worker._take_detector_frame(replay_enabled=True)
+        with worker._lock:
+            worker._latest_frames[1] = _PendingFrame(
+                live_two.direction,
+                live_two.full_frame,
+                live_two.received_at,
+                live_two.observed_at,
+                live_two.captured_at,
+                live_two.frame_id,
+            )
+        with patch("app.plate_recognition.time.monotonic", return_value=10.3):
+            second = worker._take_detector_frame(replay_enabled=True)
+            third = worker._take_detector_frame(replay_enabled=True)
+
+        self.assertEqual((first[0], second[0], third[0]), ("live", "live", "replay"))
+
+    def test_historical_replay_detections_are_not_emitted_to_live_overlay(self) -> None:
+        detector = FakePlateDetector(
+            [PlateDetection(0.9, x=20, y=10, width=100, height=30)]
+        )
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+            detector_factory=lambda: detector,
+        )
+        event = MotionEvent(
+            event_id=1,
+            camera_id=1,
+            direction=Direction.ENTRY,
+            started_at=1.0,
+            ended_at=1.1,
+            enqueued_at=time.monotonic(),
+            frames=(self._make_snapshot(501, 1.0),),
+        )
+        worker._replay_buffer.add(event)
+        overlay_updates: list[object] = []
+        worker.detections_changed.connect(
+            lambda _camera_id, detections: overlay_updates.append(detections),
+            Qt.ConnectionType.DirectConnection,
+        )
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        deadline = time.monotonic() + 1.0
+        while detector.calls < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        worker.request_stop()
+        thread.join(2.0)
+
+        self.assertEqual(detector.calls, 1)
+        self.assertEqual(overlay_updates, [])
+        self.assertFalse(thread.is_alive())
+
     def test_detector_continues_while_ocr_provider_is_blocked(self) -> None:
         started = threading.Event()
         release = threading.Event()
@@ -1135,6 +1364,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             worker._job_buffer.pending_count(1),
             config.max_pending_ocr_jobs_per_camera,
         )
+        self.assertGreaterEqual(worker._frame_buffer.ring_depth(1), 4)
         release.set()
         worker.request_stop()
         thread.join(2.0)
@@ -1158,11 +1388,25 @@ class RecognitionPipelineTests(unittest.TestCase):
     def test_ocr_job_buffer_discards_stale_jobs(self) -> None:
         buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=100)
         buffer.add(
-            self._make_ocr_job(observed_at=time.monotonic() - 1.0)
+            self._make_ocr_job(
+                observed_at=time.monotonic() - 3.0,
+                queued_at=time.monotonic() - 1.0,
+            )
         )
 
         self.assertIsNone(buffer.take())
         self.assertEqual(buffer.stale_count, 1)
+
+    def test_historical_ocr_job_is_not_stale_when_recently_queued(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        job = self._make_ocr_job(
+            observed_at=time.monotonic() - 3.0,
+            queued_at=time.monotonic(),
+        )
+        buffer.add(job)
+
+        self.assertIs(buffer.take(), job)
+        self.assertEqual(buffer.stale_count, 0)
 
     def test_ocr_job_buffer_round_robin_prevents_camera_starvation(self) -> None:
         buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
@@ -1241,6 +1485,25 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertTrue(result.job.used_roi_fallback)
         self.assertEqual(result.job.ocr_crops[0].shape, result.job.roi_crop.shape)
 
+    def test_replay_zero_detection_does_not_queue_roi_fallback(self) -> None:
+        processor = PlateDetectionProcessor(self.config, FakePlateDetector([]))
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        result = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=datetime(2026, 8, 13, tzinfo=timezone.utc),
+            observed_at=10.0,
+            received_at=10.0,
+            frame_id=44,
+            detector_source="replay",
+            allow_zero_detection_fallback=False,
+        )
+
+        self.assertIsNone(result.job)
+        self.assertFalse(result.used_roi_fallback)
+
     def test_queued_observations_use_frame_time_and_matching_full_frame(self) -> None:
         processor = PlateRecognitionProcessor(
             FakeOcrProvider(confidence=0.97),
@@ -1277,6 +1540,98 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         self.assertIs(outcome.state, RecognitionState.AWAITING_CONFIRMATION)
         self.assertIsNone(outcome.record)
+
+    def test_same_frame_live_and_replay_does_not_confirm_twice(self) -> None:
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.97), self.plate_service, self.config
+        )
+        live = self._make_ocr_job(observed_at=10.0, frame_id=77)
+        replay = replace(live, queued_at=time.monotonic(), detector_source="replay")
+
+        first = processor.process_ocr_job(live, queue_depth=1)
+        duplicate = processor.process_ocr_job(replay, queue_depth=0)
+
+        self.assertIs(first.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertIs(duplicate.state, RecognitionState.DUPLICATE_SUPPRESSED)
+        self.assertIsNone(duplicate.record)
+        self.assertEqual(self._record_count(), 0)
+
+    def test_two_distinct_historical_frames_confirm_and_save_second_frame(self) -> None:
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.97), self.plate_service, self.config
+        )
+        first = self._make_ocr_job(
+            observed_at=10.0, frame_value=31, frame_id=101
+        )
+        second = self._make_ocr_job(
+            observed_at=10.2, frame_value=63, frame_id=102
+        )
+
+        awaiting = processor.process_ocr_job(first, queue_depth=1)
+        saved = processor.process_ocr_job(second, queue_depth=0)
+
+        self.assertEqual((awaiting.confirmation_count, saved.confirmation_count), (1, 2))
+        self.assertIs(saved.state, RecognitionState.SAVED)
+        saved_image = cv2.imread(
+            str(self.capture_service.resolve_reference(saved.record.image_path))
+        )
+        self.assertAlmostEqual(float(saved_image.mean()), 63.0, delta=3.0)
+
+    def test_out_of_order_replay_uses_original_observation_times(self) -> None:
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.97), self.plate_service, self.config
+        )
+        newer = self._make_ocr_job(observed_at=10.2, frame_id=202)
+        older = self._make_ocr_job(observed_at=10.0, frame_id=201)
+
+        processor.process_ocr_job(newer, queue_depth=1)
+        saved = processor.process_ocr_job(older, queue_depth=0)
+
+        self.assertIs(saved.state, RecognitionState.SAVED)
+        self.assertEqual(datetime.fromisoformat(saved.record.timestamp), older.captured_at)
+
+    def test_replay_recovers_two_plate_frames_missed_by_live_detector(self) -> None:
+        class PixelPlateDetector:
+            def detect(self, image: np.ndarray) -> list[PlateDetection]:
+                value = int(round(float(image.mean())))
+                if value in (2, 3):
+                    return [PlateDetection(0.9, x=20, y=10, width=100, height=30)]
+                return []
+
+        snapshots = tuple(
+            self._make_snapshot(index, index * 0.1, value=index)
+            for index in range(1, 5)
+        )
+        detector_processor = PlateDetectionProcessor(
+            self.config, PixelPlateDetector()
+        )
+        recognition_processor = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.97), self.plate_service, self.config
+        )
+        outcomes = []
+
+        for snapshot in snapshots:
+            result = detector_processor.prepare_job(
+                snapshot.camera_id,
+                snapshot.direction,
+                snapshot.full_frame,
+                captured_at=snapshot.captured_at,
+                observed_at=snapshot.observed_at,
+                received_at=snapshot.received_at,
+                frame_id=snapshot.frame_id,
+                detector_source="replay",
+                allow_zero_detection_fallback=False,
+            )
+            if result.job is not None:
+                outcomes.append(
+                    recognition_processor.process_ocr_job(result.job, queue_depth=0)
+                )
+
+        self.assertEqual(
+            [outcome.confirmation_count for outcome in outcomes], [1, 2]
+        )
+        self.assertIs(outcomes[-1].state, RecognitionState.SAVED)
+        self.assertEqual(self._record_count(), 1)
 
     def test_worker_detector_initialization_failure_keeps_roi_fallback_active(self) -> None:
         factory_calls = 0

@@ -36,6 +36,16 @@ DEFAULT_ZERO_DETECTION_ROI_FALLBACK_INTERVAL_MS = 750
 DEFAULT_MAX_PENDING_OCR_JOBS_PER_CAMERA = 3
 DEFAULT_OCR_JOB_MAX_AGE_MS = 2_500
 DEFAULT_DEBUG_DETECTION_OVERLAY_TTL_MS = 500
+DEFAULT_PRE_DETECTION_BUFFER_DURATION_MS = 2_000
+DEFAULT_PRE_DETECTION_BUFFER_MAX_FRAMES_PER_CAMERA = 20
+DEFAULT_MOTION_PRE_ROLL_MS = 500
+DEFAULT_MOTION_POST_ROLL_MS = 700
+DEFAULT_MOTION_QUIET_MS = 400
+DEFAULT_MOTION_CHANGED_PIXEL_RATIO = 0.03
+DEFAULT_MOTION_EVENT_MAX_DURATION_MS = 4_000
+DEFAULT_MAX_REPLAY_FRAMES_PER_EVENT = 8
+DEFAULT_MAX_PENDING_REPLAY_EVENTS_PER_CAMERA = 2
+DEFAULT_REPLAY_EVENT_MAX_AGE_MS = 8_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +100,20 @@ class PlateRecognitionConfig:
     plate_detector: PlateDetectorConfig = field(default_factory=PlateDetectorConfig)
     max_pending_ocr_jobs_per_camera: int = DEFAULT_MAX_PENDING_OCR_JOBS_PER_CAMERA
     ocr_job_max_age_ms: int = DEFAULT_OCR_JOB_MAX_AGE_MS
+    pre_detection_buffer_duration_ms: int = DEFAULT_PRE_DETECTION_BUFFER_DURATION_MS
+    pre_detection_buffer_max_frames_per_camera: int = (
+        DEFAULT_PRE_DETECTION_BUFFER_MAX_FRAMES_PER_CAMERA
+    )
+    motion_pre_roll_ms: int = DEFAULT_MOTION_PRE_ROLL_MS
+    motion_post_roll_ms: int = DEFAULT_MOTION_POST_ROLL_MS
+    motion_quiet_ms: int = DEFAULT_MOTION_QUIET_MS
+    motion_changed_pixel_ratio: float = DEFAULT_MOTION_CHANGED_PIXEL_RATIO
+    motion_event_max_duration_ms: int = DEFAULT_MOTION_EVENT_MAX_DURATION_MS
+    max_replay_frames_per_event: int = DEFAULT_MAX_REPLAY_FRAMES_PER_EVENT
+    max_pending_replay_events_per_camera: int = (
+        DEFAULT_MAX_PENDING_REPLAY_EVENTS_PER_CAMERA
+    )
+    replay_event_max_age_ms: int = DEFAULT_REPLAY_EVENT_MAX_AGE_MS
     warnings: tuple[str, ...] = ()
 
     def roi_for(self, direction: object) -> NormalizedRoi:
@@ -287,6 +311,81 @@ def _load_plate_recognition(
         "ocr_job_max_age_ms",
         warnings,
     )
+    pre_detection_buffer_duration_ms = _bounded_number(
+        raw.get("pre_detection_buffer_duration_ms"),
+        DEFAULT_PRE_DETECTION_BUFFER_DURATION_MS,
+        100,
+        10_000,
+        int,
+        "pre_detection_buffer_duration_ms",
+        warnings,
+    )
+    pre_detection_buffer_max_frames_per_camera = _bounded_number(
+        raw.get("pre_detection_buffer_max_frames_per_camera"),
+        DEFAULT_PRE_DETECTION_BUFFER_MAX_FRAMES_PER_CAMERA,
+        2,
+        100,
+        int,
+        "pre_detection_buffer_max_frames_per_camera",
+        warnings,
+    )
+    motion_pre_roll_ms = _bounded_number(
+        raw.get("motion_pre_roll_ms"), DEFAULT_MOTION_PRE_ROLL_MS,
+        0, 5_000, int, "motion_pre_roll_ms", warnings,
+    )
+    motion_post_roll_ms = _bounded_number(
+        raw.get("motion_post_roll_ms"), DEFAULT_MOTION_POST_ROLL_MS,
+        0, 5_000, int, "motion_post_roll_ms", warnings,
+    )
+    motion_quiet_ms = _bounded_number(
+        raw.get("motion_quiet_ms"), DEFAULT_MOTION_QUIET_MS,
+        0, 5_000, int, "motion_quiet_ms", warnings,
+    )
+    motion_changed_pixel_ratio = _bounded_number(
+        raw.get("motion_changed_pixel_ratio"),
+        DEFAULT_MOTION_CHANGED_PIXEL_RATIO,
+        0.001,
+        1.0,
+        float,
+        "motion_changed_pixel_ratio",
+        warnings,
+    )
+    motion_event_max_duration_ms = _bounded_number(
+        raw.get("motion_event_max_duration_ms"),
+        DEFAULT_MOTION_EVENT_MAX_DURATION_MS,
+        500,
+        30_000,
+        int,
+        "motion_event_max_duration_ms",
+        warnings,
+    )
+    max_replay_frames_per_event = _bounded_number(
+        raw.get("max_replay_frames_per_event"),
+        DEFAULT_MAX_REPLAY_FRAMES_PER_EVENT,
+        1,
+        30,
+        int,
+        "max_replay_frames_per_event",
+        warnings,
+    )
+    max_pending_replay_events_per_camera = _bounded_number(
+        raw.get("max_pending_replay_events_per_camera"),
+        DEFAULT_MAX_PENDING_REPLAY_EVENTS_PER_CAMERA,
+        1,
+        10,
+        int,
+        "max_pending_replay_events_per_camera",
+        warnings,
+    )
+    replay_event_max_age_ms = _bounded_number(
+        raw.get("replay_event_max_age_ms"),
+        DEFAULT_REPLAY_EVENT_MAX_AGE_MS,
+        500,
+        60_000,
+        int,
+        "replay_event_max_age_ms",
+        warnings,
+    )
     backend_value = raw.get("ocr_backend", "auto")
     if not isinstance(backend_value, str) or backend_value.lower() not in {
         "auto",
@@ -317,6 +416,18 @@ def _load_plate_recognition(
         plate_detector=detector,
         max_pending_ocr_jobs_per_camera=max_pending_ocr_jobs_per_camera,
         ocr_job_max_age_ms=ocr_job_max_age_ms,
+        pre_detection_buffer_duration_ms=pre_detection_buffer_duration_ms,
+        pre_detection_buffer_max_frames_per_camera=(
+            pre_detection_buffer_max_frames_per_camera
+        ),
+        motion_pre_roll_ms=motion_pre_roll_ms,
+        motion_post_roll_ms=motion_post_roll_ms,
+        motion_quiet_ms=motion_quiet_ms,
+        motion_changed_pixel_ratio=motion_changed_pixel_ratio,
+        motion_event_max_duration_ms=motion_event_max_duration_ms,
+        max_replay_frames_per_event=max_replay_frames_per_event,
+        max_pending_replay_events_per_camera=max_pending_replay_events_per_camera,
+        replay_event_max_age_ms=replay_event_max_age_ms,
         warnings=tuple(warnings),
     )
 
