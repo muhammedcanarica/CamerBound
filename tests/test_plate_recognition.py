@@ -33,6 +33,7 @@ from app.plate_recognition import (
     OcrSegment,
     OcrJob,
     OcrJobBuffer,
+    OcrJobType,
     PreDetectionFrameBuffer,
     PaddleOcrProvider,
     PlateCandidate,
@@ -188,6 +189,26 @@ class PlateTextTests(unittest.TestCase):
 
         self.assertEqual(results.count(True), 1)
 
+    def test_presence_last_seen_never_moves_backwards_for_replay(self) -> None:
+        tracker = PlatePresenceTracker()
+        candidate = PlateCandidate("34ABC123", 0.90, "34ABC123", camera_id=1)
+
+        tracker.observe(candidate, 20.0)
+        tracker.observe(candidate, 10.0)
+
+        self.assertEqual(tracker._presences[(1, "34ABC123")].last_seen, 20.0)
+
+    def test_out_of_order_observation_outside_window_does_not_confirm(self) -> None:
+        tracker = ConfirmationTracker(required=2, window_seconds=3.0)
+        candidate = PlateCandidate("34ABC123", 0.90, "34ABC123", camera_id=1)
+
+        newer = tracker.observe_progress(candidate, 10.0)
+        too_old = tracker.observe_progress(candidate, 6.9)
+
+        self.assertIsNone(newer.candidate)
+        self.assertIsNone(too_old.candidate)
+        self.assertEqual(too_old.observed_count, 1)
+
     def test_multiple_ocr_segments_are_combined_left_to_right(self) -> None:
         segments = [
             OcrSegment("123", 0.90, (200.0, 0.0, 260.0, 30.0)),
@@ -332,6 +353,9 @@ class RecognitionPipelineTests(unittest.TestCase):
         fallback_reason: str | None = None,
         frame_id: int | None = None,
         queued_at: float | None = None,
+        job_type: OcrJobType | None = None,
+        detector_source: str = "live",
+        captured_at: datetime | None = None,
     ) -> OcrJob:
         now = time.monotonic() if observed_at is None else observed_at
         frame = np.full((200, 400, 3), frame_value, dtype=np.uint8)
@@ -339,7 +363,11 @@ class RecognitionPipelineTests(unittest.TestCase):
         return OcrJob(
             camera_id=camera_id,
             direction=Direction.ENTRY if camera_id == 1 else Direction.EXIT,
-            captured_at=datetime(2026, 8, 13, 9, 0, tzinfo=timezone.utc),
+            captured_at=(
+                captured_at
+                if captured_at is not None
+                else datetime(2026, 8, 13, 9, 0, tzinfo=timezone.utc)
+            ),
             observed_at=now,
             received_at=now,
             queued_at=time.monotonic() if queued_at is None else queued_at,
@@ -351,7 +379,17 @@ class RecognitionPipelineTests(unittest.TestCase):
             fallback_reason=fallback_reason,
             detector_ms=12.0,
             quality_score=quality_score,
+            job_type=(
+                job_type
+                if job_type is not None
+                else OcrJobType.ZERO_DETECTION_FALLBACK
+                if fallback_reason == "zero-detection"
+                else OcrJobType.DETECTOR_ERROR_FALLBACK
+                if fallback_reason is not None
+                else OcrJobType.DETECTOR_CROP
+            ),
             frame_id=frame_id,
+            detector_source=detector_source,
         )
 
     def _make_snapshot(
@@ -1250,6 +1288,40 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIsNone(stale.take(now=10.0))
         self.assertEqual(stale.stale_count, 1)
 
+    def test_repeated_motion_events_remain_bounded_per_camera(self) -> None:
+        config = replace(
+            self.config,
+            max_pending_replay_events_per_camera=2,
+            max_replay_frames_per_event=1,
+        )
+        buffer = ReplayEventBuffer(config)
+
+        for event_id in range(20):
+            camera_id = 1 if event_id % 2 == 0 else 2
+            snapshot = self._make_snapshot(
+                event_id, float(event_id), camera_id=camera_id
+            )
+            buffer.add(
+                MotionEvent(
+                    event_id=event_id,
+                    camera_id=camera_id,
+                    direction=snapshot.direction,
+                    started_at=snapshot.observed_at,
+                    ended_at=snapshot.observed_at,
+                    enqueued_at=10.0,
+                    frames=(snapshot,),
+                )
+            )
+
+        self.assertEqual(buffer.pending_event_count(1), 2)
+        self.assertEqual(buffer.pending_event_count(2), 2)
+        self.assertEqual(buffer.pending_event_count(), 4)
+        self.assertEqual(buffer.dropped_count, 16)
+        self.assertEqual(
+            (buffer.take(now=10.1).camera_id, buffer.take(now=10.1).camera_id),
+            (1, 2),
+        )
+
     def test_detector_scheduler_balances_two_live_frames_with_one_replay(self) -> None:
         worker = PlateRecognitionWorker(
             self.plate_service,
@@ -1408,6 +1480,17 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIs(buffer.take(), job)
         self.assertEqual(buffer.stale_count, 0)
 
+    def test_replay_job_captured_at_t0_and_queued_at_t3_1_is_fresh_at_t3_2(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        job = self._make_ocr_job(observed_at=0.0, queued_at=3.1)
+        with patch("app.plate_recognition.time.monotonic", return_value=3.1):
+            buffer.add(job)
+        with patch("app.plate_recognition.time.monotonic", return_value=3.2):
+            taken = buffer.take()
+
+        self.assertIs(taken, job)
+        self.assertEqual(buffer.stale_count, 0)
+
     def test_ocr_job_buffer_round_robin_prevents_camera_starvation(self) -> None:
         buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
         buffer.add(self._make_ocr_job(camera_id=1, quality_score=1.0))
@@ -1418,6 +1501,339 @@ class RecognitionPipelineTests(unittest.TestCase):
         second = buffer.take()
 
         self.assertEqual((first.camera_id, second.camera_id), (1, 2))
+
+    def test_detector_crop_priority_exceeds_both_fallback_types(self) -> None:
+        for fallback_type in (
+            OcrJobType.DETECTOR_ERROR_FALLBACK,
+            OcrJobType.ZERO_DETECTION_FALLBACK,
+        ):
+            with self.subTest(fallback_type=fallback_type):
+                buffer = OcrJobBuffer(max_per_camera=1, max_age_ms=2_500)
+                fallback = self._make_ocr_job(
+                    quality_score=10_000.0,
+                    job_type=fallback_type,
+                )
+                crop = self._make_ocr_job(
+                    quality_score=1.0,
+                    job_type=OcrJobType.DETECTOR_CROP,
+                )
+
+                buffer.add(fallback)
+                result = buffer.add(crop)
+
+                self.assertTrue(result.accepted)
+                self.assertEqual(result.replaced_job_type, fallback_type)
+                self.assertIs(buffer.take(), crop)
+
+    def test_same_priority_replacement_uses_deterministic_quality_policy(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=2, max_age_ms=2_500)
+        weakest = self._make_ocr_job(quality_score=10.0, frame_id=1)
+        strongest = self._make_ocr_job(quality_score=30.0, frame_id=2)
+        replacement = self._make_ocr_job(quality_score=20.0, frame_id=3)
+        equal_quality = self._make_ocr_job(quality_score=20.0, frame_id=4)
+        buffer.add(weakest)
+        buffer.add(strongest)
+
+        accepted = buffer.add(replacement)
+        dropped = buffer.add(equal_quality)
+
+        self.assertTrue(accepted.accepted)
+        self.assertEqual(accepted.replaced_job_type, OcrJobType.DETECTOR_CROP)
+        self.assertFalse(dropped.accepted)
+        self.assertEqual(dropped.drop_reason, "quality-not-better")
+        self.assertEqual([buffer.take().frame_id, buffer.take().frame_id], [2, 3])
+
+    def test_lower_priority_job_cannot_replace_detector_crop(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=1, max_age_ms=2_500)
+        crop = self._make_ocr_job(quality_score=1.0)
+        fallback = self._make_ocr_job(
+            quality_score=10_000.0,
+            job_type=OcrJobType.ZERO_DETECTION_FALLBACK,
+        )
+        buffer.add(crop)
+
+        result = buffer.add(fallback)
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.drop_reason, "lower-priority")
+        self.assertIs(buffer.take(), crop)
+
+    def test_full_queue_accepts_detector_crop_by_evicting_weakest_fallback(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        zero = self._make_ocr_job(
+            job_type=OcrJobType.ZERO_DETECTION_FALLBACK, frame_id=1
+        )
+        error = self._make_ocr_job(
+            job_type=OcrJobType.DETECTOR_ERROR_FALLBACK, frame_id=2
+        )
+        existing_crop = self._make_ocr_job(frame_id=3)
+        new_crop = self._make_ocr_job(frame_id=4)
+        for job in (zero, error, existing_crop):
+            buffer.add(job)
+
+        result = buffer.add(new_crop)
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.replaced_job_type, OcrJobType.ZERO_DETECTION_FALLBACK)
+        self.assertEqual([buffer.take().frame_id, buffer.take().frame_id], [3, 4])
+
+    def test_zero_detection_fallback_is_coalesced_and_released_after_consume(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        first = self._make_ocr_job(job_type=OcrJobType.ZERO_DETECTION_FALLBACK)
+        second = self._make_ocr_job(job_type=OcrJobType.ZERO_DETECTION_FALLBACK)
+
+        buffer.add(first)
+        coalesced = buffer.add(second)
+        consumed = buffer.take()
+        accepted_again = buffer.add(second)
+
+        self.assertFalse(coalesced.accepted)
+        self.assertTrue(coalesced.coalesced)
+        self.assertIs(consumed, first)
+        self.assertTrue(accepted_again.accepted)
+
+    def test_fallback_coalescing_has_no_stuck_state_after_replace_stale_or_clear(self) -> None:
+        replacement_buffer = OcrJobBuffer(max_per_camera=1, max_age_ms=2_500)
+        zero = self._make_ocr_job(job_type=OcrJobType.ZERO_DETECTION_FALLBACK)
+        replacement_buffer.add(zero)
+        replacement_buffer.add(self._make_ocr_job(job_type=OcrJobType.DETECTOR_CROP))
+        replacement_buffer.take()
+        self.assertTrue(replacement_buffer.add(zero).accepted)
+
+        drop_buffer = OcrJobBuffer(max_per_camera=1, max_age_ms=2_500)
+        crop = self._make_ocr_job(job_type=OcrJobType.DETECTOR_CROP)
+        drop_buffer.add(crop)
+        dropped = drop_buffer.add(zero)
+        self.assertFalse(dropped.accepted)
+        drop_buffer.take()
+        self.assertTrue(drop_buffer.add(zero).accepted)
+
+        stale_buffer = OcrJobBuffer(max_per_camera=1, max_age_ms=100)
+        stale_buffer.add(
+            self._make_ocr_job(
+                job_type=OcrJobType.ZERO_DETECTION_FALLBACK,
+                queued_at=time.monotonic() - 1.0,
+            )
+        )
+        fresh = self._make_ocr_job(job_type=OcrJobType.ZERO_DETECTION_FALLBACK)
+        stale_result = stale_buffer.add(fresh)
+        self.assertTrue(stale_result.accepted)
+        self.assertEqual(stale_result.stale_discarded, 1)
+
+        stale_buffer.clear()
+        self.assertTrue(stale_buffer.add(fresh).accepted)
+
+    def test_detector_error_fallback_cannot_flood_camera_queue(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        first = self._make_ocr_job(job_type=OcrJobType.DETECTOR_ERROR_FALLBACK)
+        buffer.add(first)
+
+        results = [
+            buffer.add(
+                self._make_ocr_job(job_type=OcrJobType.DETECTOR_ERROR_FALLBACK)
+            )
+            for _ in range(5)
+        ]
+
+        self.assertEqual(buffer.pending_count(1), 1)
+        self.assertTrue(all(result.coalesced for result in results))
+
+    def test_buffer_debug_decision_reports_priority_and_coalescing(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        fallback = self._make_ocr_job(
+            frame_id=41,
+            job_type=OcrJobType.ZERO_DETECTION_FALLBACK,
+        )
+        buffer.add(fallback)
+
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            buffer.add(replace(fallback, frame_id=42))
+
+        diagnostic = captured.output[-1]
+        self.assertIn("job_type=ZERO_DETECTION_FALLBACK", diagnostic)
+        self.assertIn("priority=1", diagnostic)
+        self.assertIn("accepted=no", diagnostic)
+        self.assertIn("drop_reason=fallback-pending", diagnostic)
+        self.assertIn("coalesced=yes", diagnostic)
+
+    def test_ocr_consumer_prefers_detector_crop_globally(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        fallback = self._make_ocr_job(
+            camera_id=1, job_type=OcrJobType.DETECTOR_ERROR_FALLBACK
+        )
+        crop = self._make_ocr_job(camera_id=2, job_type=OcrJobType.DETECTOR_CROP)
+        buffer.add(fallback)
+        buffer.add(crop)
+
+        self.assertIs(buffer.take(), crop)
+        self.assertIs(buffer.take(), fallback)
+
+    def test_ocr_consumer_follows_all_priority_tiers(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        zero = self._make_ocr_job(
+            camera_id=2,
+            job_type=OcrJobType.ZERO_DETECTION_FALLBACK,
+        )
+        error = self._make_ocr_job(
+            camera_id=1,
+            job_type=OcrJobType.DETECTOR_ERROR_FALLBACK,
+        )
+        crop = self._make_ocr_job(
+            camera_id=2,
+            job_type=OcrJobType.DETECTOR_CROP,
+        )
+        for job in (zero, error, crop):
+            buffer.add(job)
+
+        self.assertEqual(
+            [buffer.take().job_type for _ in range(3)],
+            [
+                OcrJobType.DETECTOR_CROP,
+                OcrJobType.DETECTOR_ERROR_FALLBACK,
+                OcrJobType.ZERO_DETECTION_FALLBACK,
+            ],
+        )
+
+    def test_ocr_consumer_is_camera_fair_within_priority_tier(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        entry_jobs = [
+            self._make_ocr_job(camera_id=1, frame_id=frame_id)
+            for frame_id in (1, 2, 3)
+        ]
+        exit_jobs = [
+            self._make_ocr_job(camera_id=2, frame_id=frame_id)
+            for frame_id in (4, 5)
+        ]
+        for job in (*entry_jobs, *exit_jobs):
+            buffer.add(job)
+
+        taken = [buffer.take() for _ in range(4)]
+
+        self.assertEqual([job.camera_id for job in taken], [1, 2, 1, 2])
+
+    def test_waiting_ocr_consumer_wakes_and_stops_without_deadlock(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        stop_event = threading.Event()
+        result: list[OcrJob | None] = []
+        thread = threading.Thread(
+            target=lambda: result.append(buffer.take(stop_event, wait=True))
+        )
+        thread.start()
+        stop_event.set()
+        buffer.clear()
+        buffer.wake_all()
+        thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [None])
+
+    def test_fallback_flood_cannot_suppress_other_camera_detector_crop(self) -> None:
+        for crop_camera_id in (1, 2):
+            with self.subTest(crop_camera_id=crop_camera_id):
+                fallback_camera_id = 2 if crop_camera_id == 1 else 1
+                buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+                for frame_id in range(10):
+                    buffer.add(
+                        self._make_ocr_job(
+                            camera_id=fallback_camera_id,
+                            frame_id=frame_id,
+                            job_type=OcrJobType.ZERO_DETECTION_FALLBACK,
+                        )
+                    )
+                crop = self._make_ocr_job(
+                    camera_id=crop_camera_id,
+                    frame_id=100,
+                    job_type=OcrJobType.DETECTOR_CROP,
+                )
+
+                accepted = buffer.add(crop)
+
+                self.assertTrue(accepted.accepted)
+                self.assertIs(buffer.take(), crop)
+                self.assertEqual(buffer.pending_count(fallback_camera_id), 1)
+
+    def test_normal_vehicle_detector_crops_save_while_fallback_jobs_are_pending(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.97), self.plate_service, self.config
+        )
+        buffer.add(
+            self._make_ocr_job(
+                camera_id=1,
+                frame_id=90,
+                job_type=OcrJobType.ZERO_DETECTION_FALLBACK,
+            )
+        )
+        buffer.add(
+            self._make_ocr_job(
+                camera_id=2,
+                frame_id=91,
+                job_type=OcrJobType.DETECTOR_ERROR_FALLBACK,
+            )
+        )
+        first_crop = self._make_ocr_job(
+            camera_id=1,
+            observed_at=10.0,
+            frame_id=100,
+            frame_value=31,
+            job_type=OcrJobType.DETECTOR_CROP,
+        )
+        second_crop = self._make_ocr_job(
+            camera_id=1,
+            observed_at=10.2,
+            frame_id=104,
+            frame_value=63,
+            job_type=OcrJobType.DETECTOR_CROP,
+        )
+        self.assertTrue(buffer.add(first_crop).accepted)
+        self.assertTrue(buffer.add(second_crop).accepted)
+
+        first_taken = buffer.take()
+        second_taken = buffer.take()
+        awaiting = processor.process_ocr_job(
+            first_taken, queue_depth=buffer.pending_count()
+        )
+        saved = processor.process_ocr_job(
+            second_taken, queue_depth=buffer.pending_count()
+        )
+
+        self.assertEqual((first_taken.frame_id, second_taken.frame_id), (100, 104))
+        self.assertIs(awaiting.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertEqual(awaiting.confirmation_count, 1)
+        self.assertIs(saved.state, RecognitionState.SAVED)
+        self.assertEqual(saved.confirmation_count, 2)
+        self.assertEqual(self._record_count(), 1)
+        saved_image = cv2.imread(
+            str(self.capture_service.resolve_reference(saved.record.image_path))
+        )
+        self.assertAlmostEqual(float(saved_image.mean()), 63.0, delta=3.0)
+
+    def test_ocr_worker_diagnostics_include_job_identity_and_confirmation(self) -> None:
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.97), self.plate_service, self.config
+        )
+        job = self._make_ocr_job(
+            observed_at=time.monotonic(),
+            frame_id=55,
+            detector_source="replay",
+            job_type=OcrJobType.DETECTOR_CROP,
+        )
+
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            outcome = processor.process_ocr_job(job, queue_depth=2)
+
+        diagnostic = next(
+            line for line in captured.output if "OCR worker diagnostics" in line
+        )
+        self.assertIs(outcome.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertIn("job_type=DETECTOR_CROP", diagnostic)
+        self.assertIn("priority=3", diagnostic)
+        self.assertIn("source=replay", diagnostic)
+        self.assertIn("frame_id=55", diagnostic)
+        self.assertIn("queue_wait_ms=", diagnostic)
+        self.assertIn("candidate=34ABC123", diagnostic)
+        self.assertIn("recognition_state=AWAITING_CONFIRMATION", diagnostic)
+        self.assertIn("confirmation=1/2", diagnostic)
 
     def test_detection_processor_queues_crop_and_preserves_full_frame(self) -> None:
         detection = PlateDetection(0.9, x=20, y=10, width=100, height=30)
@@ -1437,6 +1853,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(result.job)
+        self.assertIs(result.job.job_type, OcrJobType.DETECTOR_CROP)
         self.assertEqual(len(result.job.ocr_crops), 1)
         self.assertLess(result.job.ocr_crops[0].shape[0], result.job.roi_crop.shape[0])
         np.testing.assert_array_equal(result.job.full_frame, frame)
@@ -1462,6 +1879,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(first.job.fallback_reason, "zero-detection")
+        self.assertIs(first.job.job_type, OcrJobType.ZERO_DETECTION_FALLBACK)
         self.assertIsNone(throttled.job)
         self.assertEqual(after_interval.job.fallback_reason, "zero-detection")
 
@@ -1482,6 +1900,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(result.job.fallback_reason, "detector-error")
+        self.assertIs(result.job.job_type, OcrJobType.DETECTOR_ERROR_FALLBACK)
         self.assertTrue(result.job.used_roi_fallback)
         self.assertEqual(result.job.ocr_crops[0].shape, result.job.roi_crop.shape)
 
@@ -1503,6 +1922,34 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         self.assertIsNone(result.job)
         self.assertFalse(result.used_roi_fallback)
+
+    def test_replay_detector_crop_keeps_detector_crop_priority_and_timestamps(self) -> None:
+        processor = PlateDetectionProcessor(
+            self.config,
+            FakePlateDetector([PlateDetection(0.9, x=20, y=10, width=100, height=30)]),
+        )
+        frame = np.full((200, 400, 3), 19, dtype=np.uint8)
+        captured_at = datetime(2026, 8, 13, 9, 30, tzinfo=timezone.utc)
+
+        result = processor.prepare_job(
+            2,
+            Direction.EXIT,
+            frame,
+            captured_at=captured_at,
+            observed_at=12.5,
+            received_at=12.5,
+            frame_id=88,
+            detector_source="replay",
+            allow_zero_detection_fallback=False,
+        )
+
+        self.assertIsNotNone(result.job)
+        self.assertIs(result.job.job_type, OcrJobType.DETECTOR_CROP)
+        self.assertEqual(result.job.detector_source, "replay")
+        self.assertEqual(result.job.frame_id, 88)
+        self.assertEqual(result.job.observed_at, 12.5)
+        self.assertEqual(result.job.captured_at, captured_at)
+        np.testing.assert_array_equal(result.job.full_frame, frame)
 
     def test_queued_observations_use_frame_time_and_matching_full_frame(self) -> None:
         processor = PlateRecognitionProcessor(
@@ -1581,14 +2028,24 @@ class RecognitionPipelineTests(unittest.TestCase):
         processor = PlateRecognitionProcessor(
             FakeOcrProvider(confidence=0.97), self.plate_service, self.config
         )
-        newer = self._make_ocr_job(observed_at=10.2, frame_id=202)
-        older = self._make_ocr_job(observed_at=10.0, frame_id=201)
+        newer_captured_at = datetime(2026, 8, 13, 9, 0, 1, tzinfo=timezone.utc)
+        older_captured_at = datetime(2026, 8, 13, 9, 0, 0, tzinfo=timezone.utc)
+        newer = self._make_ocr_job(
+            observed_at=10.2,
+            frame_id=202,
+            captured_at=newer_captured_at,
+        )
+        older = self._make_ocr_job(
+            observed_at=10.0,
+            frame_id=201,
+            captured_at=older_captured_at,
+        )
 
         processor.process_ocr_job(newer, queue_depth=1)
         saved = processor.process_ocr_job(older, queue_depth=0)
 
         self.assertIs(saved.state, RecognitionState.SAVED)
-        self.assertEqual(datetime.fromisoformat(saved.record.timestamp), older.captured_at)
+        self.assertEqual(datetime.fromisoformat(saved.record.timestamp), older_captured_at)
 
     def test_replay_recovers_two_plate_frames_missed_by_live_detector(self) -> None:
         class PixelPlateDetector:

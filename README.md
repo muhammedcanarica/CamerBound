@@ -57,6 +57,18 @@ Manuel çalıştırma:
 .venv\Scripts\python.exe
 ```
 
+Production log seviyesi varsayılan olarak `INFO` kalır. Kaynak kodu değiştirmeden
+geçici saha tanılaması açmak için aynı PowerShell oturumunda:
+
+```powershell
+$env:CAMERBOUND_LOG_LEVEL="DEBUG"
+.\run.bat
+```
+
+İzin verilen seviyeler `DEBUG`, `INFO`, `WARNING` ve `ERROR` değerleridir. Geçersiz
+bir değer güvenli biçimde `INFO` seviyesine döner. Mevcut rotating log sınırları ve
+kamera credential/URL sanitization davranışı DEBUG modunda da korunur.
+
 ## Kamera Yapılandırması
 
 Kamera kaynakları ADMIN hesabıyla **Ayarlar** ekranından yapılandırılır.
@@ -114,7 +126,7 @@ Same-camera same-plate duplicate cooldown: 120 saniye
 
 Detector açıkken OpenVINO modeli yalnızca yapılandırılmış ENTRY/EXIT ROI üzerinde çalışır. Yalnızca modelin `plate` sınıfı OCR'a gönderilir; `vehicle` sınıfı OCR'a gönderilmez. Detection confidence ve bbox alanına göre en iyi iki plaka crop'u seçilir. Detector exception verirse `fallback_to_roi_ocr=true` ile mevcut ROI OCR akışı korunur. Detector başarıyla çalışıp hiç kullanılabilir plate crop üretmezse, kamera başına ayrı tutulan 750 ms throttle süresi dolduğunda safety fallback olarak ROI OCR bir kez denenir; aradaki recognition frame'lerinde pahalı OCR çağrısı yapılmaz.
 
-Detector ve PaddleOCR ayrı worker'larda çalışır; OCR inference sürerken detector round-robin olarak her kameranın en yeni frame'ini işlemeye devam eder. Üretilen OCR job'ları kamera başına en fazla 3 adet RAM'de tutulur ve OCR kuyruğunda 2500 ms'den uzun bekleyen job işlenmeden bırakılır. Buffer dolduğunda detector confidence, crop alanı ve Laplacian sharpness kullanan ucuz kalite skoru daha iyi yeni frame'i zayıf pending job ile değiştirebilir. OCR job, crop ile birlikte aynı full camera frame'i ve frame zamanlarını taşıdığı için confirmation gözlem zamanı ile confirmed-record JPEG'i doğru frame'e bağlı kalır. Video veya sürekli frame kaydı yapılmaz.
+Detector ve PaddleOCR ayrı worker'larda çalışır; OCR inference sürerken detector round-robin olarak her kameranın en yeni frame'ini işlemeye devam eder. Üretilen OCR job'ları kamera başına en fazla 3 adet RAM'de tutulur ve OCR kuyruğunda 2500 ms'den uzun bekleyen job işlenmeden bırakılır. Job türleri açıkça `DETECTOR_CROP`, `DETECTOR_ERROR_FALLBACK` ve `ZERO_DETECTION_FALLBACK` olarak sınıflandırılır. Tüketici önce detector crop'larını, sonra detector-error fallback'lerini, son olarak zero-detection fallback'lerini seçer; her öncelik seviyesinde ENTRY/EXIT round-robin adaleti korunur. Buffer dolduğunda düşük öncelikli job önce evict edilir; yalnız aynı öncelikte detector confidence, crop alanı ve Laplacian sharpness kullanan ucuz kalite skoru karşılaştırılır. Kamera başına her fallback türünden en fazla bir pending job tutulur, böylece tekrar eden fallback'ler coalesce edilir ve gerçek detector crop'larını dolduramaz. OCR job, crop ile birlikte aynı full camera frame'i ve frame zamanlarını taşıdığı için confirmation gözlem zamanı ile confirmed-record JPEG'i doğru frame'e bağlı kalır. Video veya sürekli frame kaydı yapılmaz.
 
 Detector öncesindeki rolling ring her kamera için son 2000 ms ve en fazla 20 full-resolution frame ile sınırlıdır. ROI, yaklaşık 160 piksel genişliğe küçültülüp grayscale/blur/absdiff ile ucuz bir değişen-piksel oranı hesaplanır. Motion event 500 ms pre-roll, 700 ms post-roll ve 400 ms quiet hysteresis kullanır; event en fazla 4000 ms sürer. Event frame'leri zamansal bin'lere bölünür ve her bin içindeki en keskin ROI seçilerek en fazla 8 historical frame replay edilir. Detector 2 live frame / 1 replay frame oranıyla iki kaynağı dengeler; replay kuyruğu kamera başına 2 event ve 8000 ms scheduling yaşı ile bounded'dır.
 
@@ -128,7 +140,7 @@ Varsayılan detector ayarları:
 {
   "enabled": true,
   "backend": "openvino",
-  "min_confidence": 0.5,
+  "min_confidence": 0.15,
   "crop_padding_ratio": 0.15,
   "max_plate_candidates_per_frame": 2,
   "fallback_to_roi_ocr": true,

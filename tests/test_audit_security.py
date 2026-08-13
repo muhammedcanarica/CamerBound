@@ -12,7 +12,7 @@ from app.audit import AuditAction, AuditService
 from app.auth import AuthService, AuthenticationError, Role
 from app.camera import CameraService
 from app.database import Database
-from app.logging_config import CredentialSafeFormatter
+from app.logging_config import CredentialSafeFormatter, resolve_log_level
 from app.plate_service import PlateService
 from app.security import (
     sanitize_camera_source_for_log,
@@ -213,6 +213,17 @@ class CameraSourceSanitizationTests(unittest.TestCase):
         )
         rendered = CredentialSafeFormatter("%(message)s").format(record)
         self.assertEqual(rendered, "Camera failed: rtsp://example.com/live")
+
+    def test_debug_log_level_can_be_enabled_by_environment(self) -> None:
+        with patch.dict("os.environ", {"CAMERBOUND_LOG_LEVEL": "DEBUG"}):
+            self.assertEqual(resolve_log_level(), logging.DEBUG)
+
+    def test_invalid_log_level_safely_falls_back_to_info(self) -> None:
+        for value in ("TRACE", "", "debugging"):
+            with self.subTest(value=value), patch.dict(
+                "os.environ", {"CAMERBOUND_LOG_LEVEL": value}
+            ):
+                self.assertEqual(resolve_log_level(), logging.INFO)
 
 
 class AuditMigrationTests(unittest.TestCase):

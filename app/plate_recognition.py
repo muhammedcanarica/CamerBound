@@ -48,6 +48,22 @@ class RecognitionStatus(StrEnum):
     ERROR = "ERROR"
 
 
+class OcrJobType(StrEnum):
+    """Explicit OCR work class; crop dimensions never determine priority."""
+
+    DETECTOR_CROP = "DETECTOR_CROP"
+    DETECTOR_ERROR_FALLBACK = "DETECTOR_ERROR_FALLBACK"
+    ZERO_DETECTION_FALLBACK = "ZERO_DETECTION_FALLBACK"
+
+    @property
+    def priority(self) -> int:
+        return {
+            OcrJobType.DETECTOR_CROP: 3,
+            OcrJobType.DETECTOR_ERROR_FALLBACK: 2,
+            OcrJobType.ZERO_DETECTION_FALLBACK: 1,
+        }[self]
+
+
 LOGGER = logging.getLogger(__name__)
 PLATE_PRESENCE_RELEASE_SECONDS = 15
 OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS = 5.0
@@ -691,6 +707,7 @@ class OcrJob:
     fallback_reason: str | None
     detector_ms: float
     quality_score: float
+    job_type: OcrJobType = OcrJobType.DETECTOR_CROP
     frame_id: int | None = None
     detector_source: str = "live"
 
@@ -712,10 +729,14 @@ class OcrBufferAddResult:
     dropped: int
     camera_depth: int
     total_depth: int
+    replaced_job_type: OcrJobType | None = None
+    drop_reason: str | None = None
+    coalesced: bool = False
+    stale_discarded: int = 0
 
 
 class OcrJobBuffer:
-    """Camera-fair bounded RAM buffer retaining stronger recent observations."""
+    """Priority-aware, camera-fair bounded RAM buffer for OCR work."""
 
     def __init__(self, max_per_camera: int, max_age_ms: int) -> None:
         self.max_per_camera = max(1, max_per_camera)
@@ -732,17 +753,43 @@ class OcrJobBuffer:
         replaced = 0
         dropped = 0
         accepted = True
+        replaced_job_type: OcrJobType | None = None
+        drop_reason: str | None = None
+        coalesced = False
         with self._condition:
             if job.camera_id not in self._known_camera_ids:
                 self._known_camera_ids.add(job.camera_id)
                 self._camera_order.append(job.camera_id)
             camera_jobs = self._jobs[job.camera_id]
-            if len(camera_jobs) >= self.max_per_camera:
+            stale_discarded = self._discard_stale_locked(
+                camera_jobs, time.monotonic()
+            )
+            if (
+                job.job_type is not OcrJobType.DETECTOR_CROP
+                and any(item.job_type is job.job_type for item in camera_jobs)
+            ):
+                accepted = False
+                dropped = 1
+                coalesced = True
+                drop_reason = "fallback-pending"
+                self.dropped_count += 1
+            elif len(camera_jobs) >= self.max_per_camera:
                 weakest_index = min(
                     range(len(camera_jobs)),
-                    key=lambda index: camera_jobs[index].quality_score,
+                    key=lambda index: (
+                        camera_jobs[index].job_type.priority,
+                        camera_jobs[index].quality_score,
+                        index,
+                    ),
                 )
-                if job.quality_score > camera_jobs[weakest_index].quality_score:
+                weakest = camera_jobs[weakest_index]
+                higher_priority = job.job_type.priority > weakest.job_type.priority
+                better_same_priority = (
+                    job.job_type.priority == weakest.job_type.priority
+                    and job.quality_score > weakest.quality_score
+                )
+                if higher_priority or better_same_priority:
+                    replaced_job_type = weakest.job_type
                     del camera_jobs[weakest_index]
                     camera_jobs.append(job)
                     replaced = 1
@@ -750,6 +797,11 @@ class OcrJobBuffer:
                 else:
                     accepted = False
                     dropped = 1
+                    drop_reason = (
+                        "lower-priority"
+                        if job.job_type.priority < weakest.job_type.priority
+                        else "quality-not-better"
+                    )
                     self.dropped_count += 1
             else:
                 camera_jobs.append(job)
@@ -757,13 +809,37 @@ class OcrJobBuffer:
             total_depth = sum(len(items) for items in self._jobs.values())
             if accepted:
                 self._condition.notify()
-        return OcrBufferAddResult(
+        result = OcrBufferAddResult(
             accepted=accepted,
             replaced=replaced,
             dropped=dropped,
             camera_depth=camera_depth,
             total_depth=total_depth,
+            replaced_job_type=replaced_job_type,
+            drop_reason=drop_reason,
+            coalesced=coalesced,
+            stale_discarded=stale_discarded,
         )
+
+        if LOGGER.isEnabledFor(logging.DEBUG) and (not accepted or replaced):
+            LOGGER.debug(
+                "OCR buffer decision camera_id=%s job_type=%s source=%s frame_id=%s "
+                "priority=%s accepted=%s queue_depth=%s camera_depth=%s "
+                "replaced_job_type=%s drop_reason=%s coalesced=%s stale_count=%s",
+                job.camera_id,
+                job.job_type.value,
+                job.detector_source,
+                job.frame_id,
+                job.job_type.priority,
+                "yes" if accepted else "no",
+                total_depth,
+                camera_depth,
+                replaced_job_type.value if replaced_job_type is not None else "none",
+                drop_reason or "none",
+                "yes" if coalesced else "no",
+                self.stale_count,
+            )
+        return result
 
     def take(
         self,
@@ -776,21 +852,50 @@ class OcrJobBuffer:
                 if stop_event is not None and stop_event.is_set():
                     return None
                 now = time.monotonic()
-                for _ in range(len(self._camera_order)):
-                    camera_id = self._camera_order.popleft()
-                    self._camera_order.append(camera_id)
-                    camera_jobs = self._jobs[camera_id]
-                    while (
-                        camera_jobs
-                        and now - camera_jobs[0].queued_at > self.max_age_seconds
-                    ):
-                        camera_jobs.popleft()
-                        self.stale_count += 1
-                    if camera_jobs:
-                        return camera_jobs.popleft()
+                for camera_id in tuple(self._camera_order):
+                    self._discard_stale_locked(self._jobs[camera_id], now)
+                for job_type in (
+                    OcrJobType.DETECTOR_CROP,
+                    OcrJobType.DETECTOR_ERROR_FALLBACK,
+                    OcrJobType.ZERO_DETECTION_FALLBACK,
+                ):
+                    for _ in range(len(self._camera_order)):
+                        camera_id = self._camera_order.popleft()
+                        self._camera_order.append(camera_id)
+                        camera_jobs = self._jobs[camera_id]
+                        job_index = next(
+                            (
+                                index
+                                for index, pending in enumerate(camera_jobs)
+                                if pending.job_type is job_type
+                            ),
+                            None,
+                        )
+                        if job_index is not None:
+                            job = camera_jobs[job_index]
+                            del camera_jobs[job_index]
+                            return job
                 if not wait:
                     return None
                 self._condition.wait(0.05)
+
+    def _discard_stale_locked(
+        self,
+        camera_jobs: deque[OcrJob],
+        now: float,
+    ) -> int:
+        kept = [
+            job
+            for job in camera_jobs
+            if now - job.queued_at <= self.max_age_seconds
+        ]
+        discarded = len(camera_jobs) - len(kept)
+        if not discarded:
+            return 0
+        camera_jobs.clear()
+        camera_jobs.extend(kept)
+        self.stale_count += discarded
+        return discarded
 
     def pending_count(self, camera_id: int | None = None) -> int:
         with self._condition:
@@ -927,6 +1032,13 @@ class PlateDetectionProcessor:
                 detector_ms,
                 brightness,
             )
+        job_type = OcrJobType.DETECTOR_CROP
+        if fallback_reason == "zero-detection":
+            job_type = OcrJobType.ZERO_DETECTION_FALLBACK
+        elif used_roi_fallback:
+            # Detector-disabled and detector-unavailable paths share the protected
+            # detector-error fallback priority tier; fallback_reason stays explicit.
+            job_type = OcrJobType.DETECTOR_ERROR_FALLBACK
         job = OcrJob(
             camera_id=camera_id,
             direction=direction,
@@ -942,6 +1054,7 @@ class PlateDetectionProcessor:
             fallback_reason=fallback_reason,
             detector_ms=detector_ms,
             quality_score=ocr_job_quality_score(ocr_crops, selected),
+            job_type=job_type,
             frame_id=frame_id,
             detector_source=detector_source,
         )
@@ -1184,6 +1297,10 @@ class PlateRecognitionProcessor:
         queue_depth: int,
     ) -> RecognitionOutcome:
         """Run preprocessing, OCR and persistence for an already detected frame."""
+        queue_wait_ms = max(
+            0.0,
+            (time.monotonic() - job.queued_at) * 1000.0,
+        )
         ocr_started_at = time.perf_counter()
         preprocess_started_at = ocr_started_at
         variants: list[np.ndarray] = []
@@ -1196,16 +1313,7 @@ class PlateRecognitionProcessor:
         ocr_finished_at = time.perf_counter()
         inference_ms = (ocr_finished_at - inference_started_at) * 1000.0
         candidate = select_best_candidate(segments, job.camera_id)
-        self._log_queued_ocr_diagnostics(
-            job=job,
-            variants=variants,
-            queue_depth=queue_depth,
-            ocr_started_at=ocr_started_at,
-            preprocess_ms=preprocess_ms,
-            inference_ms=inference_ms,
-            candidate_found=candidate is not None,
-        )
-        return self._complete_observation(
+        outcome = self._complete_observation(
             camera_id=job.camera_id,
             segments=segments,
             candidate=candidate,
@@ -1216,6 +1324,18 @@ class PlateRecognitionProcessor:
             used_roi_fallback=job.used_roi_fallback,
             frame_id=job.frame_id,
         )
+        self._log_queued_ocr_diagnostics(
+            job=job,
+            variants=variants,
+            queue_depth=queue_depth,
+            ocr_started_at=ocr_started_at,
+            preprocess_ms=preprocess_ms,
+            inference_ms=inference_ms,
+            queue_wait_ms=queue_wait_ms,
+            candidate=candidate,
+            outcome=outcome,
+        )
+        return outcome
 
     def _complete_observation(
         self,
@@ -1485,7 +1605,9 @@ class PlateRecognitionProcessor:
         ocr_started_at: float,
         preprocess_ms: float,
         inference_ms: float,
-        candidate_found: bool,
+        queue_wait_ms: float,
+        candidate: PlateCandidate | None,
+        outcome: RecognitionOutcome,
     ) -> None:
         if not LOGGER.isEnabledFor(logging.DEBUG):
             return
@@ -1498,14 +1620,14 @@ class PlateRecognitionProcessor:
             return
         self._last_diagnostic_logged_at[job.camera_id] = ocr_started_at
         now = time.monotonic()
-        queue_wait_ms = max(0.0, (now - job.queued_at) * 1000.0)
         end_to_end_ms = max(0.0, (now - job.observed_at) * 1000.0)
         brightness = roi_mean_brightness(job.roi_crop)
         LOGGER.debug(
             "OCR worker diagnostics camera_id=%s direction=%s brightness=%.1f "
             "low_light=%s variants=%s queue_depth=%s queue_wait_ms=%.1f "
             "preprocess_ms=%.1f inference_ms=%.1f end_to_end_ms=%.1f "
-            "fallback_reason=%s candidate=%s",
+            "job_type=%s priority=%s source=%s frame_id=%s fallback_reason=%s "
+            "candidate=%s recognition_state=%s confirmation=%s/%s",
             job.camera_id,
             job.direction.value,
             brightness,
@@ -1516,8 +1638,15 @@ class PlateRecognitionProcessor:
             preprocess_ms,
             inference_ms,
             end_to_end_ms,
+            job.job_type.value,
+            job.job_type.priority,
+            job.detector_source,
+            job.frame_id,
             job.fallback_reason or "none",
-            "yes" if candidate_found else "no",
+            candidate.plate if candidate is not None else "none",
+            outcome.state.value,
+            outcome.confirmation_count,
+            outcome.confirmation_required,
         )
 
     def _log_detector_error(
@@ -1912,7 +2041,8 @@ class PlateRecognitionWorker(QObject):
             "detector_frame_age_ms=%.1f detections=%s ocr_queue_depth=%s "
             "camera_queue_depth=%s dropped=%s replaced=%s stale_total=%s "
             "fallback_reason=%s source=%s frame_id=%s original_frame_age_ms=%.1f "
-            "replay_queue_depth=%s",
+            "replay_queue_depth=%s job_type=%s priority=%s detector_crop_count=%s "
+            "accepted=%s replaced_job_type=%s drop_reason=%s coalesced=%s",
             camera_id,
             item.direction.value,
             result.detector_ms,
@@ -1928,6 +2058,35 @@ class PlateRecognitionWorker(QObject):
             item.frame_id,
             max(0.0, (now - item.observed_at) * 1000.0),
             self._replay_buffer.pending_event_count(),
+            result.job.job_type.value if result.job is not None else "none",
+            result.job.job_type.priority if result.job is not None else 0,
+            (
+                len(result.job.ocr_crops)
+                if result.job is not None
+                and result.job.job_type is OcrJobType.DETECTOR_CROP
+                else 0
+            ),
+            (
+                "no"
+                if buffer_result is None
+                else "yes" if buffer_result.accepted else "no"
+            ),
+            (
+                buffer_result.replaced_job_type.value
+                if buffer_result is not None
+                and buffer_result.replaced_job_type is not None
+                else "none"
+            ),
+            (
+                buffer_result.drop_reason
+                if buffer_result is not None and buffer_result.drop_reason is not None
+                else "none"
+            ),
+            (
+                "yes"
+                if buffer_result is not None and buffer_result.coalesced
+                else "no"
+            ),
         )
 
     def _log_ring_diagnostics(self, camera_id: int, now: float) -> None:

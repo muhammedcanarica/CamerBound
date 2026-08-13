@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -8,9 +9,27 @@ from app.config import application_root
 from app.security import sanitize_text_for_log
 
 
+LOG_LEVEL_ENVIRONMENT_VARIABLE = "CAMERBOUND_LOG_LEVEL"
+ALLOWED_LOG_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+}
+
+
 class CredentialSafeFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         return sanitize_text_for_log(super().format(record))
+
+
+def resolve_log_level(value: str | None = None) -> int:
+    configured = (
+        os.environ.get(LOG_LEVEL_ENVIRONMENT_VARIABLE, "INFO")
+        if value is None
+        else value
+    )
+    return ALLOWED_LOG_LEVELS.get(str(configured).strip().upper(), logging.INFO)
 
 
 def configure_logging(log_path: Path | None = None) -> Path:
@@ -34,5 +53,5 @@ def configure_logging(log_path: Path | None = None) -> Path:
             )
         )
         root_logger.addHandler(handler)
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(resolve_log_level())
     return resolved
