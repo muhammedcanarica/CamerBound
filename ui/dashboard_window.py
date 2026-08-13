@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import cv2
@@ -67,6 +68,7 @@ class DashboardHome(QWidget):
         self.camera_directions: dict[int, Direction] = {}
         self._latest_images: dict[Direction, QImage] = {}
         self._plate_detections: dict[Direction, tuple[PlateDetection, ...]] = {}
+        self._plate_detection_updated_at: dict[Direction, float] = {}
         self._build_ui()
         self.camera_service.frame_ready.connect(self._show_frame)
         self.camera_service.status_changed.connect(self._show_status)
@@ -389,6 +391,7 @@ class DashboardHome(QWidget):
         self._plate_detections[direction] = tuple(
             item for item in detections if isinstance(item, PlateDetection)
         )
+        self._plate_detection_updated_at[direction] = time.monotonic()
 
     def _draw_plate_detections(self, image: QImage, direction: Direction) -> None:
         if (
@@ -399,6 +402,15 @@ class DashboardHome(QWidget):
             return
         detections = self._plate_detections.get(direction, ())
         if not detections:
+            return
+        updated_at = self._plate_detection_updated_at.get(direction, 0.0)
+        ttl_seconds = (
+            self.recognition_service.config.plate_detector.debug_detection_overlay_ttl_ms
+            / 1000.0
+        )
+        if time.monotonic() - updated_at > ttl_seconds:
+            self._plate_detections.pop(direction, None)
+            self._plate_detection_updated_at.pop(direction, None)
             return
 
         roi = self.recognition_service.config.roi_for(direction)

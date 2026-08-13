@@ -31,10 +31,11 @@ from PySide6.QtWidgets import (
 )
 
 from app.auth import AuthService, Role
-from app.camera import CameraService
+from app.camera import CameraService, Direction
 from app.config import load_config
 from app.database import Database
 from app.plate_capture import PlateCaptureService
+from app.plate_detector import PlateDetection
 from app.plate_recognition import (
     PlateCandidate,
     PlateRecognitionService,
@@ -586,6 +587,33 @@ class LoginFlowSmokeTest(unittest.TestCase):
         )
         self.assertIsNone(dashboard.findChild(QGroupBox, "securityAuditGroup"))
         self.assertIsNone(dashboard.findChild(QGroupBox, "timeDiagnosticsGroup"))
+
+    def test_debug_detection_overlay_discards_stale_boxes_after_ttl(self) -> None:
+        admin = self.controller.auth_service.authenticate("admin", "admin123")
+        self.controller.show_dashboard(admin)
+        home = self.controller.dashboard_window.dashboard_home
+        home.recognition_service.config = replace(
+            home.recognition_service.config,
+            plate_detector=replace(
+                home.recognition_service.config.plate_detector,
+                debug_overlay=True,
+                debug_detection_overlay_ttl_ms=500,
+            ),
+        )
+        home._plate_detections[Direction.ENTRY] = (
+            PlateDetection(0.9, x=10, y=10, width=40, height=20),
+        )
+        home._plate_detection_updated_at[Direction.ENTRY] = 10.0
+        image = home._latest_images.get(Direction.ENTRY)
+        if image is None:
+            from PySide6.QtGui import QImage
+
+            image = QImage(320, 180, QImage.Format.Format_RGB888)
+
+        with patch("ui.dashboard_window.time.monotonic", return_value=10.6):
+            home._draw_plate_detections(image, Direction.ENTRY)
+
+        self.assertNotIn(Direction.ENTRY, home._plate_detections)
 
     def test_records_page_opens_detail_on_double_click(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")

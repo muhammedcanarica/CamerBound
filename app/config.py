@@ -33,6 +33,9 @@ DEFAULT_PLATE_DETECTOR_CROP_PADDING_RATIO = 0.15
 DEFAULT_MAX_PLATE_CANDIDATES_PER_FRAME = 2
 DEFAULT_ZERO_DETECTION_ROI_FALLBACK_ENABLED = True
 DEFAULT_ZERO_DETECTION_ROI_FALLBACK_INTERVAL_MS = 750
+DEFAULT_MAX_PENDING_OCR_JOBS_PER_CAMERA = 3
+DEFAULT_OCR_JOB_MAX_AGE_MS = 2_500
+DEFAULT_DEBUG_DETECTION_OVERLAY_TTL_MS = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +63,7 @@ class PlateDetectorConfig:
         DEFAULT_ZERO_DETECTION_ROI_FALLBACK_INTERVAL_MS
     )
     debug_overlay: bool = False
+    debug_detection_overlay_ttl_ms: int = DEFAULT_DEBUG_DETECTION_OVERLAY_TTL_MS
     model_dir: Path = Path("models") / "plate_detector" / PLATE_DETECTOR_MODEL_NAME
 
     @property
@@ -84,6 +88,8 @@ class PlateRecognitionConfig:
     record_retention_days: int = DEFAULT_RECORD_RETENTION_DAYS
     ocr_backend: str = "auto"
     plate_detector: PlateDetectorConfig = field(default_factory=PlateDetectorConfig)
+    max_pending_ocr_jobs_per_camera: int = DEFAULT_MAX_PENDING_OCR_JOBS_PER_CAMERA
+    ocr_job_max_age_ms: int = DEFAULT_OCR_JOB_MAX_AGE_MS
     warnings: tuple[str, ...] = ()
 
     def roi_for(self, direction: object) -> NormalizedRoi:
@@ -263,6 +269,24 @@ def _load_plate_recognition(
     retention_days = _record_retention_days(
         raw.get("record_retention_days"), warnings
     )
+    max_pending_ocr_jobs_per_camera = _bounded_number(
+        raw.get("max_pending_ocr_jobs_per_camera"),
+        DEFAULT_MAX_PENDING_OCR_JOBS_PER_CAMERA,
+        1,
+        20,
+        int,
+        "max_pending_ocr_jobs_per_camera",
+        warnings,
+    )
+    ocr_job_max_age_ms = _bounded_number(
+        raw.get("ocr_job_max_age_ms"),
+        DEFAULT_OCR_JOB_MAX_AGE_MS,
+        100,
+        60_000,
+        int,
+        "ocr_job_max_age_ms",
+        warnings,
+    )
     backend_value = raw.get("ocr_backend", "auto")
     if not isinstance(backend_value, str) or backend_value.lower() not in {
         "auto",
@@ -291,6 +315,8 @@ def _load_plate_recognition(
         model_root=(root / "models" / "ocr").resolve(),
         ocr_backend=backend_value.lower(),
         plate_detector=detector,
+        max_pending_ocr_jobs_per_camera=max_pending_ocr_jobs_per_camera,
+        ocr_job_max_age_ms=ocr_job_max_age_ms,
         warnings=tuple(warnings),
     )
 
@@ -378,6 +404,15 @@ def _load_plate_detector(
             warnings,
         ),
         debug_overlay=debug_overlay,
+        debug_detection_overlay_ttl_ms=_bounded_number(
+            raw.get("debug_detection_overlay_ttl_ms"),
+            DEFAULT_DEBUG_DETECTION_OVERLAY_TTL_MS,
+            0,
+            60_000,
+            int,
+            "plate_detector.debug_detection_overlay_ttl_ms",
+            warnings,
+        ),
         model_dir=(
             root / "models" / "plate_detector" / PLATE_DETECTOR_MODEL_NAME
         ).resolve(),

@@ -29,8 +29,11 @@ from app.plate_recognition import (
     LOW_LIGHT_THRESHOLD,
     OcrModelNotFound,
     OcrSegment,
+    OcrJob,
+    OcrJobBuffer,
     PaddleOcrProvider,
     PlateCandidate,
+    PlateDetectionProcessor,
     PlatePresenceTracker,
     PlateRecognitionProcessor,
     PlateRecognitionWorker,
@@ -84,6 +87,21 @@ class RecordingOcrProvider(FakeOcrProvider):
     def recognize(self, images: object) -> list[OcrSegment]:
         self.calls += 1
         self.images = list(images)
+        return super().recognize(images)
+
+
+class BlockingOcrProvider(FakeOcrProvider):
+    def __init__(self, started: threading.Event, release: threading.Event) -> None:
+        super().__init__(confidence=0.97)
+        self.started = started
+        self.release = release
+        self.thread_ids: list[int] = []
+
+    def recognize(self, images: object) -> list[OcrSegment]:
+        self.thread_ids.append(threading.get_ident())
+        self.started.set()
+        if not self.release.wait(2.0):
+            raise RuntimeError("test OCR release timeout")
         return super().recognize(images)
 
 
@@ -297,6 +315,35 @@ class RecognitionPipelineTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.camera_service.stop_all()
         self.temp_directory.cleanup()
+
+    def _make_ocr_job(
+        self,
+        *,
+        camera_id: int = 1,
+        observed_at: float | None = None,
+        quality_score: float = 1.0,
+        frame_value: int = 0,
+        fallback_reason: str | None = None,
+    ) -> OcrJob:
+        now = time.monotonic() if observed_at is None else observed_at
+        frame = np.full((200, 400, 3), frame_value, dtype=np.uint8)
+        crop = np.full((40, 120, 3), max(1, frame_value), dtype=np.uint8)
+        return OcrJob(
+            camera_id=camera_id,
+            direction=Direction.ENTRY if camera_id == 1 else Direction.EXIT,
+            captured_at=datetime(2026, 8, 13, 9, 0, tzinfo=timezone.utc),
+            observed_at=now,
+            received_at=now,
+            queued_at=time.monotonic(),
+            full_frame=frame,
+            roi_crop=crop,
+            ocr_crops=(crop.copy(),),
+            detections=(),
+            used_roi_fallback=fallback_reason is not None,
+            fallback_reason=fallback_reason,
+            detector_ms=12.0,
+            quality_score=quality_score,
+        )
 
     def test_processor_saves_only_after_confirmation(self) -> None:
         camera = self.camera_service.list_cameras()[0]
@@ -1056,6 +1103,180 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         self.assertEqual((first_camera_id, second_camera_id), (10, 20))
         self.assertEqual(worker.pending_frame_count, 1)
+
+    def test_detector_continues_while_ocr_provider_is_blocked(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        provider = BlockingOcrProvider(started, release)
+        detector = FakePlateDetector(
+            [PlateDetection(0.9, x=20, y=10, width=100, height=30)]
+        )
+        config = replace(self.config, recognition_interval_ms=100)
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            config,
+            provider_factory=lambda: provider,
+            detector_factory=lambda: detector,
+        )
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        worker.submit_frame(1, Direction.ENTRY, frame)
+        self.assertTrue(started.wait(1.0))
+        for _ in range(4):
+            time.sleep(0.11)
+            worker.submit_frame(1, Direction.ENTRY, frame)
+        deadline = time.monotonic() + 1.0
+        while detector.calls < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertLessEqual(
+            worker._job_buffer.pending_count(1),
+            config.max_pending_ocr_jobs_per_camera,
+        )
+        release.set()
+        worker.request_stop()
+        thread.join(2.0)
+        self.assertGreaterEqual(detector.calls, 3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(set(provider.thread_ids)), 1)
+
+    def test_ocr_job_buffer_is_bounded_and_replaces_only_weaker_job(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        for quality in (10.0, 20.0, 30.0):
+            buffer.add(self._make_ocr_job(quality_score=quality))
+
+        dropped = buffer.add(self._make_ocr_job(quality_score=5.0))
+        replaced = buffer.add(self._make_ocr_job(quality_score=40.0))
+
+        self.assertFalse(dropped.accepted)
+        self.assertTrue(replaced.accepted)
+        self.assertEqual(replaced.replaced, 1)
+        self.assertEqual(buffer.pending_count(1), 3)
+
+    def test_ocr_job_buffer_discards_stale_jobs(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=100)
+        buffer.add(
+            self._make_ocr_job(observed_at=time.monotonic() - 1.0)
+        )
+
+        self.assertIsNone(buffer.take())
+        self.assertEqual(buffer.stale_count, 1)
+
+    def test_ocr_job_buffer_round_robin_prevents_camera_starvation(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        buffer.add(self._make_ocr_job(camera_id=1, quality_score=1.0))
+        buffer.add(self._make_ocr_job(camera_id=1, quality_score=2.0))
+        buffer.add(self._make_ocr_job(camera_id=2, quality_score=1.0))
+
+        first = buffer.take()
+        second = buffer.take()
+
+        self.assertEqual((first.camera_id, second.camera_id), (1, 2))
+
+    def test_detection_processor_queues_crop_and_preserves_full_frame(self) -> None:
+        detection = PlateDetection(0.9, x=20, y=10, width=100, height=30)
+        processor = PlateDetectionProcessor(
+            self.config,
+            FakePlateDetector([detection]),
+        )
+        frame = np.full((200, 400, 3), 71, dtype=np.uint8)
+
+        result = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=datetime(2026, 8, 13, tzinfo=timezone.utc),
+            observed_at=10.0,
+            received_at=10.0,
+        )
+
+        self.assertIsNotNone(result.job)
+        self.assertEqual(len(result.job.ocr_crops), 1)
+        self.assertLess(result.job.ocr_crops[0].shape[0], result.job.roi_crop.shape[0])
+        np.testing.assert_array_equal(result.job.full_frame, frame)
+        frame[:] = 0
+        self.assertEqual(int(result.job.full_frame[0, 0, 0]), 71)
+
+    def test_detection_processor_keeps_zero_detection_throttle(self) -> None:
+        processor = PlateDetectionProcessor(self.config, FakePlateDetector([]))
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        captured_at = datetime(2026, 8, 13, tzinfo=timezone.utc)
+
+        first = processor.prepare_job(
+            1, Direction.ENTRY, frame,
+            captured_at=captured_at, observed_at=10.0, received_at=10.0,
+        )
+        throttled = processor.prepare_job(
+            1, Direction.ENTRY, frame,
+            captured_at=captured_at, observed_at=10.5, received_at=10.5,
+        )
+        after_interval = processor.prepare_job(
+            1, Direction.ENTRY, frame,
+            captured_at=captured_at, observed_at=10.8, received_at=10.8,
+        )
+
+        self.assertEqual(first.job.fallback_reason, "zero-detection")
+        self.assertIsNone(throttled.job)
+        self.assertEqual(after_interval.job.fallback_reason, "zero-detection")
+
+    def test_detection_processor_exception_queues_detector_error_fallback(self) -> None:
+        processor = PlateDetectionProcessor(
+            self.config,
+            FakePlateDetector(error=PlateDetectorError("temporary")),
+        )
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        result = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=datetime(2026, 8, 13, tzinfo=timezone.utc),
+            observed_at=10.0,
+            received_at=10.0,
+        )
+
+        self.assertEqual(result.job.fallback_reason, "detector-error")
+        self.assertTrue(result.job.used_roi_fallback)
+        self.assertEqual(result.job.ocr_crops[0].shape, result.job.roi_crop.shape)
+
+    def test_queued_observations_use_frame_time_and_matching_full_frame(self) -> None:
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.97),
+            self.plate_service,
+            self.config,
+        )
+        first = self._make_ocr_job(observed_at=10.0, frame_value=11)
+        second = self._make_ocr_job(observed_at=12.0, frame_value=22)
+
+        awaiting = processor.process_ocr_job(first, queue_depth=1)
+        saved = processor.process_ocr_job(second, queue_depth=0)
+
+        self.assertIs(awaiting.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertIs(saved.state, RecognitionState.SAVED)
+        self.assertEqual(
+            datetime.fromisoformat(saved.record.timestamp),
+            second.captured_at,
+        )
+        saved_image = cv2.imread(str(self.capture_service.resolve_reference(saved.record.image_path)))
+        self.assertIsNotNone(saved_image)
+        self.assertAlmostEqual(float(saved_image.mean()), 22.0, delta=3.0)
+
+    def test_queued_observations_outside_capture_window_do_not_confirm(self) -> None:
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.97),
+            self.plate_service,
+            self.config,
+        )
+        first = self._make_ocr_job(observed_at=10.0)
+        delayed = self._make_ocr_job(observed_at=14.0)
+
+        processor.process_ocr_job(first, queue_depth=1)
+        outcome = processor.process_ocr_job(delayed, queue_depth=0)
+
+        self.assertIs(outcome.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertIsNone(outcome.record)
 
     def test_worker_detector_initialization_failure_keeps_roi_fallback_active(self) -> None:
         factory_calls = 0

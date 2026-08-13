@@ -8,6 +8,8 @@
   "plate_detection": {
     "ocr_backend": "auto",
     "recognition_interval_ms": 250,
+    "max_pending_ocr_jobs_per_camera": 3,
+    "ocr_job_max_age_ms": 2500,
     "min_confidence": 0.65,
     "confirmations_required": 2,
     "confirmation_window_seconds": 3,
@@ -22,14 +24,15 @@
       "fallback_to_roi_ocr": true,
       "zero_detection_roi_fallback_enabled": true,
       "zero_detection_roi_fallback_interval_ms": 750,
-      "debug_overlay": true
+      "debug_overlay": true,
+      "debug_detection_overlay_ttl_ms": 500
     },
     "roi": {
       "ENTRY": {
-        "x": 0.001388888888888889,
-        "y": 0.4246913580246914,
-        "width": 0.9986111111111111,
-        "height": 0.5753086419753086
+        "x": 0.004166666666666667,
+        "y": 0.37777777777777777,
+        "width": 0.9958333333333333,
+        "height": 0.6222222222222222
       },
       "EXIT": {
         "x": 0.007142857142857143,

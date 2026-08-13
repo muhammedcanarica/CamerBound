@@ -7,7 +7,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
@@ -347,6 +347,316 @@ class RecognitionOutcome:
     used_roi_fallback: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class OcrJob:
+    """A bounded, in-memory OCR observation tied to its original camera frame."""
+
+    camera_id: int
+    direction: Direction
+    captured_at: datetime
+    observed_at: float
+    received_at: float
+    queued_at: float
+    full_frame: np.ndarray
+    roi_crop: np.ndarray
+    ocr_crops: tuple[np.ndarray, ...]
+    detections: tuple[PlateDetection, ...]
+    used_roi_fallback: bool
+    fallback_reason: str | None
+    detector_ms: float
+    quality_score: float
+
+
+@dataclass(frozen=True, slots=True)
+class DetectionJobResult:
+    job: OcrJob | None
+    detections: tuple[PlateDetection, ...]
+    used_roi_fallback: bool
+    fallback_reason: str | None
+    detector_ms: float
+    roi_brightness: float
+
+
+@dataclass(frozen=True, slots=True)
+class OcrBufferAddResult:
+    accepted: bool
+    replaced: int
+    dropped: int
+    camera_depth: int
+    total_depth: int
+
+
+class OcrJobBuffer:
+    """Camera-fair bounded RAM buffer retaining stronger recent observations."""
+
+    def __init__(self, max_per_camera: int, max_age_ms: int) -> None:
+        self.max_per_camera = max(1, max_per_camera)
+        self.max_age_seconds = max(0.1, max_age_ms / 1000.0)
+        self._jobs: dict[int, deque[OcrJob]] = defaultdict(deque)
+        self._camera_order: deque[int] = deque()
+        self._known_camera_ids: set[int] = set()
+        self._condition = threading.Condition()
+        self.dropped_count = 0
+        self.replaced_count = 0
+        self.stale_count = 0
+
+    def add(self, job: OcrJob) -> OcrBufferAddResult:
+        replaced = 0
+        dropped = 0
+        accepted = True
+        with self._condition:
+            if job.camera_id not in self._known_camera_ids:
+                self._known_camera_ids.add(job.camera_id)
+                self._camera_order.append(job.camera_id)
+            camera_jobs = self._jobs[job.camera_id]
+            if len(camera_jobs) >= self.max_per_camera:
+                weakest_index = min(
+                    range(len(camera_jobs)),
+                    key=lambda index: camera_jobs[index].quality_score,
+                )
+                if job.quality_score > camera_jobs[weakest_index].quality_score:
+                    del camera_jobs[weakest_index]
+                    camera_jobs.append(job)
+                    replaced = 1
+                    self.replaced_count += 1
+                else:
+                    accepted = False
+                    dropped = 1
+                    self.dropped_count += 1
+            else:
+                camera_jobs.append(job)
+            camera_depth = len(camera_jobs)
+            total_depth = sum(len(items) for items in self._jobs.values())
+            if accepted:
+                self._condition.notify()
+        return OcrBufferAddResult(
+            accepted=accepted,
+            replaced=replaced,
+            dropped=dropped,
+            camera_depth=camera_depth,
+            total_depth=total_depth,
+        )
+
+    def take(
+        self,
+        stop_event: threading.Event | None = None,
+        *,
+        wait: bool = False,
+    ) -> OcrJob | None:
+        with self._condition:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    return None
+                now = time.monotonic()
+                for _ in range(len(self._camera_order)):
+                    camera_id = self._camera_order.popleft()
+                    self._camera_order.append(camera_id)
+                    camera_jobs = self._jobs[camera_id]
+                    while (
+                        camera_jobs
+                        and now - camera_jobs[0].observed_at > self.max_age_seconds
+                    ):
+                        camera_jobs.popleft()
+                        self.stale_count += 1
+                    if camera_jobs:
+                        return camera_jobs.popleft()
+                if not wait:
+                    return None
+                self._condition.wait(0.05)
+
+    def pending_count(self, camera_id: int | None = None) -> int:
+        with self._condition:
+            if camera_id is not None:
+                return len(self._jobs.get(camera_id, ()))
+            return sum(len(items) for items in self._jobs.values())
+
+    def clear(self) -> None:
+        with self._condition:
+            self._jobs.clear()
+            self._camera_order.clear()
+            self._known_camera_ids.clear()
+            self._condition.notify_all()
+
+    def wake_all(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+
+class PlateDetectionProcessor:
+    """Detector-only stage. It never initializes or invokes PaddleOCR."""
+
+    def __init__(
+        self,
+        config: PlateRecognitionConfig,
+        detector: PlateDetector | None,
+    ) -> None:
+        self.config = config
+        self.detector = detector
+        self._last_zero_detection_fallback_at: dict[int, float] = {}
+        self._last_detector_error_logged_at: dict[int, float] = {}
+
+    def prepare_job(
+        self,
+        camera_id: int,
+        direction: Direction,
+        frame: object,
+        *,
+        captured_at: datetime,
+        observed_at: float,
+        received_at: float,
+    ) -> DetectionJobResult:
+        roi_crop = crop_roi(frame, self.config.roi_for(direction))
+        if roi_crop is None:
+            return DetectionJobResult(None, (), False, None, 0.0, 0.0)
+
+        detector_started_at = time.perf_counter()
+        detector_config = self.config.plate_detector
+        detections: list[PlateDetection] = []
+        selected: list[PlateDetection] = []
+        used_roi_fallback = not detector_config.enabled
+        fallback_reason = "detector-disabled" if used_roi_fallback else None
+        ocr_crops: list[np.ndarray] = []
+
+        if detector_config.enabled and self.detector is not None:
+            try:
+                detections = self.detector.detect(roi_crop)
+            except Exception as exc:
+                self._log_detector_error(
+                    camera_id,
+                    exc,
+                    detector_started_at,
+                    detector_config.fallback_to_roi_ocr,
+                )
+                if not detector_config.fallback_to_roi_ocr:
+                    raise
+                used_roi_fallback = True
+                fallback_reason = "detector-error"
+                ocr_crops = [roi_crop]
+            if not used_roi_fallback:
+                selected = select_plate_detections(
+                    detections,
+                    detector_config.max_plate_candidates_per_frame,
+                )
+                ocr_crops = [
+                    plate_crop
+                    for detection in selected
+                    if (
+                        plate_crop := crop_padded_plate(
+                            roi_crop,
+                            detection,
+                            detector_config.crop_padding_ratio,
+                        )
+                    )
+                    is not None
+                ]
+                if not ocr_crops and self._should_run_zero_detection_fallback(
+                    camera_id,
+                    observed_at,
+                    detector_config.zero_detection_roi_fallback_enabled,
+                    detector_config.zero_detection_roi_fallback_interval_ms,
+                ):
+                    used_roi_fallback = True
+                    fallback_reason = "zero-detection"
+                    ocr_crops = [roi_crop]
+        elif detector_config.enabled:
+            if not detector_config.fallback_to_roi_ocr:
+                raise PlateDetectorError(
+                    "Plate detector kullanılamıyor ve ROI OCR fallback kapalı."
+                )
+            used_roi_fallback = True
+            fallback_reason = "detector-error"
+            ocr_crops = [roi_crop]
+        else:
+            ocr_crops = [roi_crop]
+
+        detector_ms = (time.perf_counter() - detector_started_at) * 1000.0
+        detection_tuple = tuple(detections)
+        brightness = roi_mean_brightness(roi_crop)
+        if not ocr_crops:
+            return DetectionJobResult(
+                None,
+                detection_tuple,
+                used_roi_fallback,
+                fallback_reason,
+                detector_ms,
+                brightness,
+            )
+
+        full_frame = frame.copy() if isinstance(frame, np.ndarray) else frame
+        if not isinstance(full_frame, np.ndarray):
+            return DetectionJobResult(
+                None,
+                detection_tuple,
+                used_roi_fallback,
+                fallback_reason,
+                detector_ms,
+                brightness,
+            )
+        job = OcrJob(
+            camera_id=camera_id,
+            direction=direction,
+            captured_at=captured_at,
+            observed_at=observed_at,
+            received_at=received_at,
+            queued_at=time.monotonic(),
+            full_frame=full_frame,
+            roi_crop=roi_crop,
+            ocr_crops=tuple(ocr_crops),
+            detections=detection_tuple,
+            used_roi_fallback=used_roi_fallback,
+            fallback_reason=fallback_reason,
+            detector_ms=detector_ms,
+            quality_score=ocr_job_quality_score(ocr_crops, selected),
+        )
+        return DetectionJobResult(
+            job,
+            detection_tuple,
+            used_roi_fallback,
+            fallback_reason,
+            detector_ms,
+            brightness,
+        )
+
+    def _should_run_zero_detection_fallback(
+        self,
+        camera_id: int,
+        observed_at: float,
+        enabled: bool,
+        interval_ms: int,
+    ) -> bool:
+        if not enabled:
+            return False
+        last_fallback_at = self._last_zero_detection_fallback_at.get(camera_id)
+        if (
+            last_fallback_at is not None
+            and (observed_at - last_fallback_at) * 1000.0 < interval_ms
+        ):
+            return False
+        self._last_zero_detection_fallback_at[camera_id] = observed_at
+        return True
+
+    def _log_detector_error(
+        self,
+        camera_id: int,
+        exc: Exception,
+        now: float,
+        fallback_enabled: bool,
+    ) -> None:
+        last_logged_at = self._last_detector_error_logged_at.get(camera_id)
+        if (
+            last_logged_at is not None
+            and now - last_logged_at < OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._last_detector_error_logged_at[camera_id] = now
+        LOGGER.warning(
+            "Plate detector inference failed camera_id=%s fallback=%s error_type=%s",
+            camera_id,
+            "roi" if fallback_enabled else "disabled",
+            type(exc).__name__,
+        )
+
+
 class PlateRecognitionProcessor:
     def __init__(
         self,
@@ -515,6 +825,73 @@ class PlateRecognitionProcessor:
             "detections": tuple(detections),
             "used_roi_fallback": used_roi_fallback,
         }
+        return self._complete_observation(
+            camera_id=camera_id,
+            segments=segments,
+            candidate=candidate,
+            observed_at=(
+                monotonic_at if monotonic_at is not None else time.monotonic()
+            ),
+            detected_at=detected_at,
+            full_frame=frame,
+            **detection_context,
+        )
+
+    def process_ocr_job(
+        self,
+        job: OcrJob,
+        *,
+        queue_depth: int,
+    ) -> RecognitionOutcome:
+        """Run preprocessing, OCR and persistence for an already detected frame."""
+        ocr_started_at = time.perf_counter()
+        preprocess_started_at = ocr_started_at
+        variants: list[np.ndarray] = []
+        for ocr_crop in job.ocr_crops:
+            brightness = roi_mean_brightness(ocr_crop)
+            variants.extend(preprocess_variants(ocr_crop, brightness=brightness))
+        inference_started_at = time.perf_counter()
+        preprocess_ms = (inference_started_at - preprocess_started_at) * 1000.0
+        segments = self.provider.recognize(variants)
+        ocr_finished_at = time.perf_counter()
+        inference_ms = (ocr_finished_at - inference_started_at) * 1000.0
+        candidate = select_best_candidate(segments, job.camera_id)
+        self._log_queued_ocr_diagnostics(
+            job=job,
+            variants=variants,
+            queue_depth=queue_depth,
+            ocr_started_at=ocr_started_at,
+            preprocess_ms=preprocess_ms,
+            inference_ms=inference_ms,
+            candidate_found=candidate is not None,
+        )
+        return self._complete_observation(
+            camera_id=job.camera_id,
+            segments=segments,
+            candidate=candidate,
+            observed_at=job.observed_at,
+            detected_at=job.captured_at,
+            full_frame=job.full_frame,
+            detections=job.detections,
+            used_roi_fallback=job.used_roi_fallback,
+        )
+
+    def _complete_observation(
+        self,
+        *,
+        camera_id: int,
+        segments: Sequence[OcrSegment],
+        candidate: PlateCandidate | None,
+        observed_at: float,
+        detected_at: datetime | None,
+        full_frame: object,
+        detections: tuple[PlateDetection, ...],
+        used_roi_fallback: bool,
+    ) -> RecognitionOutcome:
+        detection_context = {
+            "detections": detections,
+            "used_roi_fallback": used_roi_fallback,
+        }
         if not segments:
             return self._outcome(
                 camera_id,
@@ -535,7 +912,6 @@ class PlateRecognitionProcessor:
                 **detection_context,
             )
 
-        observed_at = monotonic_at if monotonic_at is not None else time.monotonic()
         self.presences.observe(candidate, observed_at)
         progress = self.confirmations.observe_progress(candidate, observed_at)
         confirmed = progress.candidate
@@ -564,7 +940,7 @@ class PlateRecognitionProcessor:
                 camera_id,
                 confirmed.confidence,
                 detected_at,
-                frame,
+                full_frame,
             )
         except DuplicatePlateDetection:
             LOGGER.info("Duplicate plate detection suppressed for camera_id=%s", camera_id)
@@ -731,6 +1107,50 @@ class PlateRecognitionProcessor:
         self._last_zero_detection_fallback_at[camera_id] = now
         return True
 
+    def _log_queued_ocr_diagnostics(
+        self,
+        *,
+        job: OcrJob,
+        variants: Sequence[np.ndarray],
+        queue_depth: int,
+        ocr_started_at: float,
+        preprocess_ms: float,
+        inference_ms: float,
+        candidate_found: bool,
+    ) -> None:
+        if not LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        last_logged_at = self._last_diagnostic_logged_at.get(job.camera_id)
+        if (
+            last_logged_at is not None
+            and ocr_started_at - last_logged_at
+            < OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._last_diagnostic_logged_at[job.camera_id] = ocr_started_at
+        now = time.monotonic()
+        queue_wait_ms = max(0.0, (now - job.queued_at) * 1000.0)
+        end_to_end_ms = max(0.0, (now - job.observed_at) * 1000.0)
+        brightness = roi_mean_brightness(job.roi_crop)
+        LOGGER.debug(
+            "OCR worker diagnostics camera_id=%s direction=%s brightness=%.1f "
+            "low_light=%s variants=%s queue_depth=%s queue_wait_ms=%.1f "
+            "preprocess_ms=%.1f inference_ms=%.1f end_to_end_ms=%.1f "
+            "fallback_reason=%s candidate=%s",
+            job.camera_id,
+            job.direction.value,
+            brightness,
+            "yes" if brightness < LOW_LIGHT_THRESHOLD else "no",
+            len(variants),
+            queue_depth,
+            queue_wait_ms,
+            preprocess_ms,
+            inference_ms,
+            end_to_end_ms,
+            job.fallback_reason or "none",
+            "yes" if candidate_found else "no",
+        )
+
     def _log_detector_error(
         self,
         camera_id: int,
@@ -753,11 +1173,116 @@ class PlateRecognitionProcessor:
         )
 
 
+def ocr_job_quality_score(
+    crops: Sequence[np.ndarray],
+    detections: Sequence[PlateDetection] = (),
+) -> float:
+    """Cheap score favoring confident, larger and sharper plate observations."""
+    confidence = max((item.confidence for item in detections), default=0.0)
+    best_visual_score = 0.0
+    for crop in crops:
+        if not isinstance(crop, np.ndarray) or crop.size == 0:
+            continue
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        area = float(crop.shape[0] * crop.shape[1])
+        visual_score = float(np.log1p(area)) + min(sharpness, 2_000.0) / 100.0
+        best_visual_score = max(best_visual_score, visual_score)
+    return confidence * 100.0 + best_visual_score
+
+
 @dataclass(slots=True)
 class _PendingFrame:
     direction: Direction
     frame: object
     received_at: float
+    observed_at: float
+    captured_at: datetime
+
+
+class PlateOcrWorker:
+    """Single-consumer OCR stage; the provider is never used outside this thread."""
+
+    def __init__(
+        self,
+        plate_service: PlateService,
+        config: PlateRecognitionConfig,
+        provider_factory: Callable[[], OcrProvider],
+        job_buffer: OcrJobBuffer,
+        stop_event: threading.Event,
+        on_outcome: Callable[[int, RecognitionOutcome], None],
+        on_status: Callable[[RecognitionStatus, str], None],
+    ) -> None:
+        self.plate_service = plate_service
+        self.config = config
+        self.provider_factory = provider_factory
+        self.job_buffer = job_buffer
+        self.stop_event = stop_event
+        self.on_outcome = on_outcome
+        self.on_status = on_status
+        self.initialized = threading.Event()
+        self.failed = threading.Event()
+        self.initialization_error: Exception | None = None
+
+    def run(self) -> None:
+        try:
+            try:
+                provider = self.provider_factory()
+                processor = PlateRecognitionProcessor(
+                    provider,
+                    self.plate_service,
+                    self.config,
+                )
+            except Exception as exc:
+                self.initialization_error = exc
+                self.failed.set()
+                if isinstance(exc, OcrModelError):
+                    LOGGER.error("OCR model initialization failed: %s", exc)
+                    self.on_status(RecognitionStatus.UNAVAILABLE, str(exc))
+                else:
+                    LOGGER.exception("OCR initialization failed")
+                    self.on_status(
+                        RecognitionStatus.UNAVAILABLE,
+                        f"OCR kullanılamıyor: {exc}",
+                    )
+                return
+            finally:
+                self.initialized.set()
+
+            recovering_from_error = False
+            while not self.stop_event.is_set():
+                stale_before = self.job_buffer.stale_count
+                job = self.job_buffer.take(self.stop_event, wait=True)
+                stale_discarded = self.job_buffer.stale_count - stale_before
+                if stale_discarded and LOGGER.isEnabledFor(logging.DEBUG):
+                    LOGGER.debug(
+                        "OCR buffer stale jobs discarded count=%s total=%s",
+                        stale_discarded,
+                        self.job_buffer.stale_count,
+                    )
+                if job is None:
+                    return
+                try:
+                    outcome = processor.process_ocr_job(
+                        job,
+                        queue_depth=self.job_buffer.pending_count(),
+                    )
+                except OcrModelError as exc:
+                    LOGGER.error("Fatal OCR model error: %s", exc)
+                    self.failed.set()
+                    self.on_status(RecognitionStatus.UNAVAILABLE, str(exc))
+                    return
+                except Exception as exc:
+                    LOGGER.exception("Transient OCR inference error")
+                    self.on_status(RecognitionStatus.ERROR, f"OCR hatası: {exc}")
+                    recovering_from_error = True
+                    continue
+                if recovering_from_error:
+                    self.on_status(RecognitionStatus.ACTIVE, "OCR yeniden aktif.")
+                    recovering_from_error = False
+                self.on_outcome(job.camera_id, outcome)
+        finally:
+            self.initialized.set()
 
 
 class PlateRecognitionWorker(QObject):
@@ -787,16 +1312,26 @@ class PlateRecognitionWorker(QObject):
         self._last_processed_at: dict[int, float] = {}
         self._camera_order: deque[int] = deque()
         self._known_camera_ids: set[int] = set()
+        self._last_detection_diagnostic_at: dict[int, float] = {}
+        self._job_buffer = OcrJobBuffer(
+            config.max_pending_ocr_jobs_per_camera,
+            config.ocr_job_max_age_ms,
+        )
+        self._ocr_worker: PlateOcrWorker | None = None
+        self._ocr_thread: threading.Thread | None = None
 
     def submit_frame(self, camera_id: int, direction: Direction, frame: object) -> None:
         with self._lock:
             if camera_id not in self._known_camera_ids:
                 self._known_camera_ids.add(camera_id)
                 self._camera_order.append(camera_id)
+            observed_at = time.monotonic()
             self._latest_frames[camera_id] = _PendingFrame(
-                direction,
-                frame,
-                time.perf_counter(),
+                direction=direction,
+                frame=frame,
+                received_at=observed_at,
+                observed_at=observed_at,
+                captured_at=datetime.now(timezone.utc),
             )
         self._wake_event.set()
 
@@ -808,27 +1343,28 @@ class PlateRecognitionWorker(QObject):
     def request_stop(self) -> None:
         self._stop_event.set()
         self._wake_event.set()
+        self._job_buffer.wake_all()
 
     @Slot()
     def run(self) -> None:
         self.status_changed.emit(RecognitionStatus.INITIALIZING, "OCR başlatılıyor.")
+        ocr_worker = PlateOcrWorker(
+            self.plate_service,
+            self.config,
+            self.provider_factory,
+            self._job_buffer,
+            self._stop_event,
+            self._publish_outcome,
+            self.status_changed.emit,
+        )
+        ocr_thread = threading.Thread(
+            target=ocr_worker.run,
+            name="plate-ocr-worker",
+        )
+        self._ocr_worker = ocr_worker
+        self._ocr_thread = ocr_thread
+        ocr_thread.start()
         try:
-            try:
-                provider = self.provider_factory()
-            except OcrModelError as exc:
-                LOGGER.error("OCR model initialization failed: %s", exc)
-                self.status_changed.emit(RecognitionStatus.UNAVAILABLE, str(exc))
-                self._stop_event.wait()
-                return
-            except Exception as exc:
-                LOGGER.exception("OCR initialization failed")
-                self.status_changed.emit(
-                    RecognitionStatus.UNAVAILABLE,
-                    f"OCR kullanılamıyor: {exc}",
-                )
-                self._stop_event.wait()
-                return
-
             detector: PlateDetector | None = None
             detector_message = ""
             if self.config.plate_detector.enabled and self.detector_factory is not None:
@@ -852,19 +1388,23 @@ class PlateRecognitionWorker(QObject):
                     )
                     detector_message = " Plate detector kullanılamıyor; ROI OCR fallback aktif."
 
-            processor = PlateRecognitionProcessor(
-                provider,
-                self.plate_service,
-                self.config,
-                detector=detector,
-            )
+            while not ocr_worker.initialized.wait(0.05):
+                if self._stop_event.is_set():
+                    return
+            if ocr_worker.initialization_error is not None:
+                self._stop_event.wait()
+                return
+
+            detector_processor = PlateDetectionProcessor(self.config, detector)
             active_message = "OCR aktif."
             active_message += detector_message
             if self.config.warnings:
                 active_message += " " + " ".join(self.config.warnings)
             self.status_changed.emit(RecognitionStatus.ACTIVE, active_message)
-            recovering_from_error = False
             while not self._stop_event.is_set():
+                if ocr_worker.failed.is_set():
+                    self._stop_event.wait(0.05)
+                    continue
                 pending = self._take_due_frame()
                 if pending is None:
                     self._wake_event.wait(0.05)
@@ -872,38 +1412,95 @@ class PlateRecognitionWorker(QObject):
                     continue
                 camera_id, item = pending
                 try:
-                    outcome = processor.process(
+                    result = detector_processor.prepare_job(
                         camera_id,
                         item.direction,
                         item.frame,
-                        frame_received_at=item.received_at,
+                        captured_at=item.captured_at,
+                        observed_at=item.observed_at,
+                        received_at=item.received_at,
                     )
-                except OcrModelError as exc:
-                    LOGGER.error("Fatal OCR model error: %s", exc)
-                    self.status_changed.emit(RecognitionStatus.UNAVAILABLE, str(exc))
-                    self._stop_event.wait()
-                    return
                 except Exception as exc:
-                    LOGGER.exception("Transient OCR inference error")
-                    self.status_changed.emit(RecognitionStatus.ERROR, f"OCR hatası: {exc}")
-                    recovering_from_error = True
+                    LOGGER.exception("Transient plate detector error")
+                    self.status_changed.emit(
+                        RecognitionStatus.ERROR,
+                        f"Plate detector hatası: {exc}",
+                    )
                     continue
-                if recovering_from_error:
-                    self.status_changed.emit(RecognitionStatus.ACTIVE, "OCR yeniden aktif.")
-                    recovering_from_error = False
-                if outcome.candidate is not None:
-                    self.candidate_changed.emit(camera_id, outcome.candidate)
-                self.detections_changed.emit(camera_id, outcome.detections)
-                if outcome.record is not None:
-                    self.record_saved.emit(outcome.record)
-                self.outcome_changed.emit(camera_id, outcome)
+                self.detections_changed.emit(camera_id, result.detections)
+                if result.job is None:
+                    self.outcome_changed.emit(
+                        camera_id,
+                        RecognitionOutcome(
+                            candidate=None,
+                            record=None,
+                            state=RecognitionState.NO_OCR_TEXT,
+                            detections=result.detections,
+                            used_roi_fallback=result.used_roi_fallback,
+                        ),
+                    )
+                    self._log_detection_diagnostics(camera_id, item, result, None)
+                    continue
+                buffer_result = self._job_buffer.add(result.job)
+                self._log_detection_diagnostics(
+                    camera_id,
+                    item,
+                    result,
+                    buffer_result,
+                )
         finally:
+            self._stop_event.set()
+            self._job_buffer.clear()
+            self._job_buffer.wake_all()
+            ocr_thread.join()
             with self._lock:
                 self._latest_frames.clear()
                 self._camera_order.clear()
                 self._known_camera_ids.clear()
             self.status_changed.emit(RecognitionStatus.STOPPED, "OCR durduruldu.")
             self.finished.emit()
+
+    def _publish_outcome(self, camera_id: int, outcome: RecognitionOutcome) -> None:
+        if outcome.candidate is not None:
+            self.candidate_changed.emit(camera_id, outcome.candidate)
+        if outcome.record is not None:
+            self.record_saved.emit(outcome.record)
+        self.outcome_changed.emit(camera_id, outcome)
+
+    def _log_detection_diagnostics(
+        self,
+        camera_id: int,
+        item: _PendingFrame,
+        result: DetectionJobResult,
+        buffer_result: OcrBufferAddResult | None,
+    ) -> None:
+        if not LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        now = time.monotonic()
+        last_logged_at = self._last_detection_diagnostic_at.get(camera_id)
+        if (
+            last_logged_at is not None
+            and now - last_logged_at < OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._last_detection_diagnostic_at[camera_id] = now
+        LOGGER.debug(
+            "Detector worker diagnostics camera_id=%s direction=%s detector_ms=%.1f "
+            "detector_frame_age_ms=%.1f detections=%s ocr_queue_depth=%s "
+            "camera_queue_depth=%s dropped=%s replaced=%s stale_total=%s "
+            "fallback_reason=%s",
+            camera_id,
+            item.direction.value,
+            result.detector_ms,
+            max(0.0, (now - item.observed_at) * 1000.0),
+            len(result.detections),
+            self._job_buffer.pending_count(),
+            0 if buffer_result is None else buffer_result.camera_depth,
+            self._job_buffer.dropped_count,
+            self._job_buffer.replaced_count,
+            self._job_buffer.stale_count,
+            result.fallback_reason or "none",
+        )
 
     def _take_due_frame(self) -> tuple[int, _PendingFrame] | None:
         interval = self.config.recognition_interval_ms / 1000.0

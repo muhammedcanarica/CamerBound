@@ -84,10 +84,10 @@ Kamera kullanıcı adı ve bağlantı şifresi yalnızca ADMIN kullanıcı taraf
 ```text
 Kamera latest frame
 → Kamera ROI alanı
-→ OpenVINO generic/pretrained plaka detector
-→ En fazla iki padded plaka crop'u
-→ OCR preprocessing variantları
-→ OCR
+→ Detector worker: OpenVINO generic/pretrained plaka detector
+→ En fazla iki padded plaka crop'u veya throttled ROI fallback job'u
+→ Kamera başına bounded RAM OCR job buffer
+→ OCR worker: preprocessing variantları ve PaddleOCR
 → Plaka normalizasyonu
 → Türk plaka doğrulaması
 → Minimum OCR kalite filtresi ve confirmation kontrolü
@@ -112,6 +112,8 @@ Same-camera same-plate duplicate cooldown: 120 saniye
 
 Detector açıkken OpenVINO modeli yalnızca yapılandırılmış ENTRY/EXIT ROI üzerinde çalışır. Yalnızca modelin `plate` sınıfı OCR'a gönderilir; `vehicle` sınıfı OCR'a gönderilmez. Detection confidence ve bbox alanına göre en iyi iki plaka crop'u seçilir. Detector exception verirse `fallback_to_roi_ocr=true` ile mevcut ROI OCR akışı korunur. Detector başarıyla çalışıp hiç kullanılabilir plate crop üretmezse, kamera başına ayrı tutulan 750 ms throttle süresi dolduğunda safety fallback olarak ROI OCR bir kez denenir; aradaki recognition frame'lerinde pahalı OCR çağrısı yapılmaz.
 
+Detector ve PaddleOCR ayrı worker'larda çalışır; OCR inference sürerken detector round-robin olarak her kameranın en yeni frame'ini işlemeye devam eder. Üretilen OCR job'ları kamera başına en fazla 3 adet RAM'de tutulur ve 2500 ms'den eski job işlenmeden bırakılır. Buffer dolduğunda detector confidence, crop alanı ve Laplacian sharpness kullanan ucuz kalite skoru daha iyi yeni frame'i zayıf pending job ile değiştirebilir. OCR job, crop ile birlikte aynı full camera frame'i ve frame zamanlarını taşıdığı için confirmation gözlem zamanı ile confirmed-record JPEG'i doğru frame'e bağlı kalır. Video veya sürekli frame kaydı yapılmaz.
+
 Varsayılan detector ayarları:
 
 ```json
@@ -124,9 +126,12 @@ Varsayılan detector ayarları:
   "fallback_to_roi_ocr": true,
   "zero_detection_roi_fallback_enabled": true,
   "zero_detection_roi_fallback_interval_ms": 750,
-  "debug_overlay": false
+  "debug_overlay": false,
+  "debug_detection_overlay_ttl_ms": 500
 }
 ```
+
+`plate_detection` seviyesindeki buffer ayarları `max_pending_ocr_jobs_per_camera=3` ve `ocr_job_max_age_ms=2500` değerleridir. Debug detector kutusu son detection güncellemesinden 500 ms sonra preview üzerinde çizilmez; `debug_overlay=false` production davranışı değişmez.
 
 Beklenen offline model dizini:
 

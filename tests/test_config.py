@@ -37,14 +37,18 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                                 "zero_detection_roi_fallback_enabled": True,
                                 "zero_detection_roi_fallback_interval_ms": 750,
                                 "debug_overlay": False,
-                            }
+                                "debug_detection_overlay_ttl_ms": 500,
+                            },
+                            "max_pending_ocr_jobs_per_camera": 3,
+                            "ocr_job_max_age_ms": 2500,
                         },
                     }
                 ),
                 encoding="utf-8",
             )
 
-            detector = load_config(settings_path).plate_recognition.plate_detector
+            config = load_config(settings_path).plate_recognition
+            detector = config.plate_detector
 
         self.assertTrue(detector.enabled)
         self.assertEqual(detector.backend, "openvino")
@@ -55,6 +59,9 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertTrue(detector.zero_detection_roi_fallback_enabled)
         self.assertEqual(detector.zero_detection_roi_fallback_interval_ms, 750)
         self.assertFalse(detector.debug_overlay)
+        self.assertEqual(detector.debug_detection_overlay_ttl_ms, 500)
+        self.assertEqual(config.max_pending_ocr_jobs_per_camera, 3)
+        self.assertEqual(config.ocr_job_max_age_ms, 2500)
         self.assertEqual(detector.model_dir.name, PLATE_DETECTOR_MODEL_NAME)
         self.assertEqual(detector.model_xml.name, "model.xml")
         self.assertEqual(detector.model_bin.name, "model.bin")
@@ -67,6 +74,8 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                     {
                         "database_path": "test.db",
                         "plate_detection": {
+                            "max_pending_ocr_jobs_per_camera": 0,
+                            "ocr_job_max_age_ms": 0,
                             "plate_detector": {
                                 "enabled": "yes",
                                 "backend": "unknown",
@@ -76,6 +85,7 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                                 "fallback_to_roi_ocr": "yes",
                                 "zero_detection_roi_fallback_enabled": "yes",
                                 "zero_detection_roi_fallback_interval_ms": -1,
+                                "debug_detection_overlay_ttl_ms": -1,
                             }
                         },
                     }
@@ -94,7 +104,10 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertTrue(detector.fallback_to_roi_ocr)
         self.assertTrue(detector.zero_detection_roi_fallback_enabled)
         self.assertEqual(detector.zero_detection_roi_fallback_interval_ms, 750)
-        self.assertGreaterEqual(len(config.warnings), 8)
+        self.assertEqual(detector.debug_detection_overlay_ttl_ms, 500)
+        self.assertEqual(config.max_pending_ocr_jobs_per_camera, 3)
+        self.assertEqual(config.ocr_job_max_age_ms, 2500)
+        self.assertGreaterEqual(len(config.warnings), 11)
 
     def test_ocr_sampling_interval_is_250_without_relaxing_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
