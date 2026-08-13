@@ -123,6 +123,15 @@ class LoginFlowSmokeTest(unittest.TestCase):
         self.assertEqual(dashboard.user.username, "admin")
         self.assertEqual(dashboard.stack.count(), 5)
         self.assertTrue(dashboard.dashboard_home.recent_table.isVisible())
+        recent_headers = [
+            dashboard.dashboard_home.recent_table.horizontalHeaderItem(index).text()
+            for index in range(dashboard.dashboard_home.recent_table.columnCount())
+        ]
+        self.assertEqual(
+            recent_headers,
+            ["Plaka", "İşlem", "Kamera", "Tarih / Saat"],
+        )
+        self.assertNotIn("Güven", recent_headers)
         for card in dashboard.dashboard_home.camera_cards.values():
             self.assertGreaterEqual(card.preview.minimumHeight(), 280)
             self.assertGreaterEqual(card.preview.height(), 280)
@@ -167,6 +176,9 @@ class LoginFlowSmokeTest(unittest.TestCase):
         )
         card = dashboard.dashboard_home.camera_cards[camera.direction]
         saved_plate_before_candidate = card.last_plate.text()
+        dashboard.dashboard_home._show_candidate(camera.id, candidate)
+        self.assertIn("OCR: 34 ABC 123", card.ocr_status.text())
+        self.assertNotIn("%", card.ocr_status.text())
         outcome_cases = (
             (
                 RecognitionOutcome(
@@ -177,7 +189,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
                     confirmation_required=2,
                 ),
                 "Durum: Doğrulanıyor (1/2)",
-                "OCR: 34 ABC 123 · %75",
+                "OCR: 34 ABC 123",
             ),
             (
                 RecognitionOutcome(
@@ -185,8 +197,8 @@ class LoginFlowSmokeTest(unittest.TestCase):
                     None,
                     RecognitionState.LOW_CONFIDENCE,
                 ),
-                "Durum: Güven düşük, kaydedilmedi",
-                "OCR: 34 ABC 123 · %58",
+                "Durum: Okuma yeterli değil, kaydedilmedi",
+                "OCR: 34 ABC 123",
             ),
             (
                 RecognitionOutcome(
@@ -195,7 +207,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
                     RecognitionState.SAVED,
                 ),
                 "Durum: Kaydedildi",
-                "OCR: 34 CLK 536 · %97",
+                "OCR: 34 CLK 536",
             ),
             (
                 RecognitionOutcome(
@@ -204,8 +216,8 @@ class LoginFlowSmokeTest(unittest.TestCase):
                     RecognitionState.DUPLICATE_SUPPRESSED,
                     duplicate=True,
                 ),
-                "Durum: Zaten algılandı",
-                "OCR: 34 CLK 536 · %97",
+                "Durum: Zaten kaydedildi",
+                "OCR: 34 CLK 536",
             ),
         )
         for outcome, expected_state, expected_ocr in outcome_cases:
@@ -213,6 +225,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
             ocr_text = card.ocr_status.text()
             self.assertIn(expected_ocr, ocr_text)
             self.assertIn(expected_state, ocr_text)
+            self.assertNotIn("%", ocr_text)
             self.assertEqual(card.last_plate.text(), saved_plate_before_candidate)
 
         dashboard.dashboard_home._show_recognition_outcome(
@@ -592,9 +605,16 @@ class LoginFlowSmokeTest(unittest.TestCase):
         self.assertIsInstance(day_button, QPushButton)
         self.assertEqual(day_button.text(), "Aç")
         day_button.click()
-        self.assertEqual(records_page.table.columnCount(), 6)
-        self.assertEqual(records_page.table.horizontalHeaderItem(5).text(), "Fotoğraf")
-        photo_button = records_page.table.cellWidget(0, 5)
+        self.assertEqual(records_page.table.columnCount(), 5)
+        self.assertEqual(records_page.table.horizontalHeaderItem(4).text(), "Fotoğraf")
+        self.assertNotIn(
+            "Güven",
+            [
+                records_page.table.horizontalHeaderItem(index).text()
+                for index in range(records_page.table.columnCount())
+            ],
+        )
+        photo_button = records_page.table.cellWidget(0, 4)
         self.assertIsInstance(photo_button, QPushButton)
         self.assertEqual(photo_button.text(), "Aç")
         self.controller.dashboard_window.stack.setCurrentWidget(records_page)

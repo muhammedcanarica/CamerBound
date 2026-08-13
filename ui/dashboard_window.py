@@ -106,7 +106,7 @@ class DashboardHome(QWidget):
         self.recent_table = QTableWidget()
         prepare_table(
             self.recent_table,
-            ["Plaka", "İşlem", "Kamera", "Güven", "Tarih / Saat"],
+            ["Plaka", "İşlem", "Kamera", "Tarih / Saat"],
         )
         self.recent_table.setMinimumHeight(120)
         self.recent_table.setSizePolicy(
@@ -263,7 +263,7 @@ class DashboardHome(QWidget):
         if direction is None:
             return
         self.camera_cards[direction].ocr_status.setText(
-            f"OCR: {display_plate(candidate.plate)} · %{candidate.confidence * 100:.0f}\n"
+            f"OCR: {display_plate(candidate.plate)}\n"
             "Durum: Değerlendiriliyor"
         )
         self.camera_cards[direction].ocr_status.setToolTip(
@@ -287,9 +287,9 @@ class DashboardHome(QWidget):
             return
 
         state_texts = {
-            RecognitionState.LOW_CONFIDENCE: "Güven düşük, kaydedilmedi",
+            RecognitionState.LOW_CONFIDENCE: "Okuma yeterli değil, kaydedilmedi",
             RecognitionState.SAVED: "Kaydedildi",
-            RecognitionState.DUPLICATE_SUPPRESSED: "Zaten algılandı",
+            RecognitionState.DUPLICATE_SUPPRESSED: "Zaten kaydedildi",
         }
         if outcome.state is RecognitionState.AWAITING_CONFIRMATION:
             state_text = (
@@ -299,8 +299,7 @@ class DashboardHome(QWidget):
         else:
             state_text = state_texts.get(outcome.state, "Plaka aranıyor")
         card.ocr_status.setText(
-            f"OCR: {display_plate(candidate.plate)} · "
-            f"%{candidate.confidence * 100:.0f}\n"
+            f"OCR: {display_plate(candidate.plate)}\n"
             f"Durum: {state_text}"
         )
 
@@ -444,7 +443,6 @@ class DashboardHome(QWidget):
                 record.plate,
                 "Giriş" if record.direction is Direction.ENTRY else "Çıkış",
                 record.camera_name,
-                f"%{record.confidence * 100:.1f}",
                 display_timestamp(record.timestamp),
             )
             for column, value in enumerate(values):

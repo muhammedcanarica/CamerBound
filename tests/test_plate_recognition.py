@@ -26,7 +26,6 @@ from app.plate_capture import PlateCaptureService
 from app.plate_detector import PlateDetection, PlateDetectorError
 from app.plate_recognition import (
     ConfirmationTracker,
-    HIGH_CONFIDENCE_THRESHOLD,
     LOW_LIGHT_THRESHOLD,
     OcrModelNotFound,
     OcrSegment,
@@ -327,10 +326,10 @@ class RecognitionPipelineTests(unittest.TestCase):
             self.capture_service.resolve_reference(second.record.image_path).is_file()
         )
 
-    def test_very_high_confidence_valid_plate_saves_on_first_observation(self) -> None:
+    def test_very_high_confidence_still_requires_two_observations(self) -> None:
         camera = self.camera_service.list_cameras()[0]
         processor = PlateRecognitionProcessor(
-            FakeOcrProvider(confidence=0.97), self.plate_service, self.config
+            FakeOcrProvider(confidence=0.99), self.plate_service, self.config
         )
 
         with patch.object(
@@ -338,18 +337,26 @@ class RecognitionPipelineTests(unittest.TestCase):
             "save_plate_detection",
             wraps=self.plate_service.save_plate_detection,
         ) as save_plate_detection:
-            outcome = processor.process(
+            first = processor.process(
                 camera.id,
                 camera.direction,
                 np.zeros((200, 400, 3), dtype=np.uint8),
                 monotonic_at=1.0,
             )
+            second = processor.process(
+                camera.id,
+                camera.direction,
+                np.zeros((200, 400, 3), dtype=np.uint8),
+                monotonic_at=2.0,
+            )
 
-        self.assertEqual(HIGH_CONFIDENCE_THRESHOLD, 0.90)
+        self.assertIs(first.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertEqual((first.confirmation_count, first.confirmation_required), (1, 2))
+        self.assertIsNone(first.record)
         save_plate_detection.assert_called_once()
-        self.assertIs(outcome.state, RecognitionState.SAVED)
-        self.assertEqual((outcome.confirmation_count, outcome.confirmation_required), (1, 1))
-        self.assertIsNotNone(outcome.record)
+        self.assertIs(second.state, RecognitionState.SAVED)
+        self.assertEqual((second.confirmation_count, second.confirmation_required), (2, 2))
+        self.assertIsNotNone(second.record)
         self.assertEqual(self._record_count(), 1)
 
     def test_low_confidence_and_invalid_plate_have_distinct_outcomes(self) -> None:
@@ -381,14 +388,23 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
         frame = np.zeros((200, 400, 3), dtype=np.uint8)
 
-        saved = processor.process(
+        first = processor.process(
             camera.id, camera.direction, frame, monotonic_at=1.0
         )
-        duplicate = processor.process(
+        saved = processor.process(
             camera.id, camera.direction, frame, monotonic_at=2.0
         )
+        awaiting_again = processor.process(
+            camera.id, camera.direction, frame, monotonic_at=3.0
+        )
+        processor.process(camera.id, camera.direction, frame, monotonic_at=6.0)
+        duplicate = processor.process(
+            camera.id, camera.direction, frame, monotonic_at=7.0
+        )
 
+        self.assertIs(first.state, RecognitionState.AWAITING_CONFIRMATION)
         self.assertIs(saved.state, RecognitionState.SAVED)
+        self.assertIs(awaiting_again.state, RecognitionState.AWAITING_CONFIRMATION)
         self.assertIs(duplicate.state, RecognitionState.DUPLICATE_SUPPRESSED)
         self.assertTrue(duplicate.duplicate)
         self.assertEqual(self._record_count(), 1)
@@ -440,14 +456,22 @@ class RecognitionPipelineTests(unittest.TestCase):
             "save_plate_detection",
             wraps=self.plate_service.save_plate_detection,
         ) as save_plate_detection:
-            outcome = processor.process(
+            first = processor.process(
                 camera.id,
                 camera.direction,
                 frame,
                 monotonic_at=1.0,
             )
+            outcome = processor.process(
+                camera.id,
+                camera.direction,
+                frame,
+                monotonic_at=2.0,
+            )
 
-        self.assertEqual(detector.calls, 1)
+        self.assertIs(first.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertEqual(detector.calls, 2)
+        self.assertEqual(provider.calls, 2)
         self.assertEqual(len(provider.images), 4)
         self.assertEqual(provider.images[2].shape, (60, 200, 3))
         self.assertFalse(outcome.used_roi_fallback)
@@ -724,15 +748,25 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
         frame = np.zeros((200, 400, 3), dtype=np.uint8)
         detected_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
-        first = processor.process(
+        processor.process(
             camera.id, camera.direction, frame, detected_at, monotonic_at=1.0
+        )
+        first = processor.process(
+            camera.id, camera.direction, frame, detected_at, monotonic_at=2.0
+        )
+        processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            detected_at + timedelta(seconds=16),
+            monotonic_at=18.0,
         )
         second = processor.process(
             camera.id,
             camera.direction,
             frame,
-            detected_at + timedelta(seconds=16),
-            monotonic_at=17.0,
+            detected_at + timedelta(seconds=17),
+            monotonic_at=19.0,
         )
 
         self.assertIsNotNone(first.record)

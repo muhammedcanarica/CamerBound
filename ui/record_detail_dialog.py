@@ -121,14 +121,10 @@ class RecordDetailDialog(QDialog):
         self.camera_value = self._detail_value(
             self.record.camera_name, "recordCameraValue"
         )
-        self.confidence_value = self._detail_value(
-            f"%{self.record.confidence * 100:.1f}", "recordConfidenceValue"
-        )
         metadata_layout.addRow("Plaka", self.plate_value)
         metadata_layout.addRow("Tarih / Saat", self.timestamp_value)
         metadata_layout.addRow("Yön", self.direction_value)
         metadata_layout.addRow("Kamera", self.camera_value)
-        metadata_layout.addRow("OCR Güveni", self.confidence_value)
         layout.addWidget(metadata_frame)
 
         footer = QHBoxLayout()

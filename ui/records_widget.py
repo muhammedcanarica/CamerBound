@@ -122,6 +122,7 @@ class RecordsWidget(QWidget):
         self._records_by_id = {}
         sorting_enabled = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
+        self.table.clearContents()
         prepare_table(
             self.table,
             ["Tarih", "Toplam Kayıt", "Giriş", "Çıkış", ""],
@@ -153,9 +154,10 @@ class RecordsWidget(QWidget):
         self._records_by_id = {record.id: record for record in records}
         sorting_enabled = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
+        self.table.clearContents()
         prepare_table(
             self.table,
-            ["Plaka", "Giriş / Çıkış", "Kamera", "Güven", "Saat", "Fotoğraf"],
+            ["Plaka", "Giriş / Çıkış", "Kamera", "Saat", "Fotoğraf"],
         )
         self.table.setRowCount(len(records))
         for row_index, record in enumerate(records):
@@ -163,14 +165,13 @@ class RecordsWidget(QWidget):
                 record.plate,
                 "Giriş" if record.direction is Direction.ENTRY else "Çıkış",
                 record.camera_name,
-                f"%{record.confidence * 100:.1f}",
                 display_timestamp(record.timestamp),
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, record.id)
-                if column in (1, 3):
+                if column == 1:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row_index, column, item)
             if record.image_path:
@@ -181,11 +182,11 @@ class RecordsWidget(QWidget):
                 open_button.clicked.connect(
                     partial(self._open_record_detail, record.id)
                 )
-                self.table.setCellWidget(row_index, 5, open_button)
+                self.table.setCellWidget(row_index, 4, open_button)
             else:
                 photo_item = QTableWidgetItem("-")
                 photo_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.table.setItem(row_index, 5, photo_item)
+                self.table.setItem(row_index, 4, photo_item)
         self.table.setSortingEnabled(sorting_enabled)
 
     def _handle_double_click(self, row: int, column: int) -> None:

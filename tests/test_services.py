@@ -315,6 +315,54 @@ class ServiceTests(unittest.TestCase):
 
         self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 1)
 
+    def test_same_camera_plate_cooldown_persists_for_120_seconds(self) -> None:
+        cameras = {camera.direction: camera for camera in self.camera_service.list_cameras()}
+        service = PlateService(
+            self.database,
+            duplicate_cooldown_seconds=120,
+            capture_service=self.capture_service,
+        )
+        now = datetime(2026, 8, 12, 9, 0, tzinfo=timezone.utc)
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        first = service.save_plate_detection(
+            "34PARK01", cameras[Direction.ENTRY].id, 0.99, now, frame
+        )
+        for seconds in (10, 60, 119, 120):
+            restarted_service = PlateService(
+                self.database,
+                duplicate_cooldown_seconds=120,
+                capture_service=self.capture_service,
+            )
+            with self.assertRaises(DuplicatePlateDetection):
+                restarted_service.save_plate_detection(
+                    "34PARK01",
+                    cameras[Direction.ENTRY].id,
+                    0.99,
+                    now + timedelta(seconds=seconds),
+                    frame,
+                )
+
+        exit_record = service.save_plate_detection(
+            "34PARK01",
+            cameras[Direction.EXIT].id,
+            0.99,
+            now + timedelta(seconds=60),
+            frame,
+        )
+        after_cooldown = service.save_plate_detection(
+            "34PARK01",
+            cameras[Direction.ENTRY].id,
+            0.99,
+            now + timedelta(seconds=121),
+            frame,
+        )
+
+        self.assertEqual(first.direction, Direction.ENTRY)
+        self.assertEqual(exit_record.direction, Direction.EXIT)
+        self.assertEqual(after_cooldown.direction, Direction.ENTRY)
+        self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 3)
+
     def test_capture_failure_keeps_database_record_with_null_path(self) -> None:
         camera = self.camera_service.list_cameras()[0]
         frame = np.zeros((200, 400, 3), dtype=np.uint8)

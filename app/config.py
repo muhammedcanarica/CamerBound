@@ -23,6 +23,7 @@ class NormalizedRoi:
 
 DEFAULT_ROI = NormalizedRoi(x=0.10, y=0.35, width=0.80, height=0.55)
 DEFAULT_RECORD_RETENTION_DAYS = 90
+DEFAULT_DUPLICATE_COOLDOWN_SECONDS = 120
 SUPPORTED_RECORD_RETENTION_DAYS = (30, 90, 180, 0)
 DEFAULT_CAPTURE_MAX_WIDTH = 960
 DEFAULT_CAPTURE_JPEG_QUALITY = 60
@@ -244,7 +245,11 @@ def _load_plate_recognition(
         "confirmation_window_seconds", warnings,
     )
     cooldown = _bounded_number(
-        raw.get("duplicate_cooldown_seconds"), 10, 0, 86_400, int,
+        raw.get("duplicate_cooldown_seconds"),
+        DEFAULT_DUPLICATE_COOLDOWN_SECONDS,
+        0,
+        86_400,
+        int,
         "duplicate_cooldown_seconds", warnings,
     )
     retention_days = _record_retention_days(

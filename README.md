@@ -9,12 +9,11 @@ CamerBound, giriş ve çıkış kameralarından araç plakalarını okuyup kayı
 - Her kamera için ayrı ve kullanıcı tarafından kalibre edilebilir plaka ROI alanı
 - PaddleOCR ve ONNX Runtime ile yerel OCR işleme
 - Türk plaka normalizasyonu ve format doğrulaması
-- Yüksek güvenli geçerli plakalar için tek okumada hızlı kayıt
-- Orta güvenli plakalar için iki okumalı doğrulama
+- Geçerli plakalar için iki okumalı doğrulama
 - Aynı aktif aracın tekrar tekrar DB kaydı ve JPEG oluşturmasını engelleyen plate presence kontrolü
 - Kamera başına duplicate cooldown koruması
 - Yalnızca en güncel frame'i işleyen, backlog oluşturmayan OCR akışı
-- Dashboard'da canlı OCR adayı, güven oranı ve kayıt durumu
+- Dashboard'da canlı OCR adayı ve kayıt durumu
 - Giriş/çıkış kayıtları ve içeride bulunan araç listesi
 - Yerel tarihe göre günlük kayıt arşivi
 - Plaka arama ve giriş/çıkış filtresi
@@ -91,7 +90,7 @@ Kamera latest frame
 → OCR
 → Plaka normalizasyonu
 → Türk plaka doğrulaması
-→ Güven ve confirmation kontrolü
+→ Minimum OCR kalite filtresi ve confirmation kontrolü
 → Plate presence kontrolü
 → Duplicate cooldown kontrolü
 → SQLite kayıt
@@ -105,9 +104,8 @@ Varsayılan OCR değerleri:
 Minimum güven: 0.65
 Normal doğrulama: 2 okuma
 Doğrulama penceresi: 3 saniye
-Yüksek güven eşiği: 0.90
 Presence release süresi: 15 saniye
-Duplicate cooldown: 10 saniye
+Same-camera same-plate duplicate cooldown: 120 saniye
 ```
 
 ### Dedicated plate detector (Phase 1)
@@ -164,7 +162,9 @@ Open Model Zoo deposundaki `tools/model_tools` araçlarını kurduktan sonra mod
 
 Script `omz_downloader` ve `omz_converter` komutlarını yalnızca geliştirici tarafından çalıştırıldığında çağırır, FP32 IR çıktısını beklenen `model.xml`/`model.bin` konumuna kopyalar. Model binary dosyaları Git'e eklenmez. Model kaynağı ve lisans notu [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) dosyasındadır.
 
-Geçerli ve normalize edilmiş bir Türk plakası `%90` veya daha yüksek güvenle okunursa tek observation ile kayıt hattına geçebilir. `%65` dahil, `%90` hariç güven aralığındaki plakalar için iki okuma gerekir. Bu hızlı yol, presence ve duplicate korumalarını atlamaz.
+Minimum OCR kalite filtresini geçen tüm geçerli ve normalize edilmiş plakalar, confidence değeri ne olursa olsun iki tutarlı observation ile doğrulanır. OCR confidence değeri yalnızca dahili filtreleme, sıralama ve DEBUG diagnostics için kullanılır; kullanıcı arayüzünde doğruluk yüzdesi olarak gösterilmez.
+
+Plate presence kontrolüne ek olarak, aynı kamera ve aynı normalize plaka için son DB kaydı transaction içinde kontrol edilir. İlk kayıttan sonraki 120 saniye boyunca ikinci DB satırı veya JPEG oluşturulmaz. ENTRY ve EXIT kameraları birbirinden bağımsızdır ve kontrol SQLite kayıtlarından yapıldığı için uygulama yeniden başlatıldığında da devam eder.
 
 ENTRY ve EXIT için yalnızca en güncel frame tutulur. Eski frame'ler kuyruğa eklenmez; ortak OCR worker uygun kameraları adil sırayla işler.
 
@@ -174,9 +174,9 @@ Kamera kartındaki OCR alanı canlı candidate ve karar durumunu gösterir:
 
 - `Plaka aranıyor`
 - `Doğrulanıyor (1/2)`
-- `Güven düşük, kaydedilmedi`
+- `Okuma yeterli değil, kaydedilmedi`
 - `Kaydedildi`
-- `Zaten algılandı`
+- `Zaten kaydedildi`
 
 **Son okunan plaka** alanı canlı candidate'ı değil, DB'ye başarıyla kaydedilmiş son record'u gösterir.
 
@@ -208,7 +208,6 @@ Bir gün açıldığında yalnızca o yerel güne ait kayıtlar listelenir. Gün
 - Plaka
 - Giriş/çıkış yönü
 - Kamera
-- OCR güveni
 - Yerel tarih ve saat
 - Fotoğraf açma
 - Kayıt detay penceresi

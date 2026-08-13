@@ -133,6 +133,7 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(config.recognition_interval_ms, 250)
         self.assertEqual(config.min_confidence, 0.65)
         self.assertEqual(config.confirmations_required, 2)
+        self.assertEqual(config.duplicate_cooldown_seconds, 120)
 
     def test_plate_capture_defaults_and_invalid_values_use_safe_fallbacks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:

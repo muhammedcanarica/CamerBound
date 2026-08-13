@@ -50,7 +50,6 @@ class RecognitionStatus(StrEnum):
 
 LOGGER = logging.getLogger(__name__)
 PLATE_PRESENCE_RELEASE_SECONDS = 15
-HIGH_CONFIDENCE_THRESHOLD = 0.90
 OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS = 5.0
 LOW_LIGHT_THRESHOLD = 85.0
 LOW_LIGHT_GAMMA = 0.72
@@ -267,17 +266,6 @@ class ConfirmationTracker:
             self.required,
             self.required,
         )
-
-    def confirm_immediately(
-        self,
-        candidate: PlateCandidate,
-        observed_at: float,
-    ) -> ConfirmationProgress:
-        key = (candidate.camera_id, candidate.plate)
-        self._observations[key].clear()
-        self._confirmed_until[key] = observed_at + self.window_seconds
-        return ConfirmationProgress(candidate, 1, 1)
-
 
 @dataclass(frozen=True, slots=True)
 class ConfirmationProgress:
@@ -534,10 +522,7 @@ class PlateRecognitionProcessor:
 
         observed_at = monotonic_at if monotonic_at is not None else time.monotonic()
         self.presences.observe(candidate, observed_at)
-        if candidate.confidence >= HIGH_CONFIDENCE_THRESHOLD:
-            progress = self.confirmations.confirm_immediately(candidate, observed_at)
-        else:
-            progress = self.confirmations.observe_progress(candidate, observed_at)
+        progress = self.confirmations.observe_progress(candidate, observed_at)
         confirmed = progress.candidate
         if confirmed is None:
             return self._outcome(
@@ -609,18 +594,12 @@ class PlateRecognitionProcessor:
             LOGGER.isEnabledFor(logging.DEBUG)
             and self._last_pipeline_state.get(camera_id) != signature
         ):
-            confirmation_mode = (
-                "high-confidence-single"
-                if confirmation_count == confirmation_required == 1
-                else "standard"
-            )
             LOGGER.debug(
-                "OCR pipeline state camera_id=%s state=%s confirmation=%s/%s mode=%s",
+                "OCR pipeline state camera_id=%s state=%s confirmation=%s/%s",
                 camera_id,
                 state.value,
                 confirmation_count,
                 confirmation_required,
-                confirmation_mode,
             )
         self._last_pipeline_state[camera_id] = signature
         return RecognitionOutcome(

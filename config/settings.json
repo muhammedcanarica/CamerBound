@@ -11,7 +11,7 @@
     "min_confidence": 0.65,
     "confirmations_required": 2,
     "confirmation_window_seconds": 3,
-    "duplicate_cooldown_seconds": 10,
+    "duplicate_cooldown_seconds": 120,
     "record_retention_days": 30,
     "plate_detector": {
       "enabled": true,

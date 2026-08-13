@@ -15,7 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from app.auth import AuthService, Role
 from app.camera import CameraService
@@ -86,7 +86,13 @@ class RecordDetailDialogTests(unittest.TestCase):
         )
         self.assertEqual(dialog.direction_value.text(), "Giriş")
         self.assertEqual(dialog.camera_value.text(), self.record.camera_name)
-        self.assertEqual(dialog.confidence_value.text(), "%94.6")
+        self.assertIsNone(dialog.findChild(QLabel, "recordConfidenceValue"))
+        self.assertFalse(
+            any(
+                "Güven" in label.text() or "%94.6" in label.text()
+                for label in dialog.findChildren(QLabel)
+            )
+        )
         self.assertIsNotNone(dialog.photo_label.pixmap())
         self.assertFalse(dialog.photo_label.pixmap().isNull())
         self.assertTrue(dialog.open_file_button.isEnabled())
@@ -225,7 +231,15 @@ class RecordDetailDialogTests(unittest.TestCase):
 
         pixmap.assert_not_called()
         row = self._row_for_record(widget, self.record.id)
-        open_button = widget.table.cellWidget(row, 5)
+        self.assertEqual(widget.table.columnCount(), 5)
+        self.assertNotIn(
+            "Güven",
+            [
+                widget.table.horizontalHeaderItem(index).text()
+                for index in range(widget.table.columnCount())
+            ],
+        )
+        open_button = widget.table.cellWidget(row, 4)
         self.assertIsInstance(open_button, QPushButton)
         self.assertEqual(open_button.text(), "Aç")
 
@@ -243,8 +257,8 @@ class RecordDetailDialogTests(unittest.TestCase):
         self._open_record_day(widget, record_without_image)
 
         row = self._row_for_record(widget, record_without_image.id)
-        self.assertIsNone(widget.table.cellWidget(row, 5))
-        self.assertEqual(widget.table.item(row, 5).text(), "-")
+        self.assertIsNone(widget.table.cellWidget(row, 4))
+        self.assertEqual(widget.table.item(row, 4).text(), "-")
 
     def test_photo_button_opens_existing_dialog_for_correct_record(self) -> None:
         widget = self._records_widget(self.user)
@@ -253,7 +267,7 @@ class RecordDetailDialogTests(unittest.TestCase):
         row = self._row_for_record(widget, self.record.id)
 
         with patch("ui.records_widget.RecordDetailDialog") as dialog_factory:
-            widget.table.cellWidget(row, 5).click()
+            widget.table.cellWidget(row, 4).click()
 
         dialog_factory.assert_called_once()
         self.assertEqual(dialog_factory.call_args.args[0].id, self.record.id)
@@ -279,7 +293,7 @@ class RecordDetailDialogTests(unittest.TestCase):
                 "ui.records_widget.RecordDetailDialog"
             ) as dialog_factory:
                 row = self._row_for_record(widget, expected_record.id)
-                widget.table.cellWidget(row, 5).click()
+                widget.table.cellWidget(row, 4).click()
 
                 dialog_factory.assert_called_once()
                 self.assertEqual(dialog_factory.call_args.args[0].id, expected_record.id)
@@ -288,7 +302,7 @@ class RecordDetailDialogTests(unittest.TestCase):
         with patch("ui.records_widget.RecordDetailDialog") as dialog_factory:
             widget.refresh()
             row = self._row_for_record(widget, second_record.id)
-            widget.table.cellWidget(row, 5).click()
+            widget.table.cellWidget(row, 4).click()
 
         self.assertEqual(widget.table.rowCount(), 1)
         self.assertEqual(dialog_factory.call_args.args[0].id, second_record.id)
