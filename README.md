@@ -153,14 +153,28 @@ Aynı saha frame'inde detector açık/kapalı karşılaştırması:
 
 ### Detector modelini geliştirme ortamında hazırlama
 
-Open Model Zoo deposundaki `tools/model_tools` araçlarını kurduktan sonra model hazırlama scriptini açıkça çalıştırın:
+Model hazırlama scriptini proje ana `.venv` Python'u ile tek komutta çalıştırın:
 
 ```powershell
-..venv\Scripts\python.exe scripts\prepare_plate_detector.py --omz-tools-dir C:\path\to\open_model_zoo\tools\model_tools
-..venv\Scripts\python.exe scripts\prepare_plate_detector.py --check-only
+.\.venv\Scripts\python.exe scripts\prepare_plate_detector.py
 ```
 
-Script `omz_downloader` ve `omz_converter` komutlarını yalnızca geliştirici tarafından çalıştırıldığında çağırır, FP32 IR çıktısını beklenen `model.xml`/`model.bin` konumuna kopyalar. Model binary dosyaları Git'e eklenmez. Model kaynağı ve lisans notu [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) dosyasındadır.
+Script ilk çalıştırmada ignored `.tools/openvino_model_converter/` ortamını oluşturur ve yalnızca bu development ortamına `openvino-dev==2024.6.0`, `tensorflow==2.18.0` ve converter doğrulama bağımlılıklarını kurar. CamerBound production `.venv` ortamına TensorFlow veya legacy Model Optimizer kurulmaz. OpenVINO 2024.6 Model Optimizer ve TensorFlow aynı converter Python ile çalıştırılır.
+
+Model download ve conversion cache'i `models/plate_detector/.omz-work/` altında tutulur. Hazır cache tekrar indirilmez; final FP32 IR dosyaları otomatik olarak aşağıdaki konuma kopyalanır:
+
+```text
+models/plate_detector/vehicle-license-plate-detection-barrier-0123/model.xml
+models/plate_detector/vehicle-license-plate-detection-barrier-0123/model.bin
+```
+
+Model zaten hazırsa aynı komut pip, download veya conversion çalıştırmadan tamamlanır. Zorunlu yeniden hazırlama için `--force`, yalnızca lokal dosya kontrolü için aşağıdaki komut kullanılabilir:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\prepare_plate_detector.py --check-only
+```
+
+Yerel bir Open Model Zoo checkout'u kullanmak isteyen geliştiriciler için `--omz-tools-dir C:\path\to\open_model_zoo\tools\model_tools` desteği korunur. Bütün pip/download/conversion işlemleri yalnızca bu hazırlama scripti açıkça çalıştırıldığında yapılır; `main.py` ve `run.bat` tamamen offline kalır. Model binary dosyaları Git'e eklenmez. Model kaynağı ve lisans notu [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) dosyasındadır.
 
 Minimum OCR kalite filtresini geçen tüm geçerli ve normalize edilmiş plakalar, confidence değeri ne olursa olsun iki tutarlı observation ile doğrulanır. OCR confidence değeri yalnızca dahili filtreleme, sıralama ve DEBUG diagnostics için kullanılır; kullanıcı arayüzünde doğruluk yüzdesi olarak gösterilmez.
 

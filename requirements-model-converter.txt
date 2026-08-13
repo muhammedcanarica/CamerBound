@@ -1,0 +1,5 @@
+# Yalnızca Open Model Zoo TensorFlow -> OpenVINO IR dönüşümü içindir.
+# Production requirements.txt veya CamerBound .venv içine kurulmaz.
+openvino-dev==2024.6.0
+tensorflow==2.18.0
+fastjsonschema==2.21.2
