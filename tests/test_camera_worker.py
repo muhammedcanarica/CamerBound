@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+import numpy as np
+
 from app.camera_worker import (
     MAX_CONSECUTIVE_READ_FAILURES,
     NETWORK_OPEN_TIMEOUT_MS,
@@ -149,6 +151,20 @@ class VideoCaptureBackendTests(unittest.TestCase):
 
 
 class CameraWorkerReadToleranceTests(unittest.TestCase):
+    def test_worker_emits_one_owned_immutable_frame_copy(self) -> None:
+        worker = CameraWorker(2, "http://CAMERA_IP/live", preview_fps=1_000)
+        source_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        capture = SequencedCapture([(True, source_frame)], worker=worker)
+        emitted = []
+        worker.frame_ready.connect(lambda _camera_id, frame: emitted.append(frame))
+
+        self.assertTrue(worker._read_frames(capture))
+
+        self.assertEqual(len(emitted), 1)
+        self.assertIsNot(emitted[0], source_frame)
+        self.assertFalse(emitted[0].flags.writeable)
+        self.assertTrue(source_frame.flags.writeable)
+
     def test_single_network_read_failure_does_not_end_stream(self) -> None:
         worker = CameraWorker(2, "http://CAMERA_IP/live", preview_fps=1_000)
         capture = SequencedCapture(

@@ -134,6 +134,7 @@ class OcrBackendTests(unittest.TestCase):
         self.assertEqual(pipelines[0].options["device"], "cpu")
         self.assertFalse(pipelines[0].options["enable_hpi"])
         self.assertFalse(pipelines[0].options["enable_mkldnn"])
+        self.assertEqual(pipelines[0].options["cpu_threads"], 4)
         self.assertNotIn("engine", pipelines[0].options)
         self.assertEqual(
             Path(pipelines[0].options["text_detection_model_dir"]),
@@ -181,6 +182,7 @@ class OcrBackendTests(unittest.TestCase):
         self.assertIs(provider.backend, OcrBackend.ONNX)
         self.assertEqual(pipelines[0].options["engine"], "onnxruntime")
         self.assertFalse(pipelines[0].options["enable_hpi"])
+        self.assertEqual(pipelines[0].options["cpu_threads"], 4)
         self.assertNotIn("enable_mkldnn", pipelines[0].options)
 
 

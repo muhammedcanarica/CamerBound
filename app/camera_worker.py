@@ -189,6 +189,8 @@ class CameraWorker(QObject):
 
     def _read_frames(self, capture: VideoCaptureLike) -> bool:
         last_preview_at = 0.0
+        diagnostic_started_at = time.monotonic()
+        diagnostic_frame_count = 0
         file_frame_interval = self._file_frame_interval(capture)
         next_file_frame_at = time.monotonic()
         is_network_source = _is_network_source(self.source)
@@ -218,8 +220,24 @@ class CameraWorker(QObject):
             now = time.monotonic()
             if now - last_preview_at >= self.preview_interval:
                 copied_frame = frame.copy() if hasattr(frame, "copy") else frame
+                setflags = getattr(copied_frame, "setflags", None)
+                if callable(setflags):
+                    setflags(write=False)
                 self.frame_ready.emit(self.camera_id, copied_frame)
                 last_preview_at = now
+                diagnostic_frame_count += 1
+                diagnostic_elapsed = now - diagnostic_started_at
+                if (
+                    LOGGER.isEnabledFor(logging.DEBUG)
+                    and diagnostic_elapsed >= 5.0
+                ):
+                    LOGGER.debug(
+                        "Camera worker throughput camera_id=%s camera_worker_fps=%.2f",
+                        self.camera_id,
+                        diagnostic_frame_count / max(diagnostic_elapsed, 0.001),
+                    )
+                    diagnostic_started_at = now
+                    diagnostic_frame_count = 0
 
             if file_frame_interval is not None:
                 next_file_frame_at += file_frame_interval

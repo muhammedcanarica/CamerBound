@@ -80,6 +80,7 @@ OCR_VARIANT_NAMES = (
     "upscaled-2x-clahe-sharpened",
     "low-light-gamma-clahe-sharpened",
 )
+ROI_FALLBACK_MAX_WIDTH = 960
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +112,7 @@ class PaddleOcrProvider:
         backend: str | OcrBackend = OcrBackend.AUTO,
         *,
         pipeline_factory=None,
+        cpu_threads: int = 4,
     ) -> None:
         selection = select_ocr_backend(model_root, backend, load_onnx=True)
         self.backend = selection.backend
@@ -147,6 +149,7 @@ class PaddleOcrProvider:
             "use_textline_orientation": False,
             "device": "cpu",
             "enable_hpi": False,
+            "cpu_threads": max(1, int(cpu_threads)),
         }
         if self.backend is OcrBackend.ONNX:
             options["engine"] = "onnxruntime"
@@ -501,6 +504,11 @@ class PreDetectionFrameBuffer:
         with self._lock:
             return tuple(self._rings.get(camera_id, ()))
 
+    def active_event_id(self, camera_id: int) -> int | None:
+        with self._lock:
+            event = self._events.get(camera_id)
+            return event.event_id if event is not None else None
+
     def ring_depth(self, camera_id: int) -> int:
         with self._lock:
             return len(self._rings.get(camera_id, ()))
@@ -642,7 +650,7 @@ class ReplayEventBuffer:
             depth = len(camera_events)
         LOGGER.debug(
             "Replay event queued camera_id=%s event_id=%s event_frames=%s "
-            "selected_frames=%s queue_depth=%s",
+            "replay_selected_frame_count=%s queue_depth=%s",
             event.camera_id,
             event.event_id,
             len(event.frames),
@@ -720,6 +728,8 @@ class DetectionJobResult:
     fallback_reason: str | None
     detector_ms: float
     roi_brightness: float
+    fallback_skipped_reason: str | None = None
+    motion_event_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -738,9 +748,23 @@ class OcrBufferAddResult:
 class OcrJobBuffer:
     """Priority-aware, camera-fair bounded RAM buffer for OCR work."""
 
-    def __init__(self, max_per_camera: int, max_age_ms: int) -> None:
+    def __init__(
+        self,
+        max_per_camera: int,
+        max_age_ms: int,
+        detector_crop_max_age_ms: int | None = None,
+    ) -> None:
         self.max_per_camera = max(1, max_per_camera)
         self.max_age_seconds = max(0.1, max_age_ms / 1000.0)
+        self.detector_crop_max_age_seconds = max(
+            self.max_age_seconds,
+            (
+                max_age_ms
+                if detector_crop_max_age_ms is None
+                else detector_crop_max_age_ms
+            )
+            / 1000.0,
+        )
         self._jobs: dict[int, deque[OcrJob]] = defaultdict(deque)
         self._camera_order: deque[int] = deque()
         self._known_camera_ids: set[int] = set()
@@ -887,7 +911,7 @@ class OcrJobBuffer:
         kept = [
             job
             for job in camera_jobs
-            if now - job.queued_at <= self.max_age_seconds
+            if now - job.queued_at <= self._max_age_seconds(job)
         ]
         discarded = len(camera_jobs) - len(kept)
         if not discarded:
@@ -896,6 +920,11 @@ class OcrJobBuffer:
         camera_jobs.extend(kept)
         self.stale_count += discarded
         return discarded
+
+    def _max_age_seconds(self, job: OcrJob) -> float:
+        if job.job_type is OcrJobType.DETECTOR_CROP:
+            return self.detector_crop_max_age_seconds
+        return self.max_age_seconds
 
     def pending_count(self, camera_id: int | None = None) -> int:
         with self._condition:
@@ -926,6 +955,7 @@ class PlateDetectionProcessor:
         self.config = config
         self.detector = detector
         self._last_zero_detection_fallback_at: dict[int, float] = {}
+        self._last_zero_detection_fallback_event_id: dict[int, int] = {}
         self._last_detector_error_logged_at: dict[int, float] = {}
 
     def prepare_job(
@@ -940,6 +970,7 @@ class PlateDetectionProcessor:
         frame_id: int | None = None,
         detector_source: str = "live",
         allow_zero_detection_fallback: bool = True,
+        zero_detection_fallback_event_id: int | None = None,
     ) -> DetectionJobResult:
         roi_crop = crop_roi(frame, self.config.roi_for(direction))
         if roi_crop is None:
@@ -952,6 +983,7 @@ class PlateDetectionProcessor:
         used_roi_fallback = not detector_config.enabled
         fallback_reason = "detector-disabled" if used_roi_fallback else None
         ocr_crops: list[np.ndarray] = []
+        fallback_skipped_reason: str | None = None
 
         if detector_config.enabled and self.detector is not None:
             try:
@@ -985,19 +1017,21 @@ class PlateDetectionProcessor:
                     )
                     is not None
                 ]
-                if (
-                    not ocr_crops
-                    and allow_zero_detection_fallback
-                    and self._should_run_zero_detection_fallback(
-                    camera_id,
-                    observed_at,
-                    detector_config.zero_detection_roi_fallback_enabled,
-                    detector_config.zero_detection_roi_fallback_interval_ms,
+                if not ocr_crops:
+                    should_fallback, fallback_skipped_reason = (
+                        self._should_run_zero_detection_fallback(
+                            camera_id,
+                            observed_at,
+                            detector_config.zero_detection_roi_fallback_enabled,
+                            detector_config.zero_detection_roi_fallback_interval_ms,
+                            allow_zero_detection_fallback,
+                            zero_detection_fallback_event_id,
+                        )
                     )
-                ):
-                    used_roi_fallback = True
-                    fallback_reason = "zero-detection"
-                    ocr_crops = [roi_crop]
+                    if should_fallback:
+                        used_roi_fallback = True
+                        fallback_reason = "zero-detection"
+                        ocr_crops = [roi_crop]
         elif detector_config.enabled:
             if not detector_config.fallback_to_roi_ocr:
                 raise PlateDetectorError(
@@ -1020,9 +1054,14 @@ class PlateDetectionProcessor:
                 fallback_reason,
                 detector_ms,
                 brightness,
+                fallback_skipped_reason,
+                zero_detection_fallback_event_id,
             )
 
-        full_frame = frame.copy() if isinstance(frame, np.ndarray) else frame
+        full_frame = frame
+        if isinstance(frame, np.ndarray) and frame.flags.writeable:
+            full_frame = frame.copy()
+            full_frame.setflags(write=False)
         if not isinstance(full_frame, np.ndarray):
             return DetectionJobResult(
                 None,
@@ -1065,6 +1104,8 @@ class PlateDetectionProcessor:
             fallback_reason,
             detector_ms,
             brightness,
+            fallback_skipped_reason,
+            zero_detection_fallback_event_id,
         )
 
     def _should_run_zero_detection_fallback(
@@ -1073,17 +1114,26 @@ class PlateDetectionProcessor:
         observed_at: float,
         enabled: bool,
         interval_ms: int,
-    ) -> bool:
+        allowed_for_source: bool,
+        motion_event_id: int | None,
+    ) -> tuple[bool, str | None]:
         if not enabled:
-            return False
+            return False, "disabled"
+        if not allowed_for_source:
+            return False, "replay-zero-detection"
+        if motion_event_id is None:
+            return False, "no-meaningful-motion"
+        if self._last_zero_detection_fallback_event_id.get(camera_id) == motion_event_id:
+            return False, "event-fallback-used"
         last_fallback_at = self._last_zero_detection_fallback_at.get(camera_id)
         if (
             last_fallback_at is not None
             and (observed_at - last_fallback_at) * 1000.0 < interval_ms
         ):
-            return False
+            return False, "interval-throttled"
         self._last_zero_detection_fallback_at[camera_id] = observed_at
-        return True
+        self._last_zero_detection_fallback_event_id[camera_id] = motion_event_id
+        return True, None
 
     def _log_detector_error(
         self,
@@ -1306,13 +1356,49 @@ class PlateRecognitionProcessor:
         variants: list[np.ndarray] = []
         for ocr_crop in job.ocr_crops:
             brightness = roi_mean_brightness(ocr_crop)
-            variants.extend(preprocess_variants(ocr_crop, brightness=brightness))
+            if job.job_type is OcrJobType.DETECTOR_CROP:
+                variants.extend(preprocess_variants(ocr_crop, brightness=brightness))
+            else:
+                variants.extend(
+                    preprocess_roi_fallback_variants(
+                        ocr_crop,
+                        brightness=brightness,
+                    )
+                )
         inference_started_at = time.perf_counter()
         preprocess_ms = (inference_started_at - preprocess_started_at) * 1000.0
-        segments = self.provider.recognize(variants)
+        segments: list[OcrSegment] = []
+        candidate: PlateCandidate | None = None
+        attempted_variants: list[np.ndarray] = []
+        if job.job_type is OcrJobType.DETECTOR_CROP:
+            attempted_variants = variants
+            segments = self.provider.recognize(variants)
+            candidate = select_best_candidate(segments, job.camera_id)
+        else:
+            # Full ROI detection is the expensive safety path. Try the compact
+            # color image first and only pay for enhanced contrast when needed.
+            for variant_index, variant in enumerate(variants):
+                attempted_variants.append(variant)
+                batch = self.provider.recognize([variant])
+                segments.extend(
+                    OcrSegment(
+                        text=segment.text,
+                        confidence=segment.confidence,
+                        box=segment.box,
+                        variant_index=variant_index,
+                    )
+                    for segment in batch
+                )
+                candidate = select_best_candidate(segments, job.camera_id)
+                if (
+                    candidate is not None
+                    and candidate.confidence >= self.config.min_confidence
+                ):
+                    break
         ocr_finished_at = time.perf_counter()
         inference_ms = (ocr_finished_at - inference_started_at) * 1000.0
-        candidate = select_best_candidate(segments, job.camera_id)
+        if candidate is None:
+            candidate = select_best_candidate(segments, job.camera_id)
         outcome = self._complete_observation(
             camera_id=job.camera_id,
             segments=segments,
@@ -1326,7 +1412,7 @@ class PlateRecognitionProcessor:
         )
         self._log_queued_ocr_diagnostics(
             job=job,
-            variants=variants,
+            variants=attempted_variants,
             queue_depth=queue_depth,
             ocr_started_at=ocr_started_at,
             preprocess_ms=preprocess_ms,
@@ -1697,6 +1783,7 @@ class _PendingFrame:
     observed_at: float
     captured_at: datetime
     frame_id: int = 0
+    motion_event_id: int | None = None
 
 
 class PlateOcrWorker:
@@ -1813,10 +1900,13 @@ class PlateRecognitionWorker(QObject):
         self._known_camera_ids: set[int] = set()
         self._last_detection_diagnostic_at: dict[int, float] = {}
         self._last_ring_diagnostic_at: dict[int, float] = {}
+        self._ingest_diagnostic_started_at: dict[int, float] = {}
+        self._ingest_diagnostic_counts: dict[int, int] = {}
         self._next_frame_id = 1
         self._job_buffer = OcrJobBuffer(
             config.max_pending_ocr_jobs_per_camera,
             config.ocr_job_max_age_ms,
+            config.detector_crop_ocr_job_max_age_ms,
         )
         self._frame_buffer = PreDetectionFrameBuffer(config)
         self._replay_buffer = ReplayEventBuffer(config)
@@ -1827,12 +1917,16 @@ class PlateRecognitionWorker(QObject):
         self._ocr_thread: threading.Thread | None = None
 
     def submit_frame(self, camera_id: int, direction: Direction, frame: object) -> None:
+        if self._stop_event.is_set():
+            return
         observed_at = time.monotonic()
         captured_at = datetime.now(timezone.utc)
         with self._lock:
             frame_id = self._next_frame_id
             self._next_frame_id += 1
-        owned_frame = frame.copy() if isinstance(frame, np.ndarray) else frame
+        owned_frame = frame
+        if isinstance(frame, np.ndarray) and frame.flags.writeable:
+            owned_frame = frame.copy()
         if isinstance(owned_frame, np.ndarray):
             owned_frame.setflags(write=False)
             snapshot = FrameSnapshot(
@@ -1844,9 +1938,18 @@ class PlateRecognitionWorker(QObject):
                 received_at=observed_at,
                 full_frame=owned_frame,
             )
-            for event in self._frame_buffer.ingest(snapshot):
+            completed_events = self._frame_buffer.ingest(snapshot)
+            for event in completed_events:
                 self._replay_buffer.add(event)
+            motion_event_id = (
+                completed_events[-1].event_id
+                if completed_events
+                else self._frame_buffer.active_event_id(camera_id)
+            )
             self._log_ring_diagnostics(camera_id, observed_at)
+            self._log_ingest_fps(camera_id, observed_at)
+        else:
+            motion_event_id = None
         item = _PendingFrame(
             direction=direction,
             frame=owned_frame,
@@ -1854,6 +1957,7 @@ class PlateRecognitionWorker(QObject):
             observed_at=observed_at,
             captured_at=captured_at,
             frame_id=frame_id,
+            motion_event_id=motion_event_id,
         )
         with self._lock:
             if camera_id not in self._known_camera_ids:
@@ -1961,6 +2065,7 @@ class PlateRecognitionWorker(QObject):
                         frame_id=item.frame_id,
                         detector_source=source,
                         allow_zero_detection_fallback=(source == "live"),
+                        zero_detection_fallback_event_id=item.motion_event_id,
                     )
                 except Exception as exc:
                     LOGGER.exception("Transient plate detector error")
@@ -2008,6 +2113,8 @@ class PlateRecognitionWorker(QObject):
                 self._known_camera_ids.clear()
                 self._processed_frame_ids.clear()
                 self._processed_frame_id_sets.clear()
+                self._ingest_diagnostic_started_at.clear()
+                self._ingest_diagnostic_counts.clear()
             self.status_changed.emit(RecognitionStatus.STOPPED, "OCR durduruldu.")
             self.finished.emit()
 
@@ -2042,7 +2149,8 @@ class PlateRecognitionWorker(QObject):
             "camera_queue_depth=%s dropped=%s replaced=%s stale_total=%s "
             "fallback_reason=%s source=%s frame_id=%s original_frame_age_ms=%.1f "
             "replay_queue_depth=%s job_type=%s priority=%s detector_crop_count=%s "
-            "accepted=%s replaced_job_type=%s drop_reason=%s coalesced=%s",
+            "accepted=%s replaced_job_type=%s drop_reason=%s coalesced=%s "
+            "fallback_skipped_reason=%s motion_active=%s motion_event_id=%s",
             camera_id,
             item.direction.value,
             result.detector_ms,
@@ -2087,6 +2195,9 @@ class PlateRecognitionWorker(QObject):
                 if buffer_result is not None and buffer_result.coalesced
                 else "no"
             ),
+            result.fallback_skipped_reason or "none",
+            "yes" if result.motion_event_id is not None else "no",
+            result.motion_event_id,
         )
 
     def _log_ring_diagnostics(self, camera_id: int, now: float) -> None:
@@ -2111,13 +2222,41 @@ class PlateRecognitionWorker(QObject):
             else max(0.0, (now - snapshots[-1].observed_at) * 1000.0)
         )
         LOGGER.debug(
-            "Pre-detection ring camera_id=%s depth=%s oldest_age_ms=%.1f "
-            "newest_age_ms=%.1f replay_queue_depth=%s",
+            "Pre-detection ring camera_id=%s ring_depth=%s ring_unique_frames=%s "
+            "oldest_age_ms=%.1f newest_age_ms=%.1f replay_queue_depth=%s "
+            "motion_active=%s",
             camera_id,
             len(snapshots),
+            len({snapshot.frame_id for snapshot in snapshots}),
             oldest_age_ms,
             newest_age_ms,
             self._replay_buffer.pending_event_count(camera_id),
+            "yes" if self._frame_buffer.active_event_id(camera_id) is not None else "no",
+        )
+
+    def _log_ingest_fps(self, camera_id: int, now: float) -> None:
+        if not LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        started_at = self._ingest_diagnostic_started_at.setdefault(camera_id, now)
+        count = self._ingest_diagnostic_counts.get(camera_id, 0) + 1
+        self._ingest_diagnostic_counts[camera_id] = count
+        elapsed = now - started_at
+        if elapsed < OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS:
+            return
+        self._ingest_diagnostic_started_at[camera_id] = now
+        self._ingest_diagnostic_counts[camera_id] = 0
+        LOGGER.debug(
+            "Recognition ingestion camera_id=%s recognition_ingest_fps=%.2f "
+            "ring_depth=%s ring_unique_frames=%s",
+            camera_id,
+            count / max(elapsed, 0.001),
+            self._frame_buffer.ring_depth(camera_id),
+            len(
+                {
+                    snapshot.frame_id
+                    for snapshot in self._frame_buffer.snapshots(camera_id)
+                }
+            ),
         )
 
     def _take_detector_frame(
@@ -2225,12 +2364,21 @@ class PlateRecognitionService(QObject):
         self.detector_factory = detector_factory or self._default_detector_factory
         self._runtime: _RecognitionRuntime | None = None
         self._directions: dict[int, Direction] = {}
+        self._ingest_lock = threading.RLock()
         self._status = RecognitionStatus.STOPPED
-        self.camera_service.frame_ready.connect(self._receive_frame)
+        self.camera_service.analysis_frame_ready.connect(
+            self._receive_analysis_frame,
+            Qt.ConnectionType.DirectConnection,
+        )
 
     def start(self) -> RecognitionStatus:
-        if self._runtime is not None:
-            return self._status
+        with self._ingest_lock:
+            if self._runtime is not None:
+                return self._status
+        directions = {
+            camera.id: camera.direction
+            for camera in self.camera_service.list_cameras()
+        }
         worker = PlateRecognitionWorker(
             self.plate_service,
             self.config,
@@ -2239,7 +2387,9 @@ class PlateRecognitionService(QObject):
         )
         thread = QThread()
         worker.moveToThread(thread)
-        self._runtime = _RecognitionRuntime(worker, thread)
+        with self._ingest_lock:
+            self._runtime = _RecognitionRuntime(worker, thread)
+            self._directions = directions
         thread.started.connect(worker.run)
         worker.status_changed.connect(self._relay_status)
         worker.candidate_changed.connect(self.candidate_changed.emit)
@@ -2254,13 +2404,16 @@ class PlateRecognitionService(QObject):
         return RecognitionStatus.INITIALIZING
 
     def stop(self) -> None:
-        runtime = self._runtime
+        with self._ingest_lock:
+            runtime = self._runtime
         if runtime is None:
             return
         runtime.worker.request_stop()
         if runtime.thread.wait(self.STOP_TIMEOUT_MS):
-            self._runtime = None
-            self._directions.clear()
+            with self._ingest_lock:
+                if self._runtime is runtime:
+                    self._runtime = None
+                    self._directions.clear()
             self._set_status(RecognitionStatus.STOPPED, "OCR durduruldu.")
         else:
             self._set_status(
@@ -2288,23 +2441,21 @@ class PlateRecognitionService(QObject):
         return PaddleOcrProvider(
             self.config.model_root,
             backend=self.config.ocr_backend,
+            cpu_threads=self.config.ocr_cpu_threads,
         )
 
     def _default_detector_factory(self) -> PlateDetector:
         return OpenVinoPlateDetector(self.config.plate_detector)
 
     @Slot(int, object)
-    def _receive_frame(self, camera_id: int, frame: object) -> None:
-        runtime = self._runtime
-        if runtime is None:
+    def _receive_analysis_frame(self, camera_id: int, frame: object) -> None:
+        # DirectConnection executes on the camera worker thread. Keep this path
+        # free of UI work, DB access and inference; submit_frame owns synchronization.
+        with self._ingest_lock:
+            runtime = self._runtime
+            direction = self._directions.get(camera_id)
+        if runtime is None or direction is None:
             return
-        direction = self._directions.get(camera_id)
-        if direction is None:
-            try:
-                direction = self.camera_service.get_camera(camera_id).direction
-            except ValueError:
-                return
-            self._directions[camera_id] = direction
         runtime.worker.submit_frame(camera_id, direction, frame)
 
     @Slot(object, str)
@@ -2332,6 +2483,44 @@ def roi_mean_brightness(crop: np.ndarray) -> float:
     """Return mean grayscale luminance on OpenCV's 0-255 uint8 scale."""
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     return float(np.mean(gray))
+
+
+def preprocess_roi_fallback_variants(
+    crop: np.ndarray,
+    *,
+    brightness: float | None = None,
+) -> list[np.ndarray]:
+    """Build two compact ROI variants for sequential safety-fallback OCR."""
+    if crop.shape[1] > ROI_FALLBACK_MAX_WIDTH:
+        scale = ROI_FALLBACK_MAX_WIDTH / crop.shape[1]
+        compact = cv2.resize(
+            crop,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        compact = crop.copy()
+
+    gray = cv2.cvtColor(compact, cv2.COLOR_BGR2GRAY)
+    measured_brightness = (
+        roi_mean_brightness(compact) if brightness is None else brightness
+    )
+    if measured_brightness < LOW_LIGHT_THRESHOLD:
+        gamma_lut = np.array(
+            [
+                ((value / 255.0) ** LOW_LIGHT_GAMMA) * 255.0
+                for value in range(256)
+            ],
+            dtype=np.uint8,
+        )
+        gray = cv2.LUT(gray, gamma_lut)
+    contrasted = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8),
+    ).apply(gray)
+    return [compact, cv2.cvtColor(contrasted, cv2.COLOR_GRAY2BGR)]
 
 
 def preprocess_variants(

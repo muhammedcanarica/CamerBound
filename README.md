@@ -95,7 +95,8 @@ Kamera kullanıcı adı ve bağlantı şifresi yalnızca ADMIN kullanıcı taraf
 
 ```text
 Kamera frame
-→ Kamera başına 2 saniyelik bounded RAM rolling ring
+→ CameraWorker'ın yaklaşık 12 FPS worker-throttled immutable analysis frame'i
+→ UI event-loop'undan bağımsız kamera başına 2 saniyelik bounded RAM rolling ring
 → ROI üzerinde lightweight motion event
 → Zamansal dağıtılmış historical replay frame seçimi
 → Detector worker: live latest frame veya replay frame üzerinde OpenVINO detector
@@ -124,9 +125,15 @@ Same-camera same-plate duplicate cooldown: 120 saniye
 
 ### Dedicated plate detector (Phase 1)
 
-Detector açıkken OpenVINO modeli yalnızca yapılandırılmış ENTRY/EXIT ROI üzerinde çalışır. Yalnızca modelin `plate` sınıfı OCR'a gönderilir; `vehicle` sınıfı OCR'a gönderilmez. Detection confidence ve bbox alanına göre en iyi iki plaka crop'u seçilir. Detector exception verirse `fallback_to_roi_ocr=true` ile mevcut ROI OCR akışı korunur. Detector başarıyla çalışıp hiç kullanılabilir plate crop üretmezse, kamera başına ayrı tutulan 750 ms throttle süresi dolduğunda safety fallback olarak ROI OCR bir kez denenir; aradaki recognition frame'lerinde pahalı OCR çağrısı yapılmaz.
+Detector açıkken OpenVINO modeli yalnızca yapılandırılmış ENTRY/EXIT ROI üzerinde çalışır. Yalnızca modelin `plate` sınıfı OCR'a gönderilir; `vehicle` sınıfı OCR'a gönderilmez. Detection confidence ve bbox alanına göre en iyi iki plaka crop'u seçilir. Detector exception verirse `fallback_to_roi_ocr=true` ile mevcut ROI OCR akışı korunur. Detector başarıyla çalışıp hiç kullanılabilir plate crop üretmezse safety fallback yalnız meaningful motion event içinde, 750 ms throttle'a da uyarak event başına en fazla bir kez denenir; statik yolda pahalı OCR çağrısı yapılmaz.
 
-Detector ve PaddleOCR ayrı worker'larda çalışır; OCR inference sürerken detector round-robin olarak her kameranın en yeni frame'ini işlemeye devam eder. Üretilen OCR job'ları kamera başına en fazla 3 adet RAM'de tutulur ve OCR kuyruğunda 2500 ms'den uzun bekleyen job işlenmeden bırakılır. Job türleri açıkça `DETECTOR_CROP`, `DETECTOR_ERROR_FALLBACK` ve `ZERO_DETECTION_FALLBACK` olarak sınıflandırılır. Tüketici önce detector crop'larını, sonra detector-error fallback'lerini, son olarak zero-detection fallback'lerini seçer; her öncelik seviyesinde ENTRY/EXIT round-robin adaleti korunur. Buffer dolduğunda düşük öncelikli job önce evict edilir; yalnız aynı öncelikte detector confidence, crop alanı ve Laplacian sharpness kullanan ucuz kalite skoru karşılaştırılır. Kamera başına her fallback türünden en fazla bir pending job tutulur, böylece tekrar eden fallback'ler coalesce edilir ve gerçek detector crop'larını dolduramaz. OCR job, crop ile birlikte aynı full camera frame'i ve frame zamanlarını taşıdığı için confirmation gözlem zamanı ile confirmed-record JPEG'i doğru frame'e bağlı kalır. Video veya sürekli frame kaydı yapılmaz.
+Detector ve PaddleOCR ayrı worker'larda çalışır; OCR inference sürerken detector round-robin olarak her kameranın en yeni frame'ini işlemeye devam eder. Üretilen OCR job'ları kamera başına en fazla 3 adet RAM'de tutulur. ROI fallback job'ları OCR kuyruğunda 2500 ms, gerçek detector crop'ları ise uzun bir non-preemptive fallback sırasında kaybolmamaları için bounded olarak 12000 ms bekleyebilir. Job türleri açıkça `DETECTOR_CROP`, `DETECTOR_ERROR_FALLBACK` ve `ZERO_DETECTION_FALLBACK` olarak sınıflandırılır. Tüketici önce detector crop'larını, sonra detector-error fallback'lerini, son olarak zero-detection fallback'lerini seçer; her öncelik seviyesinde ENTRY/EXIT round-robin adaleti korunur. Buffer dolduğunda düşük öncelikli job önce evict edilir; yalnız aynı öncelikte detector confidence, crop alanı ve Laplacian sharpness kullanan ucuz kalite skoru karşılaştırılır. Kamera başına her fallback türünden en fazla bir pending job tutulur, böylece tekrar eden fallback'ler coalesce edilir ve gerçek detector crop'larını dolduramaz. OCR job, crop ile birlikte aynı immutable full camera frame referansını ve frame zamanlarını taşıdığı için confirmation gözlem zamanı ile confirmed-record JPEG'i doğru frame'e bağlı kalır. Video veya sürekli frame kaydı yapılmaz.
+
+UI preview ve recognition frame yolları ayrıdır. `CameraWorker` tarafından worker seviyesinde throttle edilip bir kez kopyalanan frame önce `analysis_frame_ready` üzerinden doğrudan thread-safe recognition ingest yoluna bırakılır. Aynı immutable ndarray daha sonra UI için latest-frame coalescing'e girer; yavaş UI event loop analysis ring'e ulaşan frameleri düşürmez. Recognition ingest callback'i UI/SQLite/inference çalıştırmaz ve kamera yönünü startup'ta hazırlanan runtime cache'den okur.
+
+Zero-detection ROI fallback yalnız meaningful motion event sırasında veya event kapanış frame'inde üretilebilir ve aynı kamera/motion event için en fazla bir kez çalışır. Boş/statik yolda 750 ms aralıkla full ROI OCR başlatılmaz. Historical replay frame'lerinde detector crop bulunursa yüksek öncelikli OCR korunur; zero detection durumunda her replay frame için full ROI OCR çalıştırılmaz. Detector-error fallback bu motion kuralından bağımsız kalır.
+
+Detector crop preprocessing'i değiştirilmemiştir. Full ROI fallback ise maksimum 960 px genişlikte iki hafif variant kullanır: önce compact color variant tek başına denenir; geçerli ve minimum kaliteyi geçen plaka bulunamazsa CLAHE/low-light enhanced ikinci variant ayrı çağrıda denenir. Böylece büyük ENTRY ROI için 2x upscale dahil 3–4 variantı tek Paddle çağrısına verme kaldırılmıştır. PaddleOCR CPU kullanımı desteklenen `cpu_threads=4` ayarıyla sınırlandırılarak OpenVINO detector'ın CPU starvation riski azaltılır.
 
 Detector öncesindeki rolling ring her kamera için son 2000 ms ve en fazla 20 full-resolution frame ile sınırlıdır. ROI, yaklaşık 160 piksel genişliğe küçültülüp grayscale/blur/absdiff ile ucuz bir değişen-piksel oranı hesaplanır. Motion event 500 ms pre-roll, 700 ms post-roll ve 400 ms quiet hysteresis kullanır; event en fazla 4000 ms sürer. Event frame'leri zamansal bin'lere bölünür ve her bin içindeki en keskin ROI seçilerek en fazla 8 historical frame replay edilir. Detector 2 live frame / 1 replay frame oranıyla iki kaynağı dengeler; replay kuyruğu kamera başına 2 event ve 8000 ms scheduling yaşı ile bounded'dır.
 
@@ -151,7 +158,7 @@ Varsayılan detector ayarları:
 }
 ```
 
-`plate_detection` seviyesindeki temel buffer ayarları `max_pending_ocr_jobs_per_camera=3`, `ocr_job_max_age_ms=2500`, `pre_detection_buffer_duration_ms=2000`, `pre_detection_buffer_max_frames_per_camera=20`, `max_replay_frames_per_event=8`, `max_pending_replay_events_per_camera=2` ve `replay_event_max_age_ms=8000` değerleridir. Debug detector kutusu son live detection güncellemesinden 500 ms sonra preview üzerinde çizilmez; `debug_overlay=false` production davranışı değişmez.
+`plate_detection` seviyesindeki temel buffer/CPU ayarları `max_pending_ocr_jobs_per_camera=3`, `ocr_job_max_age_ms=2500`, `detector_crop_ocr_job_max_age_ms=12000`, `ocr_cpu_threads=4`, `pre_detection_buffer_duration_ms=2000`, `pre_detection_buffer_max_frames_per_camera=20`, `max_replay_frames_per_event=8`, `max_pending_replay_events_per_camera=2` ve `replay_event_max_age_ms=8000` değerleridir. Debug detector kutusu son live detection güncellemesinden 500 ms sonra preview üzerinde çizilmez; `debug_overlay=false` production davranışı değişmez.
 
 Beklenen offline model dizini:
 
@@ -207,7 +214,7 @@ Minimum OCR kalite filtresini geçen tüm geçerli ve normalize edilmiş plakala
 
 Plate presence kontrolüne ek olarak, aynı kamera ve aynı normalize plaka için son DB kaydı transaction içinde kontrol edilir. İlk kayıttan sonraki 120 saniye boyunca ikinci DB satırı veya JPEG oluşturulmaz. ENTRY ve EXIT kameraları birbirinden bağımsızdır ve kontrol SQLite kayıtlarından yapıldığı için uygulama yeniden başlatıldığında da devam eder.
 
-ENTRY ve EXIT için yalnızca en güncel frame tutulur. Eski frame'ler kuyruğa eklenmez; ortak OCR worker uygun kameraları adil sırayla işler.
+ENTRY ve EXIT için detector'ın live latest-frame slotunda yalnızca en güncel frame tutulur. Bundan bağımsız pre-detection analysis ring son 2 saniyenin en fazla 20 worker-throttled frame'ini tutar; ortak OCR worker uygun kameraları öncelik ve kamera adaletiyle işler.
 
 ## Dashboard OCR Durumları
 

@@ -62,6 +62,8 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(detector.debug_detection_overlay_ttl_ms, 500)
         self.assertEqual(config.max_pending_ocr_jobs_per_camera, 3)
         self.assertEqual(config.ocr_job_max_age_ms, 2500)
+        self.assertEqual(config.detector_crop_ocr_job_max_age_ms, 12000)
+        self.assertEqual(config.ocr_cpu_threads, 4)
         self.assertEqual(config.pre_detection_buffer_duration_ms, 2000)
         self.assertEqual(config.pre_detection_buffer_max_frames_per_camera, 20)
         self.assertEqual(config.motion_pre_roll_ms, 500)
@@ -86,6 +88,8 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                         "plate_detection": {
                             "max_pending_ocr_jobs_per_camera": 0,
                             "ocr_job_max_age_ms": 0,
+                            "detector_crop_ocr_job_max_age_ms": 0,
+                            "ocr_cpu_threads": 0,
                             "plate_detector": {
                                 "enabled": "yes",
                                 "backend": "unknown",
@@ -117,7 +121,9 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(detector.debug_detection_overlay_ttl_ms, 500)
         self.assertEqual(config.max_pending_ocr_jobs_per_camera, 3)
         self.assertEqual(config.ocr_job_max_age_ms, 2500)
-        self.assertGreaterEqual(len(config.warnings), 11)
+        self.assertEqual(config.detector_crop_ocr_job_max_age_ms, 12000)
+        self.assertEqual(config.ocr_cpu_threads, 4)
+        self.assertGreaterEqual(len(config.warnings), 13)
 
     def test_ocr_sampling_interval_is_250_without_relaxing_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:

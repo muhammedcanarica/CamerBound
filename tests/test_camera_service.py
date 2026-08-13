@@ -138,6 +138,36 @@ class CameraServiceLifecycleTests(unittest.TestCase):
         snapshot[0, 0, 0] = 255
         self.assertEqual(self.camera_service.get_latest_frame(camera_id)[0, 0, 0], 0)
 
+    def test_analysis_path_receives_immutable_copy_before_preview_flush(self) -> None:
+        camera_id = self.camera_service.list_cameras()[0].id
+        analysis_frames = []
+        preview_frames = []
+        self.camera_service.analysis_frame_ready.connect(
+            lambda _camera_id, frame: analysis_frames.append(frame)
+        )
+        self.camera_service.frame_ready.connect(
+            lambda _camera_id, frame: preview_frames.append(frame)
+        )
+        source_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+
+        with self.camera_service._lock:
+            self.camera_service._runtimes[camera_id] = object()
+        try:
+            self.camera_service._on_frame_ready(camera_id, source_frame)
+
+            self.assertEqual(len(analysis_frames), 1)
+            self.assertEqual(preview_frames, [])
+            self.assertIsNot(analysis_frames[0], source_frame)
+            self.assertFalse(analysis_frames[0].flags.writeable)
+            self.assertTrue(source_frame.flags.writeable)
+
+            self.camera_service._flush_latest_frame(camera_id)
+            self.assertEqual(preview_frames, analysis_frames)
+        finally:
+            with self.camera_service._lock:
+                self.camera_service._runtimes.pop(camera_id, None)
+                self.camera_service._discard_frame(camera_id)
+
     def test_update_camera_accepts_direction_enum_and_string_values(self) -> None:
         camera = self.camera_service.list_cameras()[0]
         cases = (

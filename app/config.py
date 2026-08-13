@@ -35,6 +35,8 @@ DEFAULT_ZERO_DETECTION_ROI_FALLBACK_ENABLED = True
 DEFAULT_ZERO_DETECTION_ROI_FALLBACK_INTERVAL_MS = 750
 DEFAULT_MAX_PENDING_OCR_JOBS_PER_CAMERA = 3
 DEFAULT_OCR_JOB_MAX_AGE_MS = 2_500
+DEFAULT_DETECTOR_CROP_OCR_JOB_MAX_AGE_MS = 12_000
+DEFAULT_OCR_CPU_THREADS = 4
 DEFAULT_DEBUG_DETECTION_OVERLAY_TTL_MS = 500
 DEFAULT_PRE_DETECTION_BUFFER_DURATION_MS = 2_000
 DEFAULT_PRE_DETECTION_BUFFER_MAX_FRAMES_PER_CAMERA = 20
@@ -100,6 +102,10 @@ class PlateRecognitionConfig:
     plate_detector: PlateDetectorConfig = field(default_factory=PlateDetectorConfig)
     max_pending_ocr_jobs_per_camera: int = DEFAULT_MAX_PENDING_OCR_JOBS_PER_CAMERA
     ocr_job_max_age_ms: int = DEFAULT_OCR_JOB_MAX_AGE_MS
+    detector_crop_ocr_job_max_age_ms: int = (
+        DEFAULT_DETECTOR_CROP_OCR_JOB_MAX_AGE_MS
+    )
+    ocr_cpu_threads: int = DEFAULT_OCR_CPU_THREADS
     pre_detection_buffer_duration_ms: int = DEFAULT_PRE_DETECTION_BUFFER_DURATION_MS
     pre_detection_buffer_max_frames_per_camera: int = (
         DEFAULT_PRE_DETECTION_BUFFER_MAX_FRAMES_PER_CAMERA
@@ -311,6 +317,24 @@ def _load_plate_recognition(
         "ocr_job_max_age_ms",
         warnings,
     )
+    detector_crop_ocr_job_max_age_ms = _bounded_number(
+        raw.get("detector_crop_ocr_job_max_age_ms"),
+        DEFAULT_DETECTOR_CROP_OCR_JOB_MAX_AGE_MS,
+        500,
+        60_000,
+        int,
+        "detector_crop_ocr_job_max_age_ms",
+        warnings,
+    )
+    ocr_cpu_threads = _bounded_number(
+        raw.get("ocr_cpu_threads"),
+        DEFAULT_OCR_CPU_THREADS,
+        1,
+        16,
+        int,
+        "ocr_cpu_threads",
+        warnings,
+    )
     pre_detection_buffer_duration_ms = _bounded_number(
         raw.get("pre_detection_buffer_duration_ms"),
         DEFAULT_PRE_DETECTION_BUFFER_DURATION_MS,
@@ -416,6 +440,8 @@ def _load_plate_recognition(
         plate_detector=detector,
         max_pending_ocr_jobs_per_camera=max_pending_ocr_jobs_per_camera,
         ocr_job_max_age_ms=ocr_job_max_age_ms,
+        detector_crop_ocr_job_max_age_ms=detector_crop_ocr_job_max_age_ms,
+        ocr_cpu_threads=ocr_cpu_threads,
         pre_detection_buffer_duration_ms=pre_detection_buffer_duration_ms,
         pre_detection_buffer_max_frames_per_camera=(
             pre_detection_buffer_max_frames_per_camera

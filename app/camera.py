@@ -5,6 +5,9 @@ from enum import StrEnum
 from pathlib import Path
 from threading import RLock
 import logging
+import time
+
+import numpy as np
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 
@@ -60,6 +63,7 @@ class CameraService(QObject):
     """Own camera configuration and one worker thread per active camera."""
 
     frame_ready = Signal(int, object)
+    analysis_frame_ready = Signal(int, object)
     status_changed = Signal(int, object, str)
     _frame_available = Signal(int)
     STOP_TIMEOUT_MS = 5_000
@@ -85,6 +89,8 @@ class CameraService(QObject):
         self._latest_frames: dict[int, object] = {}
         self._last_delivered_frames: dict[int, object] = {}
         self._frame_notifications_pending: set[int] = set()
+        self._preview_delivery_counts: dict[int, int] = {}
+        self._preview_delivery_started_at: dict[int, float] = {}
         self._lock = RLock()
         self._frame_available.connect(
             self._flush_latest_frame,
@@ -333,6 +339,18 @@ class CameraService(QObject):
 
     @Slot(int, object)
     def _on_frame_ready(self, camera_id: int, frame: object) -> None:
+        if isinstance(frame, np.ndarray) and frame.flags.writeable:
+            # Production CameraWorker emits an immutable owned copy. Preserve the
+            # same ownership contract for direct/test producers without mutating
+            # memory that still belongs to their capture source.
+            frame = frame.copy()
+            frame.setflags(write=False)
+        with self._lock:
+            if camera_id not in self._runtimes:
+                return
+        # Direct subscribers may ingest this worker-throttled frame before the UI
+        # event loop coalesces preview delivery. Subscribers must remain lightweight.
+        self.analysis_frame_ready.emit(camera_id, frame)
         with self._lock:
             if camera_id not in self._runtimes:
                 return
@@ -357,6 +375,26 @@ class CameraService(QObject):
                     copier() if callable(copier) else frame
                 )
             self.frame_ready.emit(camera_id, frame)
+            self._log_preview_delivery_fps(camera_id)
+
+    def _log_preview_delivery_fps(self, camera_id: int) -> None:
+        if not LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        now = time.monotonic()
+        with self._lock:
+            started_at = self._preview_delivery_started_at.setdefault(camera_id, now)
+            count = self._preview_delivery_counts.get(camera_id, 0) + 1
+            self._preview_delivery_counts[camera_id] = count
+            elapsed = now - started_at
+            if elapsed < 5.0:
+                return
+            self._preview_delivery_started_at[camera_id] = now
+            self._preview_delivery_counts[camera_id] = 0
+        LOGGER.debug(
+            "Camera UI delivery camera_id=%s ui_preview_delivery_fps=%.2f",
+            camera_id,
+            count / max(elapsed, 0.001),
+        )
 
     @Slot(int, object, str)
     def _on_worker_status_changed(
@@ -404,6 +442,8 @@ class CameraService(QObject):
     def _discard_frame(self, camera_id: int) -> None:
         self._latest_frames.pop(camera_id, None)
         self._frame_notifications_pending.discard(camera_id)
+        self._preview_delivery_counts.pop(camera_id, None)
+        self._preview_delivery_started_at.pop(camera_id, None)
 
     @staticmethod
     def _capture_source(stream_url: str) -> str | int:

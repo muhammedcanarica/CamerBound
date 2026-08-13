@@ -10,6 +10,8 @@
     "recognition_interval_ms": 250,
     "max_pending_ocr_jobs_per_camera": 3,
     "ocr_job_max_age_ms": 2500,
+    "detector_crop_ocr_job_max_age_ms": 12000,
+    "ocr_cpu_threads": 4,
     "pre_detection_buffer_duration_ms": 2000,
     "pre_detection_buffer_max_frames_per_camera": 20,
     "motion_pre_roll_ms": 500,
