@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -39,6 +39,7 @@ from app.plate_service import (
     PlateRecord,
     PlateService,
 )
+from app.time_utils import as_utc, utc_now
 
 
 class RecognitionStatus(StrEnum):
@@ -82,6 +83,12 @@ OCR_VARIANT_NAMES = (
     "low-light-gamma-clahe-sharpened",
 )
 ROI_FALLBACK_MAX_WIDTH = 960
+RISKY_CONFIRMATIONS_REQUIRED = 3
+POST_SAVE_CONFIRMATIONS_REQUIRED = 4
+POST_SAVE_NEAR_DUPLICATE_WINDOW_SECONDS = 45 * 60
+RECENT_SAVED_EVIDENCE_LIMIT = 32
+CONFIRMATION_OBSERVATION_LIMIT_PER_CAMERA = 128
+CONFIRMED_PLATE_LIMIT = 256
 
 
 def _log_plate_detector_diagnostics(
@@ -135,6 +142,16 @@ class PlateCandidate:
     confidence: float
     raw_text: str
     camera_id: int
+    normalized_raw_text: str = ""
+    correction_cost: int = 0
+    variant_support: int = 1
+    supporting_variants: tuple[int, ...] = ()
+    frame_id: int | None = None
+    observed_at: float | None = None
+    job_type: OcrJobType | None = None
+    detector_bbox: tuple[float, float, float, float] | None = None
+    detector_crop_evidence: bool = False
+    spatial_alias_evidence: bool = False
 
 
 class OcrProvider(Protocol):
@@ -257,6 +274,11 @@ def normalize_plate_text(raw_text: str) -> str:
 
 
 def correct_plate_candidate(raw_text: str) -> str | None:
+    corrected = correct_plate_candidate_with_cost(raw_text)
+    return corrected[0] if corrected is not None else None
+
+
+def correct_plate_candidate_with_cost(raw_text: str) -> tuple[str, int] | None:
     normalized = normalize_plate_text(raw_text)
     if len(normalized) < 5 or len(normalized) > 9:
         return None
@@ -284,15 +306,17 @@ def correct_plate_candidate(raw_text: str) -> str | None:
     if not corrected:
         return None
     corrected.sort(key=lambda item: (item[0], item[1]))
-    return corrected[0][1]
+    cost, plate = corrected[0]
+    return plate, cost
 
 
 class ConfirmationTracker:
     def __init__(self, required: int, window_seconds: float) -> None:
         self.required = max(1, required)
         self.window_seconds = max(0.1, window_seconds)
-        self._observations: dict[tuple[int, str], deque[tuple[float, float]]] = defaultdict(deque)
+        self._observations: dict[int, deque[_ConfirmationObservation]] = defaultdict(deque)
         self._confirmed_until: dict[tuple[int, str], float] = {}
+        self._anonymous_frame_id = 0
 
     def observe(self, candidate: PlateCandidate, observed_at: float) -> PlateCandidate | None:
         return self.observe_progress(candidate, observed_at).candidate
@@ -301,41 +325,134 @@ class ConfirmationTracker:
         self,
         candidate: PlateCandidate,
         observed_at: float,
+        *,
+        frame_id: int | None = None,
+        post_save_near_plate: str | None = None,
+        spatial_alias: bool = False,
     ) -> ConfirmationProgress:
         key = (candidate.camera_id, candidate.plate)
-        observations = self._observations[key]
         confirmed_until = self._confirmed_until.get(key, 0.0)
         if confirmed_until >= observed_at:
-            return ConfirmationProgress(None, 0, self.required)
+            return ConfirmationProgress(
+                None,
+                0,
+                self.required,
+                suppression_reason="active-presence",
+            )
 
-        observations.append((observed_at, candidate.confidence))
-        ordered = sorted(observations, key=lambda item: item[0])
-        newest_at = ordered[-1][0]
+        if frame_id is None:
+            self._anonymous_frame_id -= 1
+            frame_id = self._anonymous_frame_id
+        observations = self._observations[candidate.camera_id]
+        if not any(item.frame_id == frame_id for item in observations):
+            observations.append(
+                _ConfirmationObservation(observed_at, frame_id, candidate)
+            )
+        ordered = sorted(observations, key=lambda item: (item.observed_at, item.frame_id))
+        newest_at = ordered[-1].observed_at
         cutoff = newest_at - self.window_seconds
         observations.clear()
-        observations.extend(item for item in ordered if item[0] >= cutoff)
-        if len(observations) < self.required:
-            return ConfirmationProgress(None, len(observations), self.required)
+        observations.extend(item for item in ordered if item.observed_at >= cutoff)
+        while len(observations) > CONFIRMATION_OBSERVATION_LIMIT_PER_CAMERA:
+            observations.popleft()
 
-        confidence = sum(value for _, value in observations) / len(observations)
-        observations.clear()
-        self._confirmed_until[key] = newest_at + self.window_seconds
-        return ConfirmationProgress(
-            PlateCandidate(
-                plate=candidate.plate,
-                confidence=confidence,
-                raw_text=candidate.raw_text,
-                camera_id=candidate.camera_id,
-            ),
-            self.required,
-            self.required,
+        exact = [item for item in observations if item.candidate.plate == candidate.plate]
+        near_groups: dict[str, list[_ConfirmationObservation]] = defaultdict(list)
+        for item in observations:
+            if item.candidate.plate != candidate.plate and plates_are_near_conflicts(
+                candidate.plate, item.candidate.plate
+            ):
+                near_groups[item.candidate.plate].append(item)
+        runner_up_votes = max((len(items) for items in near_groups.values()), default=0)
+        correction_risk = any(item.candidate.correction_cost > 0 for item in exact)
+        effective_required = self.required
+        if correction_risk or near_groups:
+            effective_required = max(effective_required, RISKY_CONFIRMATIONS_REQUIRED)
+        if post_save_near_plate is not None:
+            effective_required = max(effective_required, POST_SAVE_CONFIRMATIONS_REQUIRED)
+
+        candidate_votes = len(exact)
+        ambiguity_margin_ok = not near_groups or candidate_votes - runner_up_votes >= 2
+        detector_votes = sum(
+            1 for item in exact if item.candidate.detector_crop_evidence
         )
+        detector_evidence_ok = (
+            post_save_near_plate is None
+            or detector_votes >= POST_SAVE_CONFIRMATIONS_REQUIRED
+        )
+        ready = (
+            candidate_votes >= effective_required
+            and ambiguity_margin_ok
+            and detector_evidence_ok
+        )
+        near_conflicts = tuple(sorted(near_groups))
+        if not ready:
+            return ConfirmationProgress(
+                None,
+                candidate_votes,
+                effective_required,
+                near_conflicts=near_conflicts,
+                runner_up_votes=runner_up_votes,
+                suppression_reason=(
+                    "near-duplicate-ambiguity"
+                    if near_groups or post_save_near_plate is not None
+                    else None
+                ),
+            )
+
+        spatial_alias_votes = sum(
+            1 for item in exact if item.candidate.spatial_alias_evidence
+        )
+        if spatial_alias and spatial_alias_votes >= RISKY_CONFIRMATIONS_REQUIRED:
+            return ConfirmationProgress(
+                None,
+                candidate_votes,
+                effective_required,
+                near_conflicts=(post_save_near_plate,) if post_save_near_plate else (),
+                runner_up_votes=runner_up_votes,
+                suppression_reason="near-duplicate-ambiguity",
+                suppress=True,
+            )
+
+        confidence = sum(item.candidate.confidence for item in exact) / len(exact)
+        retained = [
+            item
+            for item in observations
+            if not (
+                item.candidate.plate == candidate.plate
+                or plates_are_near_conflicts(candidate.plate, item.candidate.plate)
+            )
+        ]
+        observations.clear()
+        observations.extend(retained)
+        self._confirmed_until[key] = newest_at + self.window_seconds
+        while len(self._confirmed_until) > CONFIRMED_PLATE_LIMIT:
+            self._confirmed_until.pop(next(iter(self._confirmed_until)))
+        return ConfirmationProgress(
+            replace(candidate, confidence=confidence),
+            candidate_votes,
+            effective_required,
+            near_conflicts=near_conflicts,
+            runner_up_votes=runner_up_votes,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfirmationObservation:
+    observed_at: float
+    frame_id: int
+    candidate: PlateCandidate
+
 
 @dataclass(frozen=True, slots=True)
 class ConfirmationProgress:
     candidate: PlateCandidate | None
     observed_count: int
     required_count: int
+    near_conflicts: tuple[str, ...] = ()
+    runner_up_votes: int = 0
+    suppression_reason: str | None = None
+    suppress: bool = False
 
 
 @dataclass(slots=True)
@@ -390,6 +507,13 @@ class PlatePresenceTracker:
                 presence.record_claimed = False
 
 
+@dataclass(frozen=True, slots=True)
+class _SavedPlateEvidence:
+    plate: str
+    detected_at: datetime
+    detector_bbox: tuple[float, float, float, float] | None
+
+
 class RecognitionState(StrEnum):
     NO_OCR_TEXT = "NO_OCR_TEXT"
     NO_VALID_PLATE = "NO_VALID_PLATE"
@@ -409,6 +533,7 @@ class RecognitionOutcome:
     duplicate: bool = False
     detections: tuple[PlateDetection, ...] = ()
     used_roi_fallback: bool = False
+    suppression_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -756,6 +881,7 @@ class OcrJob:
     job_type: OcrJobType = OcrJobType.DETECTOR_CROP
     frame_id: int | None = None
     detector_source: str = "live"
+    ocr_crop_detections: tuple[PlateDetection | None, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1018,6 +1144,7 @@ class PlateDetectionProcessor:
         detector_config = self.config.plate_detector
         detections: list[PlateDetection] = []
         selected: list[PlateDetection] = []
+        ocr_crop_detections: list[PlateDetection | None] = []
         used_roi_fallback = not detector_config.enabled
         fallback_reason = "detector-disabled" if used_roi_fallback else None
         ocr_crops: list[np.ndarray] = []
@@ -1048,18 +1175,15 @@ class PlateDetectionProcessor:
                     detections,
                     detector_config.max_plate_candidates_per_frame,
                 )
-                ocr_crops = [
-                    plate_crop
-                    for detection in selected
-                    if (
-                        plate_crop := crop_padded_plate(
-                            roi_crop,
-                            detection,
-                            detector_config.crop_padding_ratio,
-                        )
+                for detection in selected:
+                    plate_crop = crop_padded_plate(
+                        roi_crop,
+                        detection,
+                        detector_config.crop_padding_ratio,
                     )
-                    is not None
-                ]
+                    if plate_crop is not None:
+                        ocr_crops.append(plate_crop)
+                        ocr_crop_detections.append(detection)
                 if not ocr_crops:
                     should_fallback, fallback_skipped_reason = (
                         self._should_run_zero_detection_fallback(
@@ -1139,6 +1263,7 @@ class PlateDetectionProcessor:
             job_type=job_type,
             frame_id=frame_id,
             detector_source=detector_source,
+            ocr_crop_detections=tuple(ocr_crop_detections),
         )
         return DetectionJobResult(
             job,
@@ -1224,6 +1349,9 @@ class PlateRecognitionProcessor:
         self._last_zero_detection_fallback_at: dict[int, float] = {}
         self._observation_frame_ids: dict[int, deque[int]] = defaultdict(deque)
         self._observation_frame_id_sets: dict[int, set[int]] = defaultdict(set)
+        self._recent_saved_evidence: dict[int, deque[_SavedPlateEvidence]] = defaultdict(
+            lambda: deque(maxlen=RECENT_SAVED_EVIDENCE_LIMIT)
+        )
 
     def process(
         self,
@@ -1248,6 +1376,7 @@ class PlateRecognitionProcessor:
         used_roi_fallback = not detector_config.enabled
         fallback_reason = "detector-disabled" if used_roi_fallback else None
         ocr_crops: list[np.ndarray] = []
+        ocr_crop_detections: list[PlateDetection | None] = []
 
         if detector_config.enabled and self.detector is not None:
             try:
@@ -1274,18 +1403,15 @@ class PlateRecognitionProcessor:
                     detections,
                     detector_config.max_plate_candidates_per_frame,
                 )
-                ocr_crops = [
-                    plate_crop
-                    for detection in selected
-                    if (
-                        plate_crop := crop_padded_plate(
-                            roi_crop,
-                            detection,
-                            detector_config.crop_padding_ratio,
-                        )
+                for detection in selected:
+                    plate_crop = crop_padded_plate(
+                        roi_crop,
+                        detection,
+                        detector_config.crop_padding_ratio,
                     )
-                    is not None
-                ]
+                    if plate_crop is not None:
+                        ocr_crops.append(plate_crop)
+                        ocr_crop_detections.append(detection)
                 if not ocr_crops and self._should_run_zero_detection_fallback(
                     camera_id,
                     monotonic_at,
@@ -1338,15 +1464,29 @@ class PlateRecognitionProcessor:
             )
 
         variants: list[np.ndarray] = []
-        for ocr_crop in ocr_crops:
+        variant_detections: dict[int, PlateDetection] = {}
+        for crop_index, ocr_crop in enumerate(ocr_crops):
             brightness = roi_mean_brightness(ocr_crop)
-            variants.extend(preprocess_variants(ocr_crop, brightness=brightness))
+            crop_variants = preprocess_variants(ocr_crop, brightness=brightness)
+            detection = (
+                ocr_crop_detections[crop_index]
+                if crop_index < len(ocr_crop_detections)
+                else None
+            )
+            for variant in crop_variants:
+                if detection is not None:
+                    variant_detections[len(variants)] = detection
+                variants.append(variant)
         inference_started_at = time.perf_counter()
         segments = self.provider.recognize(variants)
         ocr_finished_at = time.perf_counter()
         processing_duration_ms = (ocr_finished_at - ocr_started_at) * 1000.0
         inference_duration_ms = (ocr_finished_at - inference_started_at) * 1000.0
-        candidate = select_best_candidate(segments, camera_id)
+        candidate = select_best_candidate(
+            segments,
+            camera_id,
+            variant_detections=variant_detections,
+        )
         self._log_ocr_diagnostics(
             camera_id=camera_id,
             direction=direction,
@@ -1381,6 +1521,11 @@ class PlateRecognitionProcessor:
             detected_at=detected_at,
             full_frame=frame,
             frame_id=None,
+            job_type=(
+                OcrJobType.DETECTOR_CROP
+                if not used_roi_fallback
+                else OcrJobType.DETECTOR_ERROR_FALLBACK
+            ),
             **detection_context,
         )
 
@@ -1398,17 +1543,25 @@ class PlateRecognitionProcessor:
         ocr_started_at = time.perf_counter()
         preprocess_started_at = ocr_started_at
         variants: list[np.ndarray] = []
-        for ocr_crop in job.ocr_crops:
+        variant_detections: dict[int, PlateDetection] = {}
+        for crop_index, ocr_crop in enumerate(job.ocr_crops):
             brightness = roi_mean_brightness(ocr_crop)
             if job.job_type is OcrJobType.DETECTOR_CROP:
-                variants.extend(preprocess_variants(ocr_crop, brightness=brightness))
+                crop_variants = preprocess_variants(ocr_crop, brightness=brightness)
             else:
-                variants.extend(
-                    preprocess_roi_fallback_variants(
-                        ocr_crop,
-                        brightness=brightness,
-                    )
+                crop_variants = preprocess_roi_fallback_variants(
+                    ocr_crop,
+                    brightness=brightness,
                 )
+            detection = (
+                job.ocr_crop_detections[crop_index]
+                if crop_index < len(job.ocr_crop_detections)
+                else None
+            )
+            for variant in crop_variants:
+                if detection is not None:
+                    variant_detections[len(variants)] = detection
+                variants.append(variant)
         inference_started_at = time.perf_counter()
         preprocess_ms = (inference_started_at - preprocess_started_at) * 1000.0
         segments: list[OcrSegment] = []
@@ -1417,7 +1570,11 @@ class PlateRecognitionProcessor:
         if job.job_type is OcrJobType.DETECTOR_CROP:
             attempted_variants = variants
             segments = self.provider.recognize(variants)
-            candidate = select_best_candidate(segments, job.camera_id)
+            candidate = select_best_candidate(
+                segments,
+                job.camera_id,
+                variant_detections=variant_detections,
+            )
         else:
             # Full ROI detection is the expensive safety path. Try the compact
             # color image first and only pay for enhanced contrast when needed.
@@ -1442,7 +1599,11 @@ class PlateRecognitionProcessor:
         ocr_finished_at = time.perf_counter()
         inference_ms = (ocr_finished_at - inference_started_at) * 1000.0
         if candidate is None:
-            candidate = select_best_candidate(segments, job.camera_id)
+            candidate = select_best_candidate(
+                segments,
+                job.camera_id,
+                variant_detections=variant_detections,
+            )
         outcome = self._complete_observation(
             camera_id=job.camera_id,
             segments=segments,
@@ -1453,6 +1614,7 @@ class PlateRecognitionProcessor:
             detections=job.detections,
             used_roi_fallback=job.used_roi_fallback,
             frame_id=job.frame_id,
+            job_type=job.job_type,
         )
         self._log_queued_ocr_diagnostics(
             job=job,
@@ -1479,6 +1641,7 @@ class PlateRecognitionProcessor:
         detections: tuple[PlateDetection, ...],
         used_roi_fallback: bool,
         frame_id: int | None,
+        job_type: OcrJobType,
     ) -> RecognitionOutcome:
         detection_context = {
             "detections": detections,
@@ -1504,6 +1667,14 @@ class PlateRecognitionProcessor:
                 **detection_context,
             )
 
+        candidate = replace(
+            candidate,
+            frame_id=frame_id,
+            observed_at=observed_at,
+            job_type=job_type,
+            detector_crop_evidence=job_type is OcrJobType.DETECTOR_CROP,
+        )
+
         if frame_id is not None and not self._claim_observation_frame(
             camera_id, frame_id
         ):
@@ -1517,19 +1688,50 @@ class PlateRecognitionProcessor:
                 RecognitionState.DUPLICATE_SUPPRESSED,
                 candidate=candidate,
                 duplicate=True,
+                suppression_reason="active-presence",
                 **detection_context,
             )
 
+        detection_time = as_utc(detected_at) if detected_at is not None else utc_now()
+        post_save_near_plate = self._post_save_near_plate(
+            candidate,
+            detection_time,
+        )
+        spatial_alias = self._has_spatial_alias(
+            candidate,
+            detection_time,
+            post_save_near_plate,
+        )
+        candidate = replace(candidate, spatial_alias_evidence=spatial_alias)
         self.presences.observe(candidate, observed_at)
-        progress = self.confirmations.observe_progress(candidate, observed_at)
+        progress = self.confirmations.observe_progress(
+            candidate,
+            observed_at,
+            frame_id=frame_id,
+            post_save_near_plate=post_save_near_plate,
+            spatial_alias=spatial_alias,
+        )
+        self._log_confirmation_decision(
+            candidate,
+            progress,
+            post_save_near_plate,
+            spatial_alias,
+        )
         confirmed = progress.candidate
         if confirmed is None:
+            state = (
+                RecognitionState.DUPLICATE_SUPPRESSED
+                if progress.suppress
+                else RecognitionState.AWAITING_CONFIRMATION
+            )
             return self._outcome(
                 camera_id,
-                RecognitionState.AWAITING_CONFIRMATION,
+                state,
                 candidate=candidate,
                 confirmation_count=progress.observed_count,
                 confirmation_required=progress.required_count,
+                duplicate=progress.suppress,
+                suppression_reason=progress.suppression_reason,
                 **detection_context,
             )
         if not self.presences.claim_record(confirmed):
@@ -1540,6 +1742,7 @@ class PlateRecognitionProcessor:
                 confirmation_count=progress.observed_count,
                 confirmation_required=progress.required_count,
                 duplicate=True,
+                suppression_reason="active-presence",
                 **detection_context,
             )
         try:
@@ -1547,11 +1750,21 @@ class PlateRecognitionProcessor:
                 confirmed.plate,
                 camera_id,
                 confirmed.confidence,
-                detected_at,
+                detection_time,
                 full_frame,
             )
-        except DuplicatePlateDetection:
-            LOGGER.info("Duplicate plate detection suppressed for camera_id=%s", camera_id)
+        except DuplicatePlateDetection as exc:
+            LOGGER.debug(
+                "Duplicate plate detection suppressed camera_id=%s "
+                "suppression_reason=%s latest_movement_direction=%s",
+                camera_id,
+                exc.reason.value,
+                (
+                    exc.latest_direction.value
+                    if exc.latest_direction is not None
+                    else "none"
+                ),
+            )
             return self._outcome(
                 camera_id,
                 RecognitionState.DUPLICATE_SUPPRESSED,
@@ -1559,11 +1772,13 @@ class PlateRecognitionProcessor:
                 confirmation_count=progress.observed_count,
                 confirmation_required=progress.required_count,
                 duplicate=True,
+                suppression_reason=exc.reason.value,
                 **detection_context,
             )
         except Exception:
             self.presences.release_record_claim(confirmed)
             raise
+        self._remember_saved_evidence(confirmed, detection_time)
         LOGGER.info("Plate detection saved for camera_id=%s", camera_id)
         return self._outcome(
             camera_id,
@@ -1573,6 +1788,82 @@ class PlateRecognitionProcessor:
             confirmation_count=progress.observed_count,
             confirmation_required=progress.required_count,
             **detection_context,
+        )
+
+    def _post_save_near_plate(
+        self,
+        candidate: PlateCandidate,
+        detection_time: datetime,
+    ) -> str | None:
+        for plate, _ in self.plate_service.get_recent_camera_plates(
+            candidate.camera_id,
+            detection_time,
+            POST_SAVE_NEAR_DUPLICATE_WINDOW_SECONDS,
+        ):
+            if plates_are_near_conflicts(candidate.plate, plate):
+                return plate
+        return None
+
+    def _has_spatial_alias(
+        self,
+        candidate: PlateCandidate,
+        detection_time: datetime,
+        near_plate: str | None,
+    ) -> bool:
+        if near_plate is None or candidate.detector_bbox is None:
+            return False
+        cutoff = detection_time.timestamp() - POST_SAVE_NEAR_DUPLICATE_WINDOW_SECONDS
+        for evidence in self._recent_saved_evidence[candidate.camera_id]:
+            if evidence.detected_at.timestamp() < cutoff:
+                continue
+            if evidence.plate != near_plate or evidence.detector_bbox is None:
+                continue
+            if plate_boxes_match(candidate.detector_bbox, evidence.detector_bbox):
+                return True
+        return False
+
+    def _remember_saved_evidence(
+        self,
+        candidate: PlateCandidate,
+        detection_time: datetime,
+    ) -> None:
+        self._recent_saved_evidence[candidate.camera_id].append(
+            _SavedPlateEvidence(
+                candidate.plate,
+                detection_time,
+                candidate.detector_bbox,
+            )
+        )
+
+    def _log_confirmation_decision(
+        self,
+        candidate: PlateCandidate,
+        progress: ConfirmationProgress,
+        near_duplicate_match: str | None,
+        spatial_match: bool,
+    ) -> None:
+        LOGGER.debug(
+            "OCR confirmation decision camera_id=%s frame_id=%s candidate=%s "
+            "raw_text=%s correction_cost=%s variant_support=%s base_required=%s "
+            "effective_required=%s near_conflicts=%s candidate_votes=%s "
+            "runner_up_votes=%s decision=%s suppression_reason=%s "
+            "near_duplicate_match=%s spatial_match=%s job_type=%s",
+            candidate.camera_id,
+            candidate.frame_id,
+            candidate.plate,
+            candidate.raw_text,
+            candidate.correction_cost,
+            candidate.variant_support,
+            self.confirmations.required,
+            progress.required_count,
+            ",".join(progress.near_conflicts) or "none",
+            progress.observed_count,
+            progress.runner_up_votes,
+            "suppress" if progress.suppress else "confirm" if progress.candidate else "wait",
+            progress.suppression_reason or "none",
+            near_duplicate_match or "none",
+            "yes" if spatial_match else "no",
+            candidate.job_type.value if candidate.job_type is not None else "unknown",
         )
 
     def _claim_observation_frame(self, camera_id: int, frame_id: int) -> bool:
@@ -1598,6 +1889,7 @@ class PlateRecognitionProcessor:
         duplicate: bool = False,
         detections: tuple[PlateDetection, ...] = (),
         used_roi_fallback: bool = False,
+        suppression_reason: str | None = None,
     ) -> RecognitionOutcome:
         signature = (state, candidate.plate if candidate is not None else None)
         if (
@@ -1621,6 +1913,7 @@ class PlateRecognitionProcessor:
             duplicate=duplicate,
             detections=detections,
             used_roi_fallback=used_roi_fallback,
+            suppression_reason=suppression_reason,
         )
 
     def _log_ocr_diagnostics(
@@ -2653,18 +2946,20 @@ def _image_resolution(image: object) -> str:
 def select_best_candidate(
     segments: Sequence[OcrSegment],
     camera_id: int,
+    *,
+    variant_detections: dict[int, PlateDetection] | None = None,
 ) -> PlateCandidate | None:
     usable = [segment for segment in segments if segment.text.strip()]
     if not usable:
         return None
-    raw_groups: list[tuple[str, float]] = []
+    raw_groups: list[tuple[str, float, int]] = []
     for variant_index in sorted({segment.variant_index for segment in usable}):
         ordered = sorted(
             (segment for segment in usable if segment.variant_index == variant_index),
             key=lambda segment: (segment.box[0], segment.box[1]),
         )
         for segment in ordered:
-            raw_groups.append((segment.text, segment.confidence))
+            raw_groups.append((segment.text, segment.confidence, variant_index))
         for start in range(len(ordered)):
             for end in range(start + 2, min(len(ordered), start + 4) + 1):
                 group = ordered[start:end]
@@ -2672,26 +2967,117 @@ def select_best_candidate(
                     (
                         "".join(segment.text for segment in group),
                         sum(segment.confidence for segment in group) / len(group),
+                        variant_index,
                     )
                 )
 
-    candidates: dict[str, PlateCandidate] = {}
-    for raw_text, confidence in raw_groups:
-        plate = correct_plate_candidate(raw_text)
-        if plate is None:
+    evidence: dict[str, list[tuple[str, str, int, float, int]]] = defaultdict(list)
+    for raw_text, confidence, variant_index in raw_groups:
+        corrected = correct_plate_candidate_with_cost(raw_text)
+        if corrected is None:
             continue
+        plate, correction_cost = corrected
+        evidence[plate].append(
+            (
+                raw_text,
+                normalize_plate_text(raw_text),
+                correction_cost,
+                _safe_score(confidence),
+                variant_index,
+            )
+        )
+
+    candidates: list[PlateCandidate] = []
+    for plate, items in evidence.items():
+        supporting_variants = tuple(sorted({item[4] for item in items}))
+        best = min(items, key=lambda item: (item[2], -item[3], item[1]))
+        detection = (
+            variant_detections.get(best[4])
+            if variant_detections is not None
+            else None
+        )
         candidate = PlateCandidate(
             plate=plate,
-            confidence=_safe_score(confidence),
-            raw_text=raw_text,
+            confidence=best[3],
+            raw_text=best[0],
             camera_id=camera_id,
+            normalized_raw_text=best[1],
+            correction_cost=best[2],
+            variant_support=len(supporting_variants),
+            supporting_variants=supporting_variants,
+            detector_bbox=(
+                (
+                    float(detection.x),
+                    float(detection.y),
+                    float(detection.width),
+                    float(detection.height),
+                )
+                if detection is not None
+                else None
+            ),
         )
-        previous = candidates.get(plate)
-        if previous is None or candidate.confidence > previous.confidence:
-            candidates[plate] = candidate
+        candidates.append(candidate)
     if not candidates:
         return None
-    return max(candidates.values(), key=lambda candidate: candidate.confidence)
+    return max(
+        candidates,
+        key=lambda candidate: (
+            candidate.variant_support,
+            -candidate.correction_cost,
+            candidate.confidence,
+            candidate.plate,
+        ),
+    )
+
+
+def plates_are_near_conflicts(first: str, second: str) -> bool:
+    """Flag ambiguity without guessing which one-character plate is correct."""
+    if first == second or len(first) != len(second):
+        return False
+    if not (
+        TurkishPlateValidator.is_valid(first)
+        and TurkishPlateValidator.is_valid(second)
+    ):
+        return False
+    if first[:2] != second[:2] or _plate_structure(first) != _plate_structure(second):
+        return False
+    return sum(left != right for left, right in zip(first, second)) <= 1
+
+
+def _plate_structure(plate: str) -> str:
+    return "".join("D" if character.isdigit() else "L" for character in plate)
+
+
+def plate_boxes_match(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> bool:
+    """Compare detector x/y/width/height boxes without introducing tracking."""
+    first_x, first_y, first_width, first_height = first
+    second_x, second_y, second_width, second_height = second
+    intersection_width = max(
+        0.0,
+        min(first_x + first_width, second_x + second_width) - max(first_x, second_x),
+    )
+    intersection_height = max(
+        0.0,
+        min(first_y + first_height, second_y + second_height) - max(first_y, second_y),
+    )
+    intersection = intersection_width * intersection_height
+    union = first_width * first_height + second_width * second_height - intersection
+    if union > 0 and intersection / union >= 0.30:
+        return True
+    first_center = (first_x + first_width / 2.0, first_y + first_height / 2.0)
+    second_center = (second_x + second_width / 2.0, second_y + second_height / 2.0)
+    center_distance = (
+        (first_center[0] - second_center[0]) ** 2
+        + (first_center[1] - second_center[1]) ** 2
+    ) ** 0.5
+    reference_size = max(
+        1.0,
+        (first_width + first_height + second_width + second_height) / 4.0,
+    )
+    return center_distance <= reference_size * 0.50
 
 
 def _translate(

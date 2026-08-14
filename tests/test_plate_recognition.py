@@ -47,6 +47,7 @@ from app.plate_recognition import (
     RecognitionState,
     TurkishPlateValidator,
     correct_plate_candidate,
+    correct_plate_candidate_with_cost,
     normalize_plate_text,
     crop_roi,
     preprocess_variants,
@@ -54,6 +55,7 @@ from app.plate_recognition import (
     roi_mean_brightness,
     select_replay_frames,
     select_best_candidate,
+    plates_are_near_conflicts,
     RecognitionStatus,
     _PendingFrame,
 )
@@ -173,6 +175,101 @@ class PlateTextTests(unittest.TestCase):
         self.assertEqual(correct_plate_candidate("35ABCIZ34"), "35ABC1234")
         self.assertEqual(correct_plate_candidate("34A0C123"), "34AOC123")
         self.assertIsNone(correct_plate_candidate("99ABC123"))
+
+    def test_correction_cost_is_available_without_breaking_existing_api(self) -> None:
+        self.assertEqual(
+            correct_plate_candidate_with_cost("23ABCI23"),
+            ("23ABC123", 1),
+        )
+        self.assertEqual(
+            correct_plate_candidate_with_cost("23ABC123"),
+            ("23ABC123", 0),
+        )
+
+    def test_near_conflict_requires_same_valid_structure_and_province(self) -> None:
+        self.assertTrue(plates_are_near_conflicts("23ABC123", "23ABC128"))
+        self.assertFalse(plates_are_near_conflicts("23ABC123", "34ABC128"))
+        self.assertFalse(plates_are_near_conflicts("23ABC123", "23AB1234"))
+
+    def test_variant_consensus_beats_isolated_high_confidence_typo(self) -> None:
+        candidate = select_best_candidate(
+            (
+                OcrSegment("23ABC123", 0.82, (0, 0, 10, 10), 0),
+                OcrSegment("23ABC123", 0.84, (0, 0, 10, 10), 1),
+                OcrSegment("23ABC128", 0.99, (0, 0, 10, 10), 2),
+            ),
+            camera_id=1,
+        )
+
+        self.assertEqual(candidate.plate, "23ABC123")
+        self.assertEqual(candidate.variant_support, 2)
+
+    def test_ambiguity_majority_requires_three_votes_and_two_vote_margin(self) -> None:
+        tracker = ConfirmationTracker(required=2, window_seconds=3.0)
+        first = PlateCandidate("23ABC123", 0.8, "23ABC123", 1)
+        typo = PlateCandidate("23ABC128", 0.99, "23ABC128", 1)
+
+        tracker.observe_progress(first, 1.0, frame_id=1)
+        tracker.observe_progress(typo, 1.2, frame_id=2)
+        two_vs_one = tracker.observe_progress(first, 1.4, frame_id=3)
+        confirmed = tracker.observe_progress(first, 1.6, frame_id=4)
+
+        self.assertIsNone(two_vs_one.candidate)
+        self.assertEqual(
+            (two_vs_one.observed_count, two_vs_one.required_count),
+            (2, 3),
+        )
+        self.assertEqual(confirmed.candidate.plate, "23ABC123")
+        self.assertEqual(confirmed.runner_up_votes, 1)
+
+    def test_two_vs_two_and_three_vs_two_remain_ambiguous(self) -> None:
+        tracker = ConfirmationTracker(required=2, window_seconds=3.0)
+        first = PlateCandidate("23ABC123", 0.9, "23ABC123", 1)
+        typo = PlateCandidate("23ABC128", 0.9, "23ABC128", 1)
+        sequence = (first, typo, first, typo, first)
+        outcomes = [
+            tracker.observe_progress(item, 1.0 + index * 0.2, frame_id=index)
+            for index, item in enumerate(sequence, start=1)
+        ]
+
+        self.assertIsNone(outcomes[3].candidate)
+        self.assertIsNone(outcomes[4].candidate)
+        self.assertEqual(outcomes[4].runner_up_votes, 2)
+
+    def test_corrected_candidate_requires_three_distinct_frames(self) -> None:
+        tracker = ConfirmationTracker(required=2, window_seconds=3.0)
+        corrected = PlateCandidate(
+            "23ABC123",
+            0.9,
+            "23ABCI23",
+            1,
+            correction_cost=1,
+        )
+
+        first = tracker.observe_progress(corrected, 1.0, frame_id=1)
+        second = tracker.observe_progress(corrected, 1.2, frame_id=2)
+        third = tracker.observe_progress(corrected, 1.4, frame_id=3)
+
+        self.assertEqual((first.required_count, second.required_count), (3, 3))
+        self.assertIsNone(second.candidate)
+        self.assertEqual(third.candidate.plate, "23ABC123")
+
+    def test_post_save_near_plate_cannot_rely_on_full_roi_fallback(self) -> None:
+        tracker = ConfirmationTracker(required=2, window_seconds=3.0)
+        fallback = PlateCandidate("23ABC128", 0.99, "23ABC128", 1)
+
+        outcomes = [
+            tracker.observe_progress(
+                fallback,
+                1.0 + index * 0.2,
+                frame_id=index,
+                post_save_near_plate="23ABC123",
+            )
+            for index in range(1, 6)
+        ]
+
+        self.assertTrue(all(item.candidate is None for item in outcomes))
+        self.assertTrue(all(item.required_count == 4 for item in outcomes))
 
     def test_confirmation_requires_enough_observations_and_emits_once(self) -> None:
         tracker = ConfirmationTracker(required=2, window_seconds=3.0)
@@ -386,6 +483,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         job_type: OcrJobType | None = None,
         detector_source: str = "live",
         captured_at: datetime | None = None,
+        detection: PlateDetection | None = None,
     ) -> OcrJob:
         now = time.monotonic() if observed_at is None else observed_at
         frame = np.full((200, 400, 3), frame_value, dtype=np.uint8)
@@ -404,7 +502,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             full_frame=frame,
             roi_crop=crop,
             ocr_crops=(crop.copy(),),
-            detections=(),
+            detections=(detection,) if detection is not None else (),
             used_roi_fallback=fallback_reason is not None,
             fallback_reason=fallback_reason,
             detector_ms=12.0,
@@ -420,6 +518,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             ),
             frame_id=frame_id,
             detector_source=detector_source,
+            ocr_crop_detections=(detection,) if detection is not None else (),
         )
 
     def _make_snapshot(
@@ -1027,7 +1126,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIsNone(outcome.record)
         self.assertEqual(self._record_count(), 1)
 
-    def test_same_plate_can_be_recorded_again_after_presence_release(self) -> None:
+    def test_presence_release_cannot_create_duplicate_parked_movement(self) -> None:
         camera = self.camera_service.list_cameras()[0]
         processor = PlateRecognitionProcessor(
             FakeOcrProvider(confidence=0.97), self.plate_service, self.config
@@ -1044,21 +1143,23 @@ class RecognitionPipelineTests(unittest.TestCase):
             camera.id,
             camera.direction,
             frame,
-            detected_at + timedelta(seconds=16),
-            monotonic_at=18.0,
+            detected_at + timedelta(minutes=30),
+            monotonic_at=1_800.0,
         )
         second = processor.process(
             camera.id,
             camera.direction,
             frame,
-            detected_at + timedelta(seconds=17),
-            monotonic_at=19.0,
+            detected_at + timedelta(minutes=30, seconds=1),
+            monotonic_at=1_801.0,
         )
 
         self.assertIsNotNone(first.record)
-        self.assertIsNotNone(second.record)
-        self.assertEqual(self._record_count(), 2)
-        self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 2)
+        self.assertIsNone(second.record)
+        self.assertTrue(second.duplicate)
+        self.assertEqual(second.suppression_reason, "same-direction-state")
+        self.assertEqual(self._record_count(), 1)
+        self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 1)
 
     def test_same_plate_is_independent_for_entry_and_exit_cameras(self) -> None:
         cameras = {
@@ -1086,7 +1187,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             cameras[Direction.EXIT].id,
             Direction.EXIT,
             frame,
-            detected_at,
+            detected_at + timedelta(seconds=1),
             monotonic_at=2.0,
         )
 
@@ -2451,6 +2552,174 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         self.assertIs(saved.state, RecognitionState.SAVED)
         self.assertEqual(datetime.fromisoformat(saved.record.timestamp), older_captured_at)
+
+    def test_wrong_valid_plate_never_saves_when_correct_plate_reaches_consensus(self) -> None:
+        batches = [
+            [OcrSegment(text, confidence, (0, 0, 10, 10), 0)]
+            for text, confidence in (
+                ("23ABC123", 0.82),
+                ("23ABC128", 0.99),
+                ("23ABC123", 0.83),
+                ("23ABC123", 0.84),
+            )
+        ]
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(batches),
+            self.plate_service,
+            self.config,
+        )
+        base = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
+
+        outcomes = [
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    frame_id=index,
+                    observed_at=10.0 + index * 0.2,
+                    captured_at=base + timedelta(milliseconds=index * 200),
+                ),
+                queue_depth=0,
+            )
+            for index in range(1, 5)
+        ]
+
+        self.assertEqual(outcomes[-1].record.plate, "23ABC123")
+        self.assertEqual(self._record_count(), 1)
+        with self.database.connection() as connection:
+            self.assertEqual(
+                connection.execute("SELECT plate FROM plate_records").fetchone()[0],
+                "23ABC123",
+            )
+
+    def test_corrected_candidate_saves_only_after_three_distinct_frames(self) -> None:
+        batches = [
+            [OcrSegment("23ABCI23", 0.95, (0, 0, 10, 10), 0)]
+            for _ in range(3)
+        ]
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(batches), self.plate_service, self.config
+        )
+        base = datetime(2026, 8, 13, 10, 30, tzinfo=timezone.utc)
+
+        outcomes = [
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    frame_id=index,
+                    observed_at=15.0 + index * 0.2,
+                    captured_at=base + timedelta(milliseconds=index * 200),
+                ),
+                queue_depth=0,
+            )
+            for index in range(1, 4)
+        ]
+
+        self.assertTrue(all(item.record is None for item in outcomes[:2]))
+        self.assertEqual(outcomes[1].confirmation_required, 3)
+        self.assertEqual(outcomes[2].record.plate, "23ABC123")
+
+    def test_alternating_near_plate_tie_creates_no_record(self) -> None:
+        batches = [
+            [OcrSegment(text, 0.95, (0, 0, 10, 10), 0)]
+            for text in ("23ABC123", "23ABC128", "23ABC123", "23ABC128")
+        ]
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(batches), self.plate_service, self.config
+        )
+        base = datetime(2026, 8, 13, 10, 0, tzinfo=timezone.utc)
+
+        outcomes = [
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    frame_id=index,
+                    observed_at=20.0 + index * 0.2,
+                    captured_at=base + timedelta(milliseconds=index * 200),
+                ),
+                queue_depth=0,
+            )
+            for index in range(1, 5)
+        ]
+
+        self.assertTrue(all(outcome.record is None for outcome in outcomes))
+        self.assertEqual(self._record_count(), 0)
+        self.assertEqual(outcomes[-1].confirmation_required, 3)
+
+    def test_post_save_spatial_ocr_alias_is_suppressed_without_jpeg(self) -> None:
+        batches = [
+            [OcrSegment(text, 0.95, (0, 0, 10, 10), 0)]
+            for text in (
+                "23ABC123",
+                "23ABC123",
+                "23ABC128",
+                "23ABC128",
+                "23ABC128",
+                "23ABC128",
+            )
+        ]
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(batches), self.plate_service, self.config
+        )
+        detection = PlateDetection(0.90, x=20, y=10, width=100, height=30)
+        base = datetime(2026, 8, 13, 11, 0, tzinfo=timezone.utc)
+
+        outcomes = [
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    frame_id=index,
+                    observed_at=30.0 + index * 0.2,
+                    captured_at=(
+                        base + timedelta(milliseconds=index * 200)
+                        if index <= 2
+                        else base
+                        + timedelta(minutes=30, milliseconds=index * 200)
+                    ),
+                    detection=detection,
+                    frame_value=index * 10,
+                ),
+                queue_depth=0,
+            )
+            for index in range(1, 7)
+        ]
+
+        self.assertIs(outcomes[1].state, RecognitionState.SAVED)
+        self.assertIs(outcomes[-1].state, RecognitionState.DUPLICATE_SUPPRESSED)
+        self.assertEqual(outcomes[-1].suppression_reason, "near-duplicate-ambiguity")
+        self.assertEqual(self._record_count(), 1)
+        self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 1)
+
+    def test_different_near_plate_without_spatial_continuity_can_be_accepted(self) -> None:
+        batches = [
+            [OcrSegment(text, 0.95, (0, 0, 10, 10), 0)]
+            for text in (
+                "23ABC123",
+                "23ABC123",
+                "23ABC128",
+                "23ABC128",
+                "23ABC128",
+                "23ABC128",
+            )
+        ]
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(batches), self.plate_service, self.config
+        )
+        first_detection = PlateDetection(0.90, x=20, y=10, width=80, height=25)
+        second_detection = PlateDetection(0.90, x=250, y=120, width=80, height=25)
+        base = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
+        outcomes = []
+        for index in range(1, 7):
+            outcomes.append(
+                processor.process_ocr_job(
+                    self._make_ocr_job(
+                        frame_id=index,
+                        observed_at=40.0 + index * 0.2,
+                        captured_at=base + timedelta(milliseconds=index * 200),
+                        detection=(first_detection if index <= 2 else second_detection),
+                    ),
+                    queue_depth=0,
+                )
+            )
+
+        self.assertIs(outcomes[-1].state, RecognitionState.SAVED)
+        self.assertEqual(outcomes[-1].confirmation_required, 4)
+        self.assertEqual(self._record_count(), 2)
 
     def test_replay_recovers_two_plate_frames_missed_by_live_detector(self) -> None:
         class PixelPlateDetector:

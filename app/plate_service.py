@@ -4,6 +4,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 
 from app.audit import AuditAction, AuditService
@@ -62,13 +63,27 @@ class PlateRecordDaySummary:
     exit_count: int
 
 
-class DuplicatePlateDetection(Exception):
-    """Raised when the same camera reports a plate inside the cooldown window."""
+class DuplicateSuppressionReason(StrEnum):
+    EXACT_COOLDOWN = "exact-cooldown"
+    SAME_DIRECTION_STATE = "same-direction-state"
+    STALE_HISTORICAL = "stale-historical"
 
-    def __init__(self, plate: str, camera_id: int) -> None:
+
+class DuplicatePlateDetection(Exception):
+    """Raised when persistence safely suppresses a duplicate movement."""
+
+    def __init__(
+        self,
+        plate: str,
+        camera_id: int,
+        reason: DuplicateSuppressionReason = DuplicateSuppressionReason.EXACT_COOLDOWN,
+        latest_direction: Direction | None = None,
+    ) -> None:
         super().__init__("Aynı plaka cooldown süresi içinde zaten kaydedildi.")
         self.plate = plate
         self.camera_id = camera_id
+        self.reason = reason
+        self.latest_direction = latest_direction
 
 
 class PlateService:
@@ -131,7 +146,33 @@ class PlateService:
             if camera is None:
                 raise ValidationError("Kamera bulunamadı.")
 
-            latest = connection.execute(
+            latest_movement = connection.execute(
+                """
+                SELECT direction, camera_id, timestamp
+                FROM plate_records
+                WHERE plate = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+                """,
+                (normalized_plate,),
+            ).fetchone()
+            current_direction = Direction(camera["direction"])
+            latest_direction = (
+                Direction(latest_movement["direction"])
+                if latest_movement is not None
+                else None
+            )
+            if latest_movement is not None and self._is_stale_or_equal(
+                latest_movement["timestamp"], detection_time
+            ):
+                self._raise_duplicate(
+                    normalized_plate,
+                    camera_id,
+                    DuplicateSuppressionReason.STALE_HISTORICAL,
+                    latest_direction,
+                )
+
+            latest_same_camera = connection.execute(
                 """
                 SELECT timestamp
                 FROM plate_records
@@ -141,10 +182,23 @@ class PlateService:
                 """,
                 (camera_id, normalized_plate),
             ).fetchone()
-            if latest is not None and self._inside_cooldown(
-                latest["timestamp"], detection_time
+            if latest_same_camera is not None and self._inside_cooldown(
+                latest_same_camera["timestamp"], detection_time
             ):
-                raise DuplicatePlateDetection(normalized_plate, camera_id)
+                self._raise_duplicate(
+                    normalized_plate,
+                    camera_id,
+                    DuplicateSuppressionReason.EXACT_COOLDOWN,
+                    latest_direction,
+                )
+
+            if latest_direction is current_direction:
+                self._raise_duplicate(
+                    normalized_plate,
+                    camera_id,
+                    DuplicateSuppressionReason.SAME_DIRECTION_STATE,
+                    latest_direction,
+                )
 
             cursor = connection.execute(
                 """
@@ -173,6 +227,41 @@ class PlateService:
             timestamp=timestamp,
             image_path=image_path,
         )
+
+    def get_recent_camera_plates(
+        self,
+        camera_id: int,
+        detected_at: datetime,
+        window_seconds: int,
+        *,
+        limit: int = 20,
+    ) -> list[tuple[str, datetime]]:
+        """Return recent persisted plate text for conservative OCR alias checks."""
+        current = as_utc(detected_at)
+        cutoff = current - timedelta(seconds=max(1, window_seconds))
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT plate, timestamp
+                FROM plate_records
+                WHERE camera_id = ? AND timestamp >= ? AND timestamp <= ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+                """,
+                (
+                    camera_id,
+                    to_utc_storage(cutoff),
+                    to_utc_storage(current),
+                    max(1, min(limit, 100)),
+                ),
+            ).fetchall()
+        recent: list[tuple[str, datetime]] = []
+        for row in rows:
+            try:
+                recent.append((row["plate"], parse_utc_timestamp(row["timestamp"])))
+            except (TypeError, ValueError):
+                continue
+        return recent
 
     def _save_capture(
         self,
@@ -220,6 +309,30 @@ class PlateService:
         return timedelta(0) <= elapsed <= timedelta(
             seconds=self.duplicate_cooldown_seconds
         )
+
+    @staticmethod
+    def _is_stale_or_equal(previous_value: str, current: datetime) -> bool:
+        try:
+            return as_utc(current) <= parse_utc_timestamp(previous_value)
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _raise_duplicate(
+        plate: str,
+        camera_id: int,
+        reason: DuplicateSuppressionReason,
+        latest_direction: Direction | None,
+    ) -> None:
+        LOGGER.debug(
+            "Plate persistence suppressed camera_id=%s plate=%s "
+            "suppression_reason=%s latest_movement_direction=%s",
+            camera_id,
+            plate,
+            reason.value,
+            latest_direction.value if latest_direction is not None else "none",
+        )
+        raise DuplicatePlateDetection(plate, camera_id, reason, latest_direction)
 
     def get_recent_records(
         self, actor: SessionUser, limit: int = 20

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -20,7 +21,10 @@ from app.camera import CameraService, Direction
 from app.database import Database
 from app.plate_capture import PlateCaptureService
 from app.plate_service import PlateService
-from app.plate_service import DuplicatePlateDetection
+from app.plate_service import (
+    DuplicatePlateDetection,
+    DuplicateSuppressionReason,
+)
 from app.time_utils import parse_utc_timestamp, to_utc_storage
 from main import apply_startup_retention_cleanup
 
@@ -254,13 +258,17 @@ class ServiceTests(unittest.TestCase):
         first = self.plate_service.save_plate_detection(
             "34ABC123", cameras[Direction.ENTRY].id, 0.95, now
         )
-        with self.assertRaises(DuplicatePlateDetection):
+        with self.assertRaises(DuplicatePlateDetection) as caught:
             self.plate_service.save_plate_detection(
                 "34ABC123",
                 cameras[Direction.ENTRY].id,
                 0.94,
                 now + timedelta(seconds=5),
             )
+        self.assertIs(
+            caught.exception.reason,
+            DuplicateSuppressionReason.EXACT_COOLDOWN,
+        )
         exit_record = self.plate_service.save_plate_detection(
             "34ABC123",
             cameras[Direction.EXIT].id,
@@ -277,6 +285,144 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(first.direction, Direction.ENTRY)
         self.assertEqual(exit_record.direction, Direction.EXIT)
         self.assertEqual(after_cooldown.direction, Direction.ENTRY)
+
+    def test_same_direction_state_survives_service_restart(self) -> None:
+        camera = {
+            item.direction: item for item in self.camera_service.list_cameras()
+        }[Direction.ENTRY]
+        now = datetime(2026, 8, 14, 8, 0, tzinfo=timezone.utc)
+        self.plate_service.save_plate_detection("23ABC123", camera.id, 0.95, now)
+        restarted = PlateService(self.database, duplicate_cooldown_seconds=10)
+
+        with self.assertRaises(DuplicatePlateDetection) as caught:
+            restarted.save_plate_detection(
+                "23ABC123",
+                camera.id,
+                0.95,
+                now + timedelta(minutes=30),
+            )
+
+        self.assertIs(
+            caught.exception.reason,
+            DuplicateSuppressionReason.SAME_DIRECTION_STATE,
+        )
+        with self.database.connection() as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM plate_records").fetchone()[0],
+                1,
+            )
+
+    def test_entry_exit_entry_transitions_are_allowed(self) -> None:
+        cameras = {
+            item.direction: item for item in self.camera_service.list_cameras()
+        }
+        now = datetime(2026, 8, 14, 9, 0, tzinfo=timezone.utc)
+
+        records = [
+            self.plate_service.save_plate_detection(
+                "23ABC123", cameras[Direction.ENTRY].id, 0.95, now
+            ),
+            self.plate_service.save_plate_detection(
+                "23ABC123",
+                cameras[Direction.EXIT].id,
+                0.95,
+                now + timedelta(minutes=1),
+            ),
+            self.plate_service.save_plate_detection(
+                "23ABC123",
+                cameras[Direction.ENTRY].id,
+                0.95,
+                now + timedelta(minutes=2),
+            ),
+        ]
+
+        self.assertEqual(
+            [record.direction for record in records],
+            [Direction.ENTRY, Direction.EXIT, Direction.ENTRY],
+        )
+
+    def test_same_direction_exit_is_suppressed(self) -> None:
+        camera = {
+            item.direction: item for item in self.camera_service.list_cameras()
+        }[Direction.EXIT]
+        now = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)
+        self.plate_service.save_plate_detection("23ABC123", camera.id, 0.95, now)
+
+        with self.assertRaises(DuplicatePlateDetection) as caught:
+            self.plate_service.save_plate_detection(
+                "23ABC123", camera.id, 0.95, now + timedelta(minutes=20)
+            )
+
+        self.assertIs(
+            caught.exception.reason,
+            DuplicateSuppressionReason.SAME_DIRECTION_STATE,
+        )
+
+    def test_stale_historical_result_cannot_move_state_backwards(self) -> None:
+        cameras = {
+            item.direction: item for item in self.camera_service.list_cameras()
+        }
+        now = datetime(2026, 8, 14, 11, 0, tzinfo=timezone.utc)
+        self.plate_service.save_plate_detection(
+            "23ABC123", cameras[Direction.ENTRY].id, 0.95, now
+        )
+        self.plate_service.save_plate_detection(
+            "23ABC123",
+            cameras[Direction.EXIT].id,
+            0.95,
+            now + timedelta(seconds=5),
+        )
+
+        with self.assertRaises(DuplicatePlateDetection) as caught:
+            self.plate_service.save_plate_detection(
+                "23ABC123",
+                cameras[Direction.ENTRY].id,
+                0.95,
+                now + timedelta(seconds=3),
+            )
+
+        self.assertIs(
+            caught.exception.reason,
+            DuplicateSuppressionReason.STALE_HISTORICAL,
+        )
+        with self.database.connection() as connection:
+            latest = connection.execute(
+                "SELECT direction FROM plate_records WHERE plate = ? "
+                "ORDER BY timestamp DESC, id DESC LIMIT 1",
+                ("23ABC123",),
+            ).fetchone()[0]
+        self.assertEqual(latest, Direction.EXIT.value)
+
+    def test_concurrent_same_movement_attempts_insert_one_row(self) -> None:
+        camera = {
+            item.direction: item for item in self.camera_service.list_cameras()
+        }[Direction.ENTRY]
+        now = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
+        barrier = threading.Barrier(2)
+        outcomes: list[str] = []
+
+        def save() -> None:
+            service = PlateService(self.database, duplicate_cooldown_seconds=120)
+            barrier.wait()
+            try:
+                service.save_plate_detection("23ABC123", camera.id, 0.95, now)
+                outcomes.append("saved")
+            except DuplicatePlateDetection as exc:
+                outcomes.append(exc.reason.value)
+
+        threads = [threading.Thread(target=save) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(outcomes.count("saved"), 1)
+        self.assertEqual(outcomes.count("stale-historical"), 1)
+        with self.database.connection() as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM plate_records").fetchone()[0],
+                1,
+            )
 
     def test_confirmed_record_with_frame_stores_image_path(self) -> None:
         camera = self.camera_service.list_cameras()[0]
