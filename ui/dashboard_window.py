@@ -354,12 +354,15 @@ class DashboardHome(QWidget):
             RecognitionState.LOW_CONFIDENCE: "Okuma yeterli değil, kaydedilmedi",
             RecognitionState.SAVED: "Kaydedildi",
             RecognitionState.DUPLICATE_SUPPRESSED: "Zaten kaydedildi",
+            RecognitionState.AMBIGUOUS_DISCARDED: "Kararsız okuma, kaydedilmedi",
         }
         if outcome.state is RecognitionState.AWAITING_CONFIRMATION:
             state_text = (
                 "Doğrulanıyor "
                 f"({outcome.confirmation_count}/{outcome.confirmation_required})"
             )
+        elif outcome.state is RecognitionState.STABILIZING:
+            state_text = "Karar stabilize ediliyor"
         else:
             state_text = state_texts.get(outcome.state, "Plaka aranıyor")
         card.ocr_status.setText(
@@ -385,7 +388,10 @@ class DashboardHome(QWidget):
 
     @staticmethod
     def _ocr_state_hold_ms(state: RecognitionState) -> int | None:
-        if state is RecognitionState.AWAITING_CONFIRMATION:
+        if state in (
+            RecognitionState.AWAITING_CONFIRMATION,
+            RecognitionState.STABILIZING,
+        ):
             return CONFIRMATION_STATUS_HOLD_MS
         if state is RecognitionState.SAVED:
             return SAVED_STATUS_HOLD_MS

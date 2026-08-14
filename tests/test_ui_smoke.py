@@ -200,6 +200,17 @@ class LoginFlowSmokeTest(unittest.TestCase):
             ),
             (
                 RecognitionOutcome(
+                    candidate,
+                    None,
+                    RecognitionState.STABILIZING,
+                    confirmation_count=2,
+                    confirmation_required=2,
+                ),
+                "Durum: Karar stabilize ediliyor",
+                "OCR: 34 ABC 123",
+            ),
+            (
+                RecognitionOutcome(
                     low_confidence_candidate,
                     None,
                     RecognitionState.LOW_CONFIDENCE,
@@ -224,6 +235,15 @@ class LoginFlowSmokeTest(unittest.TestCase):
                     duplicate=True,
                 ),
                 "Durum: Zaten kaydedildi",
+                "OCR: 34 CLK 536",
+            ),
+            (
+                RecognitionOutcome(
+                    high_confidence_candidate,
+                    None,
+                    RecognitionState.AMBIGUOUS_DISCARDED,
+                ),
+                "Durum: Kararsız okuma, kaydedilmedi",
                 "OCR: 34 CLK 536",
             ),
         )

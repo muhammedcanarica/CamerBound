@@ -25,6 +25,8 @@
     "min_confidence": 0.65,
     "confirmations_required": 2,
     "confirmation_window_seconds": 3,
+    "plate_stabilization_window_ms": 2000,
+    "plate_stabilization_min_hold_ms": 500,
     "duplicate_cooldown_seconds": 120,
     "record_retention_days": 30,
     "plate_detector": {

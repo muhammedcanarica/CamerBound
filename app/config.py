@@ -24,6 +24,8 @@ class NormalizedRoi:
 DEFAULT_ROI = NormalizedRoi(x=0.10, y=0.35, width=0.80, height=0.55)
 DEFAULT_RECORD_RETENTION_DAYS = 90
 DEFAULT_DUPLICATE_COOLDOWN_SECONDS = 120
+DEFAULT_PLATE_STABILIZATION_WINDOW_MS = 2_000
+DEFAULT_PLATE_STABILIZATION_MIN_HOLD_MS = 500
 SUPPORTED_RECORD_RETENTION_DAYS = (30, 90, 180, 0)
 DEFAULT_CAPTURE_MAX_WIDTH = 960
 DEFAULT_CAPTURE_JPEG_QUALITY = 60
@@ -97,6 +99,8 @@ class PlateRecognitionConfig:
     entry_roi: NormalizedRoi
     exit_roi: NormalizedRoi
     model_root: Path
+    plate_stabilization_window_ms: int = DEFAULT_PLATE_STABILIZATION_WINDOW_MS
+    plate_stabilization_min_hold_ms: int = DEFAULT_PLATE_STABILIZATION_MIN_HOLD_MS
     record_retention_days: int = DEFAULT_RECORD_RETENTION_DAYS
     ocr_backend: str = "auto"
     plate_detector: PlateDetectorConfig = field(default_factory=PlateDetectorConfig)
@@ -288,6 +292,30 @@ def _load_plate_recognition(
         raw.get("confirmation_window_seconds"), 3.0, 0.1, 60.0, float,
         "confirmation_window_seconds", warnings,
     )
+    stabilization_window_ms = _bounded_number(
+        raw.get("plate_stabilization_window_ms"),
+        DEFAULT_PLATE_STABILIZATION_WINDOW_MS,
+        500,
+        10_000,
+        int,
+        "plate_stabilization_window_ms",
+        warnings,
+    )
+    stabilization_min_hold_ms = _bounded_number(
+        raw.get("plate_stabilization_min_hold_ms"),
+        DEFAULT_PLATE_STABILIZATION_MIN_HOLD_MS,
+        500,
+        5_000,
+        int,
+        "plate_stabilization_min_hold_ms",
+        warnings,
+    )
+    if stabilization_min_hold_ms > stabilization_window_ms:
+        warnings.append(
+            "plate_stabilization_min_hold_ms karar penceresini aşamaz; "
+            "karar penceresine sınırlandı."
+        )
+        stabilization_min_hold_ms = stabilization_window_ms
     cooldown = _bounded_number(
         raw.get("duplicate_cooldown_seconds"),
         DEFAULT_DUPLICATE_COOLDOWN_SECONDS,
@@ -431,6 +459,8 @@ def _load_plate_recognition(
         min_confidence=confidence,
         confirmations_required=confirmations,
         confirmation_window_seconds=confirmation_window,
+        plate_stabilization_window_ms=stabilization_window_ms,
+        plate_stabilization_min_hold_ms=stabilization_min_hold_ms,
         duplicate_cooldown_seconds=cooldown,
         record_retention_days=retention_days,
         entry_roi=_parse_roi(roi_settings.get("ENTRY"), "ENTRY", warnings),

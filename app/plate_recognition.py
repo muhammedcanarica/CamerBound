@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -89,6 +89,9 @@ POST_SAVE_NEAR_DUPLICATE_WINDOW_SECONDS = 45 * 60
 RECENT_SAVED_EVIDENCE_LIMIT = 32
 CONFIRMATION_OBSERVATION_LIMIT_PER_CAMERA = 128
 CONFIRMED_PLATE_LIMIT = 256
+PENDING_DECISION_CAMERA_LIMIT = 16
+PENDING_DECISION_OBSERVATION_LIMIT = 32
+PENDING_DECISION_PLATE_LIMIT = 8
 
 
 def _log_plate_detector_diagnostics(
@@ -514,11 +517,56 @@ class _SavedPlateEvidence:
     detector_bbox: tuple[float, float, float, float] | None
 
 
+@dataclass(frozen=True, slots=True)
+class _PlateEvidenceObservation:
+    candidate: PlateCandidate
+    frame_key: int
+    observed_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class _RepresentativeFrame:
+    candidate: PlateCandidate
+    captured_at: datetime
+    full_frame: object
+    quality_score: float
+    detections: tuple[PlateDetection, ...]
+    used_roi_fallback: bool
+
+
+@dataclass(slots=True)
+class PendingPlateDecision:
+    camera_id: int
+    direction: Direction
+    last_updated_monotonic: float
+    cleanup_deadline_monotonic: float
+    observations: deque[_PlateEvidenceObservation] = field(default_factory=deque)
+    frame_keys: set[int] = field(default_factory=set)
+    representatives: dict[str, _RepresentativeFrame] = field(default_factory=dict)
+    provisional_plate: str | None = None
+    deadline_monotonic: float | None = None
+    min_hold_until_monotonic: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PlateDecisionEvaluation:
+    winner: PlateCandidate | None
+    winner_votes: int
+    runner_up_votes: int
+    required_votes: int
+    near_conflicts: tuple[str, ...]
+    reliable: bool
+    early_finalizable: bool
+    suppression_reason: str | None = None
+
+
 class RecognitionState(StrEnum):
     NO_OCR_TEXT = "NO_OCR_TEXT"
     NO_VALID_PLATE = "NO_VALID_PLATE"
     LOW_CONFIDENCE = "LOW_CONFIDENCE"
     AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
+    STABILIZING = "STABILIZING"
+    AMBIGUOUS_DISCARDED = "AMBIGUOUS_DISCARDED"
     SAVED = "SAVED"
     DUPLICATE_SUPPRESSED = "DUPLICATE_SUPPRESSED"
 
@@ -1034,12 +1082,15 @@ class OcrJobBuffer:
         stop_event: threading.Event | None = None,
         *,
         wait: bool = False,
+        wake_at: float | None = None,
     ) -> OcrJob | None:
         with self._condition:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return None
                 now = time.monotonic()
+                if wake_at is not None and now >= wake_at:
+                    return None
                 for camera_id in tuple(self._camera_order):
                     self._discard_stale_locked(self._jobs[camera_id], now)
                 for job_type in (
@@ -1065,7 +1116,10 @@ class OcrJobBuffer:
                             return job
                 if not wait:
                     return None
-                self._condition.wait(0.05)
+                wait_seconds = 0.05
+                if wake_at is not None:
+                    wait_seconds = min(wait_seconds, max(0.0, wake_at - now))
+                self._condition.wait(wait_seconds)
 
     def _discard_stale_locked(
         self,
@@ -1352,6 +1406,8 @@ class PlateRecognitionProcessor:
         self._recent_saved_evidence: dict[int, deque[_SavedPlateEvidence]] = defaultdict(
             lambda: deque(maxlen=RECENT_SAVED_EVIDENCE_LIMIT)
         )
+        self._pending_decisions: dict[int, PendingPlateDecision] = {}
+        self._evidence_sequence = 0
 
     def process(
         self,
@@ -1513,6 +1569,7 @@ class PlateRecognitionProcessor:
         }
         return self._complete_observation(
             camera_id=camera_id,
+            direction=direction,
             segments=segments,
             candidate=candidate,
             observed_at=(
@@ -1526,6 +1583,7 @@ class PlateRecognitionProcessor:
                 if not used_roi_fallback
                 else OcrJobType.DETECTOR_ERROR_FALLBACK
             ),
+            quality_score=0.0,
             **detection_context,
         )
 
@@ -1606,6 +1664,7 @@ class PlateRecognitionProcessor:
             )
         outcome = self._complete_observation(
             camera_id=job.camera_id,
+            direction=job.direction,
             segments=segments,
             candidate=candidate,
             observed_at=job.observed_at,
@@ -1615,6 +1674,7 @@ class PlateRecognitionProcessor:
             used_roi_fallback=job.used_roi_fallback,
             frame_id=job.frame_id,
             job_type=job.job_type,
+            quality_score=job.quality_score,
         )
         self._log_queued_ocr_diagnostics(
             job=job,
@@ -1633,6 +1693,7 @@ class PlateRecognitionProcessor:
         self,
         *,
         camera_id: int,
+        direction: Direction,
         segments: Sequence[OcrSegment],
         candidate: PlateCandidate | None,
         observed_at: float,
@@ -1642,6 +1703,7 @@ class PlateRecognitionProcessor:
         used_roi_fallback: bool,
         frame_id: int | None,
         job_type: OcrJobType,
+        quality_score: float,
     ) -> RecognitionOutcome:
         detection_context = {
             "detections": detections,
@@ -1704,6 +1766,7 @@ class PlateRecognitionProcessor:
         )
         candidate = replace(candidate, spatial_alias_evidence=spatial_alias)
         self.presences.observe(candidate, observed_at)
+        processing_now = time.monotonic()
         progress = self.confirmations.observe_progress(
             candidate,
             observed_at,
@@ -1717,6 +1780,48 @@ class PlateRecognitionProcessor:
             post_save_near_plate,
             spatial_alias,
         )
+        pending_decision: PendingPlateDecision | None = None
+        if self.config.plate_stabilization_window_ms > 0:
+            pending_decision = self._add_stabilization_evidence(
+                candidate=candidate,
+                camera_id=camera_id,
+                direction=direction,
+                observed_at=observed_at,
+                captured_at=detection_time,
+                full_frame=full_frame,
+                quality_score=quality_score,
+                detections=detections,
+                used_roi_fallback=used_roi_fallback,
+                processing_now=processing_now,
+                base_confirmed_plate=(
+                    progress.candidate.plate
+                    if progress.candidate is not None
+                    else None
+                ),
+            )
+        if pending_decision is not None:
+            evaluation = self._evaluate_pending_decision(pending_decision)
+            if (
+                evaluation.early_finalizable
+                and pending_decision.min_hold_until_monotonic is not None
+                and processing_now >= pending_decision.min_hold_until_monotonic
+            ):
+                return self._finalize_pending_decision(camera_id)
+            leader = evaluation.winner or candidate
+            state = (
+                RecognitionState.STABILIZING
+                if pending_decision.provisional_plate is not None
+                else RecognitionState.AWAITING_CONFIRMATION
+            )
+            return self._outcome(
+                camera_id,
+                state,
+                candidate=leader,
+                confirmation_count=evaluation.winner_votes,
+                confirmation_required=evaluation.required_votes,
+                suppression_reason=evaluation.suppression_reason,
+                **detection_context,
+            )
         confirmed = progress.candidate
         if confirmed is None:
             state = (
@@ -1788,6 +1893,387 @@ class PlateRecognitionProcessor:
             confirmation_count=progress.observed_count,
             confirmation_required=progress.required_count,
             **detection_context,
+        )
+
+    @property
+    def pending_decision_count(self) -> int:
+        return len(self._pending_decisions)
+
+    def next_pending_deadline(self) -> float | None:
+        deadlines = [
+            (
+                decision.deadline_monotonic
+                if decision.provisional_plate is not None
+                else decision.cleanup_deadline_monotonic
+            )
+            for decision in self._pending_decisions.values()
+        ]
+        return min((value for value in deadlines if value is not None), default=None)
+
+    def finalize_due(self, now: float | None = None) -> list[tuple[int, RecognitionOutcome]]:
+        current = time.monotonic() if now is None else now
+        outcomes: list[tuple[int, RecognitionOutcome]] = []
+        for camera_id, decision in tuple(self._pending_decisions.items()):
+            if decision.provisional_plate is None:
+                if current >= decision.cleanup_deadline_monotonic:
+                    self._pending_decisions.pop(camera_id, None)
+                continue
+            if (
+                decision.deadline_monotonic is not None
+                and current >= decision.deadline_monotonic
+            ):
+                outcomes.append(
+                    (
+                        camera_id,
+                        self._finalize_pending_decision(camera_id),
+                    )
+                )
+        return outcomes
+
+    def clear_pending_decisions(self) -> None:
+        self._pending_decisions.clear()
+
+    def _add_stabilization_evidence(
+        self,
+        *,
+        candidate: PlateCandidate,
+        camera_id: int,
+        direction: Direction,
+        observed_at: float,
+        captured_at: datetime,
+        full_frame: object,
+        quality_score: float,
+        detections: tuple[PlateDetection, ...],
+        used_roi_fallback: bool,
+        processing_now: float,
+        base_confirmed_plate: str | None,
+    ) -> PendingPlateDecision:
+        decision = self._pending_decisions.get(camera_id)
+        if decision is not None and decision.direction is not direction:
+            LOGGER.debug(
+                "Pending plate decision discarded camera_id=%s reason=direction-changed",
+                camera_id,
+            )
+            self._pending_decisions.pop(camera_id, None)
+            decision = None
+        if decision is None:
+            if len(self._pending_decisions) >= PENDING_DECISION_CAMERA_LIMIT:
+                oldest_camera = min(
+                    self._pending_decisions,
+                    key=lambda key: self._pending_decisions[key].last_updated_monotonic,
+                )
+                self._pending_decisions.pop(oldest_camera, None)
+                LOGGER.debug(
+                    "Pending plate decision evicted camera_id=%s reason=camera-limit",
+                    oldest_camera,
+                )
+            decision = PendingPlateDecision(
+                camera_id=camera_id,
+                direction=direction,
+                last_updated_monotonic=processing_now,
+                cleanup_deadline_monotonic=(
+                    processing_now + self.config.confirmation_window_seconds
+                ),
+            )
+            self._pending_decisions[camera_id] = decision
+
+        frame_key = candidate.frame_id
+        if frame_key is None:
+            self._evidence_sequence -= 1
+            frame_key = self._evidence_sequence
+        if frame_key in decision.frame_keys:
+            return decision
+        if len(decision.observations) >= PENDING_DECISION_OBSERVATION_LIMIT:
+            LOGGER.debug(
+                "Pending plate observation ignored camera_id=%s reason=evidence-limit",
+                camera_id,
+            )
+            return decision
+
+        observation = _PlateEvidenceObservation(
+            candidate=candidate,
+            frame_key=frame_key,
+            observed_at=observed_at,
+        )
+        decision.observations.append(observation)
+        decision.frame_keys.add(frame_key)
+        decision.last_updated_monotonic = processing_now
+        if decision.provisional_plate is None:
+            decision.cleanup_deadline_monotonic = (
+                processing_now + self.config.confirmation_window_seconds
+            )
+
+        representative = _RepresentativeFrame(
+            candidate=candidate,
+            captured_at=captured_at,
+            full_frame=full_frame,
+            quality_score=quality_score,
+            detections=detections,
+            used_roi_fallback=used_roi_fallback,
+        )
+        previous = decision.representatives.get(candidate.plate)
+        if previous is not None:
+            if self._representative_score(representative) > self._representative_score(
+                previous
+            ):
+                decision.representatives[candidate.plate] = representative
+        elif len(decision.representatives) < PENDING_DECISION_PLATE_LIMIT:
+            decision.representatives[candidate.plate] = representative
+        else:
+            weakest_plate = min(
+                decision.representatives,
+                key=lambda plate: self._representative_score(
+                    decision.representatives[plate]
+                ),
+            )
+            if self._representative_score(representative) > self._representative_score(
+                decision.representatives[weakest_plate]
+            ):
+                decision.representatives.pop(weakest_plate, None)
+                decision.representatives[candidate.plate] = representative
+
+        counts: dict[str, int] = defaultdict(int)
+        for item in decision.observations:
+            counts[item.candidate.plate] += 1
+        if (
+            decision.provisional_plate is None
+            and base_confirmed_plate is not None
+            and counts[base_confirmed_plate] > 0
+        ):
+            provisional = base_confirmed_plate
+            window_seconds = self.config.plate_stabilization_window_ms / 1000.0
+            min_hold_seconds = self.config.plate_stabilization_min_hold_ms / 1000.0
+            decision.provisional_plate = provisional
+            decision.deadline_monotonic = processing_now + window_seconds
+            decision.min_hold_until_monotonic = processing_now + min_hold_seconds
+            LOGGER.debug(
+                "Plate provisionally confirmed camera_id=%s candidate=%s "
+                "deadline_ms=%s min_hold_ms=%s observations=%s",
+                camera_id,
+                provisional,
+                self.config.plate_stabilization_window_ms,
+                self.config.plate_stabilization_min_hold_ms,
+                len(decision.observations),
+            )
+        return decision
+
+    def _evaluate_pending_decision(
+        self,
+        decision: PendingPlateDecision,
+    ) -> _PlateDecisionEvaluation:
+        if not decision.observations:
+            return _PlateDecisionEvaluation(None, 0, 0, 1, (), False, False)
+        provisional = decision.provisional_plate
+        counts: dict[str, int] = defaultdict(int)
+        groups: dict[str, list[_PlateEvidenceObservation]] = defaultdict(list)
+        for item in decision.observations:
+            counts[item.candidate.plate] += 1
+            groups[item.candidate.plate].append(item)
+        anchor = provisional or max(counts, key=lambda plate: (counts[plate], plate))
+        cluster = {
+            plate: items
+            for plate, items in groups.items()
+            if plate == anchor or plates_are_near_conflicts(anchor, plate)
+        }
+        winner_plate = max(
+            cluster,
+            key=lambda plate: (
+                len(cluster[plate]),
+                sum(item.candidate.correction_cost == 0 for item in cluster[plate]),
+                sum(item.candidate.variant_support for item in cluster[plate]),
+                sum(item.candidate.confidence for item in cluster[plate])
+                / len(cluster[plate]),
+                plate,
+            ),
+        )
+        winner_items = cluster[winner_plate]
+        winner_votes = len(winner_items)
+        competing = {
+            plate: items for plate, items in cluster.items() if plate != winner_plate
+        }
+        runner_up_votes = max((len(items) for items in competing.values()), default=0)
+        correction_risk = any(item.candidate.correction_cost > 0 for item in winner_items)
+        required_votes = self.config.confirmations_required
+        if correction_risk or competing:
+            required_votes = max(required_votes, RISKY_CONFIRMATIONS_REQUIRED)
+
+        representative = decision.representatives.get(winner_plate)
+        winner = representative.candidate if representative is not None else winner_items[-1].candidate
+        post_save_near_plate = None
+        if representative is not None:
+            post_save_near_plate = self._post_save_near_plate(
+                winner,
+                representative.captured_at,
+            )
+        detector_votes = sum(
+            item.candidate.detector_crop_evidence for item in winner_items
+        )
+        spatial_alias_votes = sum(
+            item.candidate.spatial_alias_evidence for item in winner_items
+        )
+        post_save_safe = True
+        suppression_reason: str | None = None
+        if post_save_near_plate is not None:
+            required_votes = max(required_votes, POST_SAVE_CONFIRMATIONS_REQUIRED)
+            post_save_safe = detector_votes >= POST_SAVE_CONFIRMATIONS_REQUIRED
+            if spatial_alias_votes >= RISKY_CONFIRMATIONS_REQUIRED:
+                post_save_safe = False
+                suppression_reason = "near-duplicate-ambiguity"
+
+        margin_ok = not competing or winner_votes - runner_up_votes >= 2
+        trailing_reversal = False
+        if provisional is not None and winner_plate != provisional:
+            relevant_order = [
+                item.candidate.plate
+                for item in sorted(
+                    (item for items in cluster.values() for item in items),
+                    key=lambda item: (item.observed_at, item.frame_key),
+                )
+            ]
+            trailing_reversal = (
+                len(relevant_order) >= RISKY_CONFIRMATIONS_REQUIRED
+                and all(
+                    plate == winner_plate
+                    for plate in relevant_order[-RISKY_CONFIRMATIONS_REQUIRED:]
+                )
+            )
+        reliable = (
+            winner_votes >= required_votes
+            and post_save_safe
+            and (margin_ok or trailing_reversal)
+        )
+        early_finalizable = (
+            reliable
+            and not competing
+            and not correction_risk
+            and post_save_near_plate is None
+            and detector_votes >= RISKY_CONFIRMATIONS_REQUIRED
+            and winner_votes >= RISKY_CONFIRMATIONS_REQUIRED
+        )
+        near_conflicts = tuple(sorted(competing))
+        if not reliable and suppression_reason is None and competing:
+            suppression_reason = "near-duplicate-ambiguity"
+        confidence = sum(item.candidate.confidence for item in winner_items) / winner_votes
+        winner = replace(winner, confidence=confidence)
+        return _PlateDecisionEvaluation(
+            winner=winner,
+            winner_votes=winner_votes,
+            runner_up_votes=runner_up_votes,
+            required_votes=required_votes,
+            near_conflicts=near_conflicts,
+            reliable=reliable,
+            early_finalizable=early_finalizable,
+            suppression_reason=suppression_reason,
+        )
+
+    def _finalize_pending_decision(
+        self,
+        camera_id: int,
+    ) -> RecognitionOutcome:
+        decision = self._pending_decisions.get(camera_id)
+        if decision is None:
+            return self._outcome(camera_id, RecognitionState.AMBIGUOUS_DISCARDED)
+        evaluation = self._evaluate_pending_decision(decision)
+        self._pending_decisions.pop(camera_id, None)
+        winner = evaluation.winner
+        if winner is None or not evaluation.reliable:
+            LOGGER.debug(
+                "Pending plate decision discarded camera_id=%s winner=%s votes=%s/%s "
+                "runner_up_votes=%s near_conflicts=%s suppression_reason=%s",
+                camera_id,
+                winner.plate if winner is not None else "none",
+                evaluation.winner_votes,
+                evaluation.required_votes,
+                evaluation.runner_up_votes,
+                ",".join(evaluation.near_conflicts) or "none",
+                evaluation.suppression_reason or "insufficient-evidence",
+            )
+            return self._outcome(
+                camera_id,
+                RecognitionState.AMBIGUOUS_DISCARDED,
+                candidate=winner,
+                confirmation_count=evaluation.winner_votes,
+                confirmation_required=evaluation.required_votes,
+                suppression_reason=(
+                    evaluation.suppression_reason or "insufficient-evidence"
+                ),
+            )
+
+        representative = decision.representatives.get(winner.plate)
+        if representative is None:
+            LOGGER.warning(
+                "Pending plate decision discarded camera_id=%s winner=%s "
+                "reason=representative-frame-evicted",
+                camera_id,
+                winner.plate,
+            )
+            return self._outcome(
+                camera_id,
+                RecognitionState.AMBIGUOUS_DISCARDED,
+                candidate=winner,
+                confirmation_count=evaluation.winner_votes,
+                confirmation_required=evaluation.required_votes,
+                suppression_reason="representative-frame-missing",
+            )
+        if not self.presences.claim_record(winner):
+            return self._outcome(
+                camera_id,
+                RecognitionState.DUPLICATE_SUPPRESSED,
+                candidate=winner,
+                confirmation_count=evaluation.winner_votes,
+                confirmation_required=evaluation.required_votes,
+                duplicate=True,
+                suppression_reason="active-presence",
+                detections=representative.detections,
+                used_roi_fallback=representative.used_roi_fallback,
+            )
+        try:
+            record = self.plate_service.save_plate_detection(
+                winner.plate,
+                camera_id,
+                winner.confidence,
+                representative.captured_at,
+                representative.full_frame,
+            )
+        except DuplicatePlateDetection as exc:
+            return self._outcome(
+                camera_id,
+                RecognitionState.DUPLICATE_SUPPRESSED,
+                candidate=winner,
+                confirmation_count=evaluation.winner_votes,
+                confirmation_required=evaluation.required_votes,
+                duplicate=True,
+                suppression_reason=exc.reason.value,
+                detections=representative.detections,
+                used_roi_fallback=representative.used_roi_fallback,
+            )
+        except Exception:
+            self.presences.release_record_claim(winner)
+            raise
+        self._remember_saved_evidence(winner, representative.captured_at)
+        LOGGER.info("Stabilized plate decision saved for camera_id=%s", camera_id)
+        return self._outcome(
+            camera_id,
+            RecognitionState.SAVED,
+            candidate=winner,
+            record=record,
+            confirmation_count=evaluation.winner_votes,
+            confirmation_required=evaluation.required_votes,
+            detections=representative.detections,
+            used_roi_fallback=representative.used_roi_fallback,
+        )
+
+    @staticmethod
+    def _representative_score(
+        representative: _RepresentativeFrame,
+    ) -> tuple[int, float, int, int, float]:
+        candidate = representative.candidate
+        return (
+            int(candidate.detector_crop_evidence),
+            representative.quality_score,
+            candidate.variant_support,
+            -candidate.correction_cost,
+            candidate.confidence,
         )
 
     def _post_save_near_plate(
@@ -2148,6 +2634,7 @@ class PlateOcrWorker:
         self.initialization_error: Exception | None = None
 
     def run(self) -> None:
+        processor: PlateRecognitionProcessor | None = None
         try:
             try:
                 provider = self.provider_factory()
@@ -2172,10 +2659,30 @@ class PlateOcrWorker:
             finally:
                 self.initialized.set()
 
+            def emit_due_outcomes() -> bool:
+                try:
+                    due_outcomes = processor.finalize_due()
+                except Exception as exc:
+                    LOGGER.exception("Pending OCR decision finalization failed")
+                    self.on_status(
+                        RecognitionStatus.ERROR,
+                        f"OCR karar kaydı hatası: {exc}",
+                    )
+                    return False
+                for camera_id, due_outcome in due_outcomes:
+                    self.on_outcome(camera_id, due_outcome)
+                return True
+
             recovering_from_error = False
             while not self.stop_event.is_set():
+                if not emit_due_outcomes():
+                    recovering_from_error = True
                 stale_before = self.job_buffer.stale_count
-                job = self.job_buffer.take(self.stop_event, wait=True)
+                job = self.job_buffer.take(
+                    self.stop_event,
+                    wait=True,
+                    wake_at=processor.next_pending_deadline(),
+                )
                 stale_discarded = self.job_buffer.stale_count - stale_before
                 if stale_discarded and LOGGER.isEnabledFor(logging.DEBUG):
                     LOGGER.debug(
@@ -2184,7 +2691,9 @@ class PlateOcrWorker:
                         self.job_buffer.stale_count,
                     )
                 if job is None:
-                    return
+                    if self.stop_event.is_set():
+                        return
+                    continue
                 try:
                     outcome = processor.process_ocr_job(
                         job,
@@ -2204,7 +2713,11 @@ class PlateOcrWorker:
                     self.on_status(RecognitionStatus.ACTIVE, "OCR yeniden aktif.")
                     recovering_from_error = False
                 self.on_outcome(job.camera_id, outcome)
+                if not emit_due_outcomes():
+                    recovering_from_error = True
         finally:
+            if processor is not None:
+                processor.clear_pending_decisions()
             self.initialized.set()
 
 

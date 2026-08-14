@@ -144,7 +144,13 @@ class FakePlateDetector:
         return list(self.detections)
 
 
-def recognition_config(model_root: Path, confirmations: int = 2) -> PlateRecognitionConfig:
+def recognition_config(
+    model_root: Path,
+    confirmations: int = 2,
+    *,
+    stabilization_window_ms: int = 0,
+    stabilization_min_hold_ms: int = 0,
+) -> PlateRecognitionConfig:
     return PlateRecognitionConfig(
         recognition_interval_ms=250,
         min_confidence=0.65,
@@ -154,6 +160,8 @@ def recognition_config(model_root: Path, confirmations: int = 2) -> PlateRecogni
         entry_roi=DEFAULT_ROI,
         exit_roi=DEFAULT_ROI,
         model_root=model_root,
+        plate_stabilization_window_ms=stabilization_window_ms,
+        plate_stabilization_min_hold_ms=stabilization_min_hold_ms,
     )
 
 
@@ -2589,6 +2597,444 @@ class RecognitionPipelineTests(unittest.TestCase):
                 connection.execute("SELECT plate FROM plate_records").fetchone()[0],
                 "23ABC123",
             )
+
+    def test_stabilization_waits_before_saving_clean_two_frame_consensus(self) -> None:
+        config = recognition_config(
+            Path(self.temp_directory.name),
+            stabilization_window_ms=2000,
+            stabilization_min_hold_ms=500,
+        )
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("23ABC122", 0.96, (0, 0, 10, 10), 0)],
+                    [OcrSegment("23ABC122", 0.97, (0, 0, 10, 10), 0)],
+                ]
+            ),
+            self.plate_service,
+            config,
+        )
+
+        first = processor.process_ocr_job(
+            self._make_ocr_job(frame_id=101, observed_at=10.0, frame_value=21),
+            queue_depth=0,
+        )
+        provisional = processor.process_ocr_job(
+            self._make_ocr_job(
+                frame_id=102,
+                observed_at=10.2,
+                frame_value=42,
+                quality_score=2.0,
+            ),
+            queue_depth=0,
+        )
+
+        self.assertIs(first.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertIs(provisional.state, RecognitionState.STABILIZING)
+        self.assertEqual(self._record_count(), 0)
+        self.assertEqual(list(Path(self.temp_directory.name).rglob("*.jpg")), [])
+
+        outcomes = processor.finalize_due(processor.next_pending_deadline() + 0.01)
+
+        self.assertEqual(len(outcomes), 1)
+        saved = outcomes[0][1]
+        self.assertIs(saved.state, RecognitionState.SAVED)
+        self.assertEqual(saved.record.plate, "23ABC122")
+        self.assertEqual(self._record_count(), 1)
+        saved_image = cv2.imread(
+            str(self.capture_service.resolve_reference(saved.record.image_path))
+        )
+        self.assertAlmostEqual(float(saved_image.mean()), 42.0, delta=3.0)
+
+    def test_stabilization_replaces_early_wrong_consensus_with_trailing_correct_evidence(self) -> None:
+        texts = (
+            "23ABC127",
+            "23ABC127",
+            "23ABC122",
+            "23ABC122",
+            "23ABC122",
+        )
+        config = recognition_config(
+            Path(self.temp_directory.name),
+            stabilization_window_ms=2000,
+            stabilization_min_hold_ms=500,
+        )
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [[OcrSegment(text, 0.97, (0, 0, 10, 10), 0)] for text in texts]
+            ),
+            self.plate_service,
+            config,
+        )
+        base = datetime(2026, 8, 13, 13, 0, tzinfo=timezone.utc)
+
+        outcomes = [
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    frame_id=index,
+                    observed_at=20.0 + index * 0.2,
+                    captured_at=base + timedelta(milliseconds=index * 200),
+                    frame_value=index * 10,
+                    quality_score=float(index),
+                ),
+                queue_depth=0,
+            )
+            for index in range(1, 6)
+        ]
+
+        self.assertTrue(all(outcome.record is None for outcome in outcomes))
+        self.assertEqual(self._record_count(), 0)
+        self.assertEqual(list(Path(self.temp_directory.name).rglob("*.jpg")), [])
+
+        saved = processor.finalize_due(processor.next_pending_deadline() + 0.01)[0][1]
+
+        self.assertIs(saved.state, RecognitionState.SAVED)
+        self.assertEqual(saved.record.plate, "23ABC122")
+        with self.database.connection() as connection:
+            plates = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT plate FROM plate_records ORDER BY id"
+                ).fetchall()
+            ]
+        self.assertEqual(plates, ["23ABC122"])
+        saved_image = cv2.imread(
+            str(self.capture_service.resolve_reference(saved.record.image_path))
+        )
+        self.assertAlmostEqual(float(saved_image.mean()), 50.0, delta=3.0)
+
+    def test_clean_three_detector_frames_can_finalize_after_minimum_hold(self) -> None:
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("23ABC122", 0.97, (0, 0, 10, 10), 0)]
+                    for _ in range(3)
+                ]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2000,
+                stabilization_min_hold_ms=500,
+            ),
+        )
+
+        processor.process_ocr_job(
+            self._make_ocr_job(frame_id=701, observed_at=25.0), queue_depth=0
+        )
+        provisional = processor.process_ocr_job(
+            self._make_ocr_job(frame_id=702, observed_at=25.2), queue_depth=0
+        )
+        time.sleep(0.52)
+        finalized = processor.process_ocr_job(
+            self._make_ocr_job(frame_id=703, observed_at=25.4), queue_depth=0
+        )
+
+        self.assertIs(provisional.state, RecognitionState.STABILIZING)
+        self.assertIs(finalized.state, RecognitionState.SAVED)
+        self.assertEqual(finalized.record.plate, "23ABC122")
+        self.assertEqual(processor.pending_decision_count, 0)
+
+    def test_stabilization_applies_conflict_margin_rules(self) -> None:
+        cases = (
+            (
+                "two_vs_two",
+                ("23ABC122", "23ABC122", "23ABC127", "23ABC127"),
+                False,
+            ),
+            (
+                "three_vs_one",
+                ("23ABC122", "23ABC122", "23ABC127", "23ABC122"),
+                True,
+            ),
+            (
+                "interleaved_three_vs_two",
+                (
+                    "23ABC122",
+                    "23ABC122",
+                    "23ABC127",
+                    "23ABC122",
+                    "23ABC127",
+                ),
+                False,
+            ),
+        )
+        for name, texts, should_save in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_directory:
+                root = Path(temp_directory)
+                database = Database(root / "recognition.db")
+                database.initialize()
+                auth_service = AuthService(database)
+                auth_service.ensure_default_admin()
+                camera_service = CameraService(database)
+                capture_service = PlateCaptureService(root / "captures", root)
+                plate_service = PlateService(
+                    database,
+                    duplicate_cooldown_seconds=10,
+                    capture_service=capture_service,
+                )
+                config = recognition_config(
+                    root,
+                    stabilization_window_ms=2000,
+                    stabilization_min_hold_ms=500,
+                )
+                processor = PlateRecognitionProcessor(
+                    SequencedOcrProvider(
+                        [
+                            [OcrSegment(text, 0.97, (0, 0, 10, 10), 0)]
+                            for text in texts
+                        ]
+                    ),
+                    plate_service,
+                    config,
+                )
+                try:
+                    for index in range(len(texts)):
+                        processor.process_ocr_job(
+                            self._make_ocr_job(
+                                frame_id=1000 + index,
+                                observed_at=30.0 + index * 0.2,
+                            ),
+                            queue_depth=0,
+                        )
+                    finalized = processor.finalize_due(
+                        processor.next_pending_deadline() + 0.01
+                    )[0][1]
+                    with database.connection() as connection:
+                        record_count = connection.execute(
+                            "SELECT COUNT(*) FROM plate_records"
+                        ).fetchone()[0]
+                    self.assertEqual(record_count, int(should_save))
+                    self.assertIs(
+                        finalized.state,
+                        RecognitionState.SAVED
+                        if should_save
+                        else RecognitionState.AMBIGUOUS_DISCARDED,
+                    )
+                finally:
+                    camera_service.stop_all()
+
+    def test_stabilization_requires_three_votes_for_corrected_candidate(self) -> None:
+        for votes, should_save in ((2, False), (3, True)):
+            with self.subTest(votes=votes), tempfile.TemporaryDirectory() as temp_directory:
+                root = Path(temp_directory)
+                database = Database(root / "recognition.db")
+                database.initialize()
+                auth_service = AuthService(database)
+                auth_service.ensure_default_admin()
+                capture_service = PlateCaptureService(root / "captures", root)
+                plate_service = PlateService(
+                    database,
+                    duplicate_cooldown_seconds=10,
+                    capture_service=capture_service,
+                )
+                processor = PlateRecognitionProcessor(
+                    SequencedOcrProvider(
+                        [
+                            [OcrSegment("23ABCI22", 0.97, (0, 0, 10, 10), 0)]
+                            for _ in range(votes)
+                        ]
+                    ),
+                    plate_service,
+                    recognition_config(
+                        root,
+                        stabilization_window_ms=2000,
+                        stabilization_min_hold_ms=500,
+                    ),
+                )
+                for index in range(votes):
+                    processor.process_ocr_job(
+                        self._make_ocr_job(
+                            frame_id=2000 + index,
+                            observed_at=40.0 + index * 0.2,
+                        ),
+                        queue_depth=0,
+                    )
+                finalized_outcomes = processor.finalize_due(
+                    processor.next_pending_deadline() + 0.01
+                )
+                with database.connection() as connection:
+                    records = [
+                        tuple(row)
+                        for row in connection.execute(
+                            "SELECT plate FROM plate_records"
+                        ).fetchall()
+                    ]
+                self.assertEqual(records, [("23ABC122",)] if should_save else [])
+                if should_save:
+                    self.assertEqual(len(finalized_outcomes), 1)
+                    self.assertIs(
+                        finalized_outcomes[0][1].state,
+                        RecognitionState.SAVED,
+                    )
+                else:
+                    self.assertEqual(finalized_outcomes, [])
+
+    def test_stabilization_counts_each_frame_only_once(self) -> None:
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("23ABC122", 0.97, (0, 0, 10, 10), 0)],
+                    [OcrSegment("23ABC122", 0.97, (0, 0, 10, 10), 0)],
+                ]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2000,
+                stabilization_min_hold_ms=500,
+            ),
+        )
+
+        first = processor.process_ocr_job(
+            self._make_ocr_job(frame_id=3001, observed_at=50.0), queue_depth=0
+        )
+        duplicate = processor.process_ocr_job(
+            self._make_ocr_job(frame_id=3001, observed_at=50.2), queue_depth=0
+        )
+
+        self.assertEqual(first.confirmation_count, 1)
+        self.assertIs(duplicate.state, RecognitionState.DUPLICATE_SUPPRESSED)
+        processor.finalize_due(processor.next_pending_deadline() + 0.01)
+        self.assertEqual(processor.pending_decision_count, 0)
+        self.assertEqual(self._record_count(), 0)
+
+    def test_pending_stabilization_state_is_bounded_and_expires(self) -> None:
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("23ABC122", 0.97, (0, 0, 10, 10), 0)]
+                    for _ in range(17)
+                ]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2000,
+                stabilization_min_hold_ms=500,
+            ),
+        )
+
+        for camera_id in range(1, 18):
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    camera_id=camera_id,
+                    frame_id=4000 + camera_id,
+                    observed_at=60.0 + camera_id * 0.01,
+                ),
+                queue_depth=0,
+            )
+
+        self.assertEqual(processor.pending_decision_count, 16)
+        processor.finalize_due(time.monotonic() + 10.0)
+        self.assertEqual(processor.pending_decision_count, 0)
+
+    def test_ocr_worker_shutdown_clears_pending_decision_without_deadlock(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2500)
+        stop_event = threading.Event()
+        outcomes = []
+        provisional_ready = threading.Event()
+
+        def on_outcome(_camera_id: int, outcome: object) -> None:
+            outcomes.append(outcome)
+            if outcome.state is RecognitionState.STABILIZING:
+                provisional_ready.set()
+
+        worker = PlateOcrWorker(
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2000,
+                stabilization_min_hold_ms=500,
+            ),
+            provider_factory=lambda: SequencedOcrProvider(
+                [
+                    [OcrSegment("23ABC122", 0.97, (0, 0, 10, 10), 0)],
+                    [OcrSegment("23ABC122", 0.97, (0, 0, 10, 10), 0)],
+                ]
+            ),
+            job_buffer=buffer,
+            stop_event=stop_event,
+            on_outcome=on_outcome,
+            on_status=lambda _status, _message: None,
+        )
+        buffer.add(self._make_ocr_job(frame_id=5001, observed_at=time.monotonic()))
+        buffer.add(
+            self._make_ocr_job(
+                frame_id=5002,
+                observed_at=time.monotonic() + 0.1,
+            )
+        )
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        try:
+            self.assertTrue(provisional_ready.wait(1.0))
+        finally:
+            stop_event.set()
+            buffer.wake_all()
+            thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self._record_count(), 0)
+        self.assertEqual(list(Path(self.temp_directory.name).rglob("*.jpg")), [])
+
+    def test_ocr_worker_finalizes_after_vehicle_leaves_stabilization_window(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2500)
+        stop_event = threading.Event()
+        outcomes = []
+        saved_ready = threading.Event()
+
+        def on_outcome(_camera_id: int, outcome: object) -> None:
+            outcomes.append(outcome)
+            if outcome.state is RecognitionState.SAVED:
+                saved_ready.set()
+
+        worker = PlateOcrWorker(
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=500,
+                stabilization_min_hold_ms=500,
+            ),
+            provider_factory=lambda: SequencedOcrProvider(
+                [
+                    [OcrSegment("23ABC122", 0.97, (0, 0, 10, 10), 0)],
+                    [OcrSegment("23ABC122", 0.97, (0, 0, 10, 10), 0)],
+                ]
+            ),
+            job_buffer=buffer,
+            stop_event=stop_event,
+            on_outcome=on_outcome,
+            on_status=lambda _status, _message: None,
+        )
+        buffer.add(self._make_ocr_job(frame_id=6001, observed_at=time.monotonic()))
+        buffer.add(
+            self._make_ocr_job(
+                frame_id=6002,
+                observed_at=time.monotonic() + 0.1,
+                frame_value=72,
+                quality_score=2.0,
+            )
+        )
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        try:
+            self.assertTrue(saved_ready.wait(1.5))
+        finally:
+            stop_event.set()
+            buffer.wake_all()
+            thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self._record_count(), 1)
+        self.assertEqual(
+            [outcome.state for outcome in outcomes],
+            [
+                RecognitionState.AWAITING_CONFIRMATION,
+                RecognitionState.STABILIZING,
+                RecognitionState.SAVED,
+            ],
+        )
 
     def test_corrected_candidate_saves_only_after_three_distinct_frames(self) -> None:
         batches = [
