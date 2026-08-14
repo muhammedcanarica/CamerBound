@@ -47,7 +47,11 @@ from app.plate_recognition import (
 from app.plate_service import PlateService
 from main import ApplicationController
 from ui.admin_widget import CameraCredentialsDialog
-from ui.dashboard_window import AUTO_REFRESH_INTERVAL_MS
+from ui.dashboard_window import (
+    AUTO_REFRESH_INTERVAL_MS,
+    CONFIRMATION_STATUS_HOLD_MS,
+    SAVED_STATUS_HOLD_MS,
+)
 from ui.styles import APP_STYLESHEET
 
 
@@ -426,6 +430,118 @@ class LoginFlowSmokeTest(unittest.TestCase):
 
         dashboard.logout_requested.emit()
         self.assertFalse(dashboard._auto_refresh_timer.isActive())
+        self.assertFalse(
+            dashboard.dashboard_home._ocr_status_expiry_timer.isActive()
+        )
+
+    def test_confirmation_and_saved_statuses_hold_then_expire_to_idle(self) -> None:
+        admin = self.controller.auth_service.authenticate("admin", "admin123")
+        self.controller.show_dashboard(admin)
+        home = self.controller.dashboard_window.dashboard_home
+        camera = self.controller.camera_service.list_cameras()[0]
+        home.camera_directions[camera.id] = camera.direction
+        card = home.camera_cards[camera.direction]
+        candidate = PlateCandidate("23ABC123", 0.97, "23 ABC 123", camera.id)
+        awaiting = RecognitionOutcome(
+            candidate,
+            None,
+            RecognitionState.AWAITING_CONFIRMATION,
+            confirmation_count=1,
+            confirmation_required=2,
+        )
+        no_text = RecognitionOutcome(None, None, RecognitionState.NO_OCR_TEXT)
+
+        self.assertEqual(CONFIRMATION_STATUS_HOLD_MS, 3_000)
+        self.assertEqual(SAVED_STATUS_HOLD_MS, 3_000)
+        with patch("ui.dashboard_window.time.monotonic", return_value=10.0):
+            home._show_recognition_outcome(camera.id, awaiting)
+        self.assertIn("OCR: 23 ABC 123", card.ocr_status.text())
+        self.assertIn("Durum: Doğrulanıyor (1/2)", card.ocr_status.text())
+
+        with patch("ui.dashboard_window.time.monotonic", return_value=10.1):
+            home._show_recognition_outcome(camera.id, no_text)
+        self.assertIn("Durum: Doğrulanıyor (1/2)", card.ocr_status.text())
+
+        with patch("ui.dashboard_window.time.monotonic", return_value=13.01):
+            home._expire_ocr_statuses()
+        self.assertEqual(card.ocr_status.text(), "OCR: Aktif\nDurum: Plaka aranıyor")
+
+        saved = RecognitionOutcome(
+            candidate,
+            None,
+            RecognitionState.SAVED,
+            confirmation_count=2,
+            confirmation_required=2,
+        )
+        with patch("ui.dashboard_window.time.monotonic", return_value=20.0):
+            home._show_recognition_outcome(camera.id, awaiting)
+        with patch("ui.dashboard_window.time.monotonic", return_value=20.2):
+            home._show_recognition_outcome(camera.id, saved)
+        self.assertIn("Durum: Kaydedildi", card.ocr_status.text())
+
+        with patch("ui.dashboard_window.time.monotonic", return_value=20.3):
+            home._show_recognition_outcome(camera.id, no_text)
+        with patch("ui.dashboard_window.time.monotonic", return_value=23.19):
+            home._expire_ocr_statuses()
+        self.assertIn("Durum: Kaydedildi", card.ocr_status.text())
+
+        saved_record = self.controller.plate_service.save_plate_detection(
+            "23ABC123",
+            camera.id,
+            0.97,
+        )
+        home._record_saved(saved_record)
+        self.assertIn("Durum: Kaydedildi", card.ocr_status.text())
+
+        with patch("ui.dashboard_window.time.monotonic", return_value=23.21):
+            home._expire_ocr_statuses()
+        self.assertEqual(card.ocr_status.text(), "OCR: Aktif\nDurum: Plaka aranıyor")
+
+    def test_detector_state_updates_without_erasing_confirmation_or_touching_camera(self) -> None:
+        admin = self.controller.auth_service.authenticate("admin", "admin123")
+        self.controller.show_dashboard(admin)
+        home = self.controller.dashboard_window.dashboard_home
+        camera = self.controller.camera_service.list_cameras()[0]
+        home.camera_directions[camera.id] = camera.direction
+        card = home.camera_cards[camera.direction]
+        candidate = PlateCandidate("23ABC123", 0.97, "23 ABC 123", camera.id)
+        awaiting = RecognitionOutcome(
+            candidate,
+            None,
+            RecognitionState.AWAITING_CONFIRMATION,
+            confirmation_count=1,
+            confirmation_required=2,
+        )
+        detection = PlateDetection(0.9, x=10, y=10, width=40, height=20)
+
+        with patch("ui.dashboard_window.time.monotonic", return_value=30.0):
+            home._show_recognition_outcome(camera.id, awaiting)
+        confirmation_text = card.ocr_status.text()
+
+        with patch.object(
+            self.controller.camera_service, "start_camera"
+        ) as start_camera, patch.object(
+            self.controller.camera_service, "stop_camera"
+        ) as stop_camera, patch.object(
+            self.controller.camera_service, "stop_all"
+        ) as stop_all:
+            with patch("ui.dashboard_window.time.monotonic", return_value=30.1):
+                home._show_plate_detections(camera.id, ())
+            self.assertFalse(
+                home._detector_display_states[camera.direction].plate_found
+            )
+            self.assertEqual(card.ocr_status.text(), confirmation_text)
+
+            with patch("ui.dashboard_window.time.monotonic", return_value=30.2):
+                home._show_plate_detections(camera.id, (detection,))
+            self.assertTrue(
+                home._detector_display_states[camera.direction].plate_found
+            )
+            self.assertEqual(card.ocr_status.text(), confirmation_text)
+
+        start_camera.assert_not_called()
+        stop_camera.assert_not_called()
+        stop_all.assert_not_called()
 
     def test_auto_refresh_is_data_only_and_record_saved_refresh_remains_immediate(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")
@@ -728,6 +844,23 @@ class LoginFlowSmokeTest(unittest.TestCase):
 
         dashboard = self.controller.dashboard_window
         self.assertEqual(dashboard.stack.count(), 3)
+        camera = self.controller.camera_service.list_cameras()[0]
+        dashboard.dashboard_home.camera_directions[camera.id] = camera.direction
+        dashboard.dashboard_home._show_recognition_outcome(
+            camera.id,
+            RecognitionOutcome(
+                PlateCandidate("34USER01", 0.97, "34 USER 01", camera.id),
+                None,
+                RecognitionState.AWAITING_CONFIRMATION,
+                confirmation_count=1,
+                confirmation_required=2,
+            ),
+        )
+        user_ocr_text = dashboard.dashboard_home.camera_cards[
+            camera.direction
+        ].ocr_status.text()
+        self.assertNotIn("%", user_ocr_text)
+        self.assertNotIn("Detector:", user_ocr_text)
         self.assertFalse(
             any(
                 button.objectName().startswith("cameraCredentialButton-")

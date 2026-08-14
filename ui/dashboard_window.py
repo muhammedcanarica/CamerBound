@@ -43,6 +43,9 @@ from ui.records_widget import (
 
 
 AUTO_REFRESH_INTERVAL_MS = 5_000
+CONFIRMATION_STATUS_HOLD_MS = 3_000
+SAVED_STATUS_HOLD_MS = 3_000
+OCR_STATUS_EXPIRY_CHECK_INTERVAL_MS = 250
 
 
 @dataclass(slots=True)
@@ -52,6 +55,21 @@ class CameraCardWidgets:
     details: QLabel
     last_plate: QLabel
     ocr_status: QLabel
+
+
+@dataclass(slots=True)
+class OcrDisplayState:
+    candidate: PlateCandidate
+    state: RecognitionState
+    confirmation_count: int
+    confirmation_required: int
+    updated_at: float
+
+
+@dataclass(slots=True)
+class DetectorDisplayState:
+    plate_found: bool
+    updated_at: float
 
 
 class DashboardHome(QWidget):
@@ -72,7 +90,15 @@ class DashboardHome(QWidget):
         self._latest_images: dict[Direction, QImage] = {}
         self._plate_detections: dict[Direction, tuple[PlateDetection, ...]] = {}
         self._plate_detection_updated_at: dict[Direction, float] = {}
+        self._ocr_display_states: dict[Direction, OcrDisplayState] = {}
+        self._detector_display_states: dict[Direction, DetectorDisplayState] = {}
         self._build_ui()
+        self._ocr_status_expiry_timer = QTimer(self)
+        self._ocr_status_expiry_timer.setInterval(
+            OCR_STATUS_EXPIRY_CHECK_INTERVAL_MS
+        )
+        self._ocr_status_expiry_timer.timeout.connect(self._expire_ocr_statuses)
+        self._ocr_status_expiry_timer.start()
         self.camera_service.frame_ready.connect(self._show_frame)
         self.camera_service.status_changed.connect(self._show_status)
         if self.recognition_service is not None:
@@ -267,6 +293,8 @@ class DashboardHome(QWidget):
     @Slot(object, str)
     def _show_ocr_status(self, status: RecognitionStatus, message: str) -> None:
         status = RecognitionStatus(status)
+        if status is not RecognitionStatus.ACTIVE:
+            self._ocr_display_states.clear()
         prefixes = {
             RecognitionStatus.STOPPED: "OCR: Kapalı",
             RecognitionStatus.INITIALIZING: "OCR: Başlatılıyor",
@@ -304,8 +332,23 @@ class DashboardHome(QWidget):
         card = self.camera_cards[direction]
         candidate = outcome.candidate
         if candidate is None:
-            card.ocr_status.setText("OCR: Aktif\nDurum: Plaka aranıyor")
+            current_state = self._ocr_display_states.get(direction)
+            if current_state is not None and self._is_ocr_state_held(
+                current_state,
+                time.monotonic(),
+            ):
+                return
+            self._set_ocr_idle(direction)
             return
+
+        display_state = OcrDisplayState(
+            candidate=candidate,
+            state=outcome.state,
+            confirmation_count=outcome.confirmation_count,
+            confirmation_required=outcome.confirmation_required,
+            updated_at=time.monotonic(),
+        )
+        self._ocr_display_states[direction] = display_state
 
         state_texts = {
             RecognitionState.LOW_CONFIDENCE: "Okuma yeterli değil, kaydedilmedi",
@@ -323,6 +366,45 @@ class DashboardHome(QWidget):
             f"OCR: {display_plate(candidate.plate)}\n"
             f"Durum: {state_text}"
         )
+
+    @Slot()
+    def _expire_ocr_statuses(self) -> None:
+        now = time.monotonic()
+        for direction, display_state in tuple(self._ocr_display_states.items()):
+            hold_ms = self._ocr_state_hold_ms(display_state.state)
+            if hold_ms is None:
+                continue
+            if (now - display_state.updated_at) * 1000.0 >= hold_ms:
+                self._set_ocr_idle(direction)
+
+    def _set_ocr_idle(self, direction: Direction) -> None:
+        self._ocr_display_states.pop(direction, None)
+        self.camera_cards[direction].ocr_status.setText(
+            "OCR: Aktif\nDurum: Plaka aranıyor"
+        )
+
+    @staticmethod
+    def _ocr_state_hold_ms(state: RecognitionState) -> int | None:
+        if state is RecognitionState.AWAITING_CONFIRMATION:
+            return CONFIRMATION_STATUS_HOLD_MS
+        if state is RecognitionState.SAVED:
+            return SAVED_STATUS_HOLD_MS
+        return None
+
+    @classmethod
+    def _is_ocr_state_held(
+        cls,
+        display_state: OcrDisplayState,
+        now: float,
+    ) -> bool:
+        hold_ms = cls._ocr_state_hold_ms(display_state.state)
+        return (
+            hold_ms is not None
+            and (now - display_state.updated_at) * 1000.0 < hold_ms
+        )
+
+    def stop_status_expiry_timer(self) -> None:
+        self._ocr_status_expiry_timer.stop()
 
     @Slot(object)
     def _record_saved(self, record: PlateRecord) -> None:
@@ -412,10 +494,15 @@ class DashboardHome(QWidget):
         direction = self.camera_directions.get(camera_id)
         if direction is None:
             return
+        updated_at = time.monotonic()
         self._plate_detections[direction] = tuple(
             item for item in detections if isinstance(item, PlateDetection)
         )
-        self._plate_detection_updated_at[direction] = time.monotonic()
+        self._plate_detection_updated_at[direction] = updated_at
+        self._detector_display_states[direction] = DetectorDisplayState(
+            plate_found=bool(self._plate_detections[direction]),
+            updated_at=updated_at,
+        )
 
     def _draw_plate_detections(self, image: QImage, direction: Direction) -> None:
         if (
@@ -428,6 +515,8 @@ class DashboardHome(QWidget):
         if not detections:
             return
         updated_at = self._plate_detection_updated_at.get(direction, 0.0)
+        # This TTL-bound ADMIN overlay is a live detector hint, not object tracking:
+        # detector results and preview frames do not share a frame_id at the UI boundary.
         ttl_seconds = (
             self.recognition_service.config.plate_detector.debug_detection_overlay_ttl_ms
             / 1000.0
@@ -651,6 +740,7 @@ class DashboardWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._auto_refresh_timer.stop()
+        self.dashboard_home.stop_status_expiry_timer()
         if not self._camera_shutdown_started:
             self._camera_shutdown_started = True
             self.camera_service.stop_all()
