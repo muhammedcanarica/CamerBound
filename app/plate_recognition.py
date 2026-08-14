@@ -26,6 +26,7 @@ from app.ocr_models import (
     select_ocr_backend,
 )
 from app.plate_detector import (
+    DetectorDiagnostics,
     OpenVinoPlateDetector,
     PlateDetection,
     PlateDetector,
@@ -81,6 +82,43 @@ OCR_VARIANT_NAMES = (
     "low-light-gamma-clahe-sharpened",
 )
 ROI_FALLBACK_MAX_WIDTH = 960
+
+
+def _log_plate_detector_diagnostics(
+    camera_id: int,
+    source: str,
+    detector: PlateDetector,
+) -> None:
+    if not LOGGER.isEnabledFor(logging.DEBUG):
+        return
+    diagnostics = getattr(detector, "last_diagnostics", None)
+    if not isinstance(diagnostics, DetectorDiagnostics):
+        return
+    brightness = (
+        "not-evaluated"
+        if diagnostics.raw_brightness is None
+        else f"{diagnostics.raw_brightness:.1f}"
+    )
+    shadow_metric = (
+        "not-evaluated"
+        if diagnostics.shadow_metric is None
+        else f"{diagnostics.shadow_metric:.1f}"
+    )
+    LOGGER.debug(
+        "Plate detector diagnostics camera_id=%s source=%s detector_variant=%s "
+        "brightness=%s raw_brightness=%s shadow_metric=%s enhanced_pass=%s "
+        "detections=%s raw_detector_ms=%.1f enhanced_detector_ms=%.1f",
+        camera_id,
+        source,
+        diagnostics.detector_variant,
+        brightness,
+        brightness,
+        shadow_metric,
+        "yes" if diagnostics.enhanced_pass else "no",
+        diagnostics.detections,
+        diagnostics.raw_detector_ms,
+        diagnostics.enhanced_detector_ms,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -988,6 +1026,11 @@ class PlateDetectionProcessor:
         if detector_config.enabled and self.detector is not None:
             try:
                 detections = self.detector.detect(roi_crop)
+                _log_plate_detector_diagnostics(
+                    camera_id,
+                    detector_source,
+                    self.detector,
+                )
             except Exception as exc:
                 self._log_detector_error(
                     camera_id,
@@ -1209,6 +1252,7 @@ class PlateRecognitionProcessor:
         if detector_config.enabled and self.detector is not None:
             try:
                 detections = self.detector.detect(roi_crop)
+                _log_plate_detector_diagnostics(camera_id, "live", self.detector)
             except Exception as exc:
                 self._log_detector_error(
                     camera_id,

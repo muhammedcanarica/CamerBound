@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,13 @@ PLATE_CLASS_ID = 2
 SSD_DETECTION_SIZE = 7
 MIN_PLATE_CROP_WIDTH = 8
 MIN_PLATE_CROP_HEIGHT = 4
+LOW_LIGHT_MEAN_THRESHOLD = 85.0
+HIGH_SHADOW_CONTRAST_THRESHOLD = 160.0
+SHADOW_PERCENTILE = 0.10
+HIGHLIGHT_PERCENTILE = 0.90
+SHADOW_LIFT_GAMMA = 0.72
+SHADOW_CLAHE_CLIP_LIMIT = 2.0
+SHADOW_CLAHE_GRID_SIZE = (8, 8)
 
 
 class PlateDetectorError(RuntimeError):
@@ -42,6 +50,30 @@ class PlateDetection:
     @property
     def area(self) -> int:
         return self.width * self.height
+
+
+@dataclass(frozen=True, slots=True)
+class DetectorLightingMetrics:
+    mean_brightness: float
+    shadow_metric: float
+
+    @property
+    def is_difficult(self) -> bool:
+        return (
+            self.mean_brightness <= LOW_LIGHT_MEAN_THRESHOLD
+            or self.shadow_metric >= HIGH_SHADOW_CONTRAST_THRESHOLD
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DetectorDiagnostics:
+    detector_variant: str
+    raw_brightness: float | None
+    shadow_metric: float | None
+    enhanced_pass: bool
+    raw_detector_ms: float
+    enhanced_detector_ms: float
+    detections: int
 
 
 class PlateDetector(Protocol):
@@ -93,6 +125,7 @@ class OpenVinoPlateDetector:
             _validate_output_metadata(self._output_port)
             self._compiled_model = self._core.compile_model(model, "CPU")
             self._infer_request = self._compiled_model.create_infer_request()
+            self.last_diagnostics: DetectorDiagnostics | None = None
         except PlateDetectorError:
             raise
         except Exception as exc:
@@ -103,8 +136,68 @@ class OpenVinoPlateDetector:
     def detect(self, image: np.ndarray) -> list[PlateDetection]:
         if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
             raise PlateDetectorError("Plate detector input'u BGR renkli görüntü olmalıdır.")
-        resized = cv2.resize(
+        self.last_diagnostics = None
+
+        raw_started_at = time.perf_counter()
+        raw_detections = self._infer_detections(
             image,
+            coordinate_width=image.shape[1],
+            coordinate_height=image.shape[0],
+        )
+        raw_detector_ms = (time.perf_counter() - raw_started_at) * 1000.0
+        if raw_detections:
+            self.last_diagnostics = DetectorDiagnostics(
+                detector_variant="raw",
+                raw_brightness=None,
+                shadow_metric=None,
+                enhanced_pass=False,
+                raw_detector_ms=raw_detector_ms,
+                enhanced_detector_ms=0.0,
+                detections=len(raw_detections),
+            )
+            return raw_detections
+
+        lighting = measure_detector_lighting(image)
+        if not lighting.is_difficult:
+            self.last_diagnostics = DetectorDiagnostics(
+                detector_variant="raw",
+                raw_brightness=lighting.mean_brightness,
+                shadow_metric=lighting.shadow_metric,
+                enhanced_pass=False,
+                raw_detector_ms=raw_detector_ms,
+                enhanced_detector_ms=0.0,
+                detections=0,
+            )
+            return []
+
+        enhanced = enhance_shadowed_detector_image(image)
+        enhanced_started_at = time.perf_counter()
+        enhanced_detections = self._infer_detections(
+            enhanced,
+            coordinate_width=image.shape[1],
+            coordinate_height=image.shape[0],
+        )
+        enhanced_detector_ms = (time.perf_counter() - enhanced_started_at) * 1000.0
+        self.last_diagnostics = DetectorDiagnostics(
+            detector_variant="enhanced",
+            raw_brightness=lighting.mean_brightness,
+            shadow_metric=lighting.shadow_metric,
+            enhanced_pass=True,
+            raw_detector_ms=raw_detector_ms,
+            enhanced_detector_ms=enhanced_detector_ms,
+            detections=len(enhanced_detections),
+        )
+        return enhanced_detections
+
+    def _infer_detections(
+        self,
+        detector_image: np.ndarray,
+        *,
+        coordinate_width: int,
+        coordinate_height: int,
+    ) -> list[PlateDetection]:
+        resized = cv2.resize(
+            detector_image,
             (self._input_width, self._input_height),
             interpolation=cv2.INTER_LINEAR,
         )
@@ -121,10 +214,54 @@ class OpenVinoPlateDetector:
 
         return parse_ssd_plate_detections(
             output,
-            image_width=image.shape[1],
-            image_height=image.shape[0],
+            image_width=coordinate_width,
+            image_height=coordinate_height,
             min_confidence=self.config.min_confidence,
         )
+
+
+def measure_detector_lighting(image: np.ndarray) -> DetectorLightingMetrics:
+    """Return cheap, deterministic luminance metrics for raw detector misses."""
+    uint8_image = _as_uint8_bgr(image)
+    grayscale = cv2.cvtColor(uint8_image, cv2.COLOR_BGR2GRAY)
+    histogram = cv2.calcHist([grayscale], [0], None, [256], [0, 256]).reshape(-1)
+    cumulative = np.cumsum(histogram)
+    pixel_count = float(grayscale.size)
+    shadow_level = int(np.searchsorted(cumulative, pixel_count * SHADOW_PERCENTILE))
+    highlight_level = int(
+        np.searchsorted(cumulative, pixel_count * HIGHLIGHT_PERCENTILE)
+    )
+    return DetectorLightingMetrics(
+        mean_brightness=float(grayscale.mean()),
+        shadow_metric=float(highlight_level - shadow_level),
+    )
+
+
+def enhance_shadowed_detector_image(image: np.ndarray) -> np.ndarray:
+    """Lift shadow luminance without sharpening or replacing BGR chroma."""
+    lab = cv2.cvtColor(_as_uint8_bgr(image), cv2.COLOR_BGR2LAB)
+    luminance, channel_a, channel_b = cv2.split(lab)
+    gamma_lut = np.clip(
+        ((np.arange(256, dtype=np.float32) / 255.0) ** SHADOW_LIFT_GAMMA) * 255.0,
+        0,
+        255,
+    ).astype(np.uint8)
+    lifted = cv2.LUT(luminance, gamma_lut)
+    clahe = cv2.createCLAHE(
+        clipLimit=SHADOW_CLAHE_CLIP_LIMIT,
+        tileGridSize=SHADOW_CLAHE_GRID_SIZE,
+    )
+    enhanced_luminance = clahe.apply(lifted)
+    return cv2.cvtColor(
+        cv2.merge((enhanced_luminance, channel_a, channel_b)),
+        cv2.COLOR_LAB2BGR,
+    )
+
+
+def _as_uint8_bgr(image: np.ndarray) -> np.ndarray:
+    if image.dtype == np.uint8:
+        return image
+    return np.clip(image, 0, 255).astype(np.uint8)
 
 
 def parse_ssd_plate_detections(

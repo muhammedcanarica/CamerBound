@@ -23,7 +23,7 @@ from app.config import (
 )
 from app.database import Database
 from app.plate_capture import PlateCaptureService
-from app.plate_detector import PlateDetection, PlateDetectorError
+from app.plate_detector import DetectorDiagnostics, PlateDetection, PlateDetectorError
 from app.plate_recognition import (
     ConfirmationTracker,
     FrameSnapshot,
@@ -2285,6 +2285,48 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         self.assertIsNone(result.job)
         self.assertFalse(result.used_roi_fallback)
+
+    def test_detector_debug_diagnostics_include_source_and_enhanced_metrics(self) -> None:
+        detector = FakePlateDetector(
+            [PlateDetection(0.9, x=20, y=10, width=100, height=30)]
+        )
+        detector.last_diagnostics = DetectorDiagnostics(
+            detector_variant="enhanced",
+            raw_brightness=62.5,
+            shadow_metric=181.0,
+            enhanced_pass=True,
+            raw_detector_ms=8.4,
+            enhanced_detector_ms=9.6,
+            detections=1,
+        )
+        processor = PlateDetectionProcessor(self.config, detector)
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            processor.prepare_job(
+                2,
+                Direction.EXIT,
+                frame,
+                captured_at=datetime(2026, 8, 13, tzinfo=timezone.utc),
+                observed_at=10.0,
+                received_at=10.0,
+                detector_source="replay",
+                allow_zero_detection_fallback=False,
+            )
+
+        diagnostic = next(
+            line for line in captured.output if "Plate detector diagnostics" in line
+        )
+        self.assertIn("camera_id=2", diagnostic)
+        self.assertIn("source=replay", diagnostic)
+        self.assertIn("detector_variant=enhanced", diagnostic)
+        self.assertIn("brightness=62.5", diagnostic)
+        self.assertIn("raw_brightness=62.5", diagnostic)
+        self.assertIn("shadow_metric=181.0", diagnostic)
+        self.assertIn("enhanced_pass=yes", diagnostic)
+        self.assertIn("detections=1", diagnostic)
+        self.assertIn("raw_detector_ms=8.4", diagnostic)
+        self.assertIn("enhanced_detector_ms=9.6", diagnostic)
 
     def test_replay_detector_crop_keeps_detector_crop_priority_and_timestamps(self) -> None:
         processor = PlateDetectionProcessor(

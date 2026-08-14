@@ -12,6 +12,8 @@ from app.plate_detector import (
     PlateDetection,
     PlateDetectorModelNotFound,
     crop_padded_plate,
+    enhance_shadowed_detector_image,
+    measure_detector_lighting,
     parse_ssd_plate_detections,
     select_plate_detections,
 )
@@ -39,12 +41,26 @@ class _FakeInferRequest:
         return {self.output_port: self.output}
 
 
+class _SequencedInferRequest:
+    def __init__(self, output_port: object, outputs: list[np.ndarray]) -> None:
+        self.output_port = output_port
+        self.outputs = outputs
+        self.calls = 0
+        self.tensors: list[np.ndarray] = []
+
+    def infer(self, inputs: dict[object, np.ndarray]) -> dict[object, np.ndarray]:
+        self.tensors.append(next(iter(inputs.values())).copy())
+        output = self.outputs[self.calls]
+        self.calls += 1
+        return {self.output_port: output}
+
+
 class _FakeCompiledModel:
-    def __init__(self, request: _FakeInferRequest) -> None:
+    def __init__(self, request: object) -> None:
         self.request = request
         self.create_calls = 0
 
-    def create_infer_request(self) -> _FakeInferRequest:
+    def create_infer_request(self) -> object:
         self.create_calls += 1
         return self.request
 
@@ -79,7 +95,188 @@ def _ssd_row(
     return [0.0, float(label), confidence, x_min, y_min, x_max, y_max]
 
 
+def _empty_ssd_output() -> np.ndarray:
+    return np.empty((1, 1, 0, 7), dtype=np.float32)
+
+
+def _plate_ssd_output(
+    confidence: float = 0.90,
+    *,
+    x_min: float = 0.10,
+    y_min: float = 0.20,
+    x_max: float = 0.60,
+    y_max: float = 0.50,
+) -> np.ndarray:
+    return np.array(
+        [[[_ssd_row(2, confidence, x_min, y_min, x_max, y_max)]]],
+        dtype=np.float32,
+    )
+
+
+def _make_sequenced_detector(
+    model_dir: Path,
+    outputs: list[np.ndarray],
+    *,
+    min_confidence: float = 0.15,
+) -> tuple[OpenVinoPlateDetector, _SequencedInferRequest]:
+    (model_dir / "model.xml").write_text("<xml />", encoding="utf-8")
+    (model_dir / "model.bin").write_bytes(b"weights")
+    input_port = _FakePort((1, 256, 256, 3))
+    output_port = _FakePort((1, 1, 200, 7))
+    request = _SequencedInferRequest(output_port, outputs)
+    compiled = _FakeCompiledModel(request)
+    core = _FakeCore(_FakeModel(input_port, output_port), compiled)
+    detector = OpenVinoPlateDetector(
+        PlateDetectorConfig(
+            model_dir=model_dir,
+            min_confidence=min_confidence,
+        ),
+        core_factory=lambda: core,
+    )
+    return detector, request
+
+
 class PlateDetectorTests(unittest.TestCase):
+    def test_bright_raw_miss_does_not_run_enhanced_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [_empty_ssd_output()],
+            )
+
+            detections = detector.detect(
+                np.full((100, 200, 3), 180, dtype=np.uint8)
+            )
+
+        self.assertEqual(detections, [])
+        self.assertEqual(request.calls, 1)
+        self.assertEqual(detector.last_diagnostics.detector_variant, "raw")
+        self.assertFalse(detector.last_diagnostics.enhanced_pass)
+
+    def test_raw_detection_skips_enhancement_even_for_dark_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [_plate_ssd_output()],
+            )
+
+            detections = detector.detect(np.full((100, 200, 3), 25, dtype=np.uint8))
+
+        self.assertEqual(len(detections), 1)
+        self.assertEqual(request.calls, 1)
+        self.assertEqual(detector.last_diagnostics.detector_variant, "raw")
+        self.assertFalse(detector.last_diagnostics.enhanced_pass)
+
+    def test_dark_raw_miss_runs_enhanced_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [_empty_ssd_output(), _plate_ssd_output()],
+            )
+            image = np.full((100, 200, 3), 30, dtype=np.uint8)
+
+            detections = detector.detect(image)
+
+        self.assertEqual(len(detections), 1)
+        self.assertEqual(request.calls, 2)
+        self.assertLess(
+            float(request.tensors[0].mean()),
+            float(request.tensors[1].mean()),
+        )
+        self.assertEqual(detector.last_diagnostics.detector_variant, "enhanced")
+        self.assertTrue(detector.last_diagnostics.enhanced_pass)
+        self.assertAlmostEqual(detector.last_diagnostics.raw_brightness, 30.0)
+
+    def test_high_shadow_highlight_contrast_runs_enhanced_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [_empty_ssd_output(), _empty_ssd_output()],
+            )
+            image = np.full((100, 200, 3), 230, dtype=np.uint8)
+            image[:, :100] = 20
+
+            detector.detect(image)
+
+        self.assertEqual(request.calls, 2)
+        self.assertGreater(detector.last_diagnostics.shadow_metric, 160.0)
+        self.assertTrue(detector.last_diagnostics.enhanced_pass)
+
+    def test_normal_lighting_raw_miss_avoids_second_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [_empty_ssd_output()],
+            )
+
+            detector.detect(np.full((100, 200, 3), 120, dtype=np.uint8))
+
+        self.assertEqual(request.calls, 1)
+        self.assertFalse(detector.last_diagnostics.enhanced_pass)
+        self.assertEqual(detector.last_diagnostics.shadow_metric, 0.0)
+
+    def test_enhanced_detection_coordinates_and_crop_use_original_roi(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [_empty_ssd_output(), _plate_ssd_output()],
+            )
+            image = np.zeros((100, 200, 3), dtype=np.uint8)
+            image[:, :, 0] = np.arange(200, dtype=np.uint8)
+            image[:, :, 1] = 20
+            image[:, :, 2] = 30
+
+            detections = detector.detect(image)
+            crop = crop_padded_plate(image, detections[0], 0.0)
+
+        self.assertEqual(request.calls, 2)
+        self.assertEqual(
+            (
+                detections[0].x,
+                detections[0].y,
+                detections[0].width,
+                detections[0].height,
+            ),
+            (20, 20, 100, 30),
+        )
+        np.testing.assert_array_equal(crop, image[20:50, 20:120])
+        self.assertFalse(np.array_equal(crop, request.tensors[1][0, 20:50, 20:120]))
+
+    def test_configured_detector_threshold_is_used_for_both_passes(self) -> None:
+        below_threshold = _plate_ssd_output(confidence=0.149)
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [below_threshold, below_threshold],
+                min_confidence=0.15,
+            )
+
+            detections = detector.detect(np.full((100, 200, 3), 30, dtype=np.uint8))
+
+        self.assertEqual(detector.config.min_confidence, 0.15)
+        self.assertEqual(detections, [])
+        self.assertEqual(request.calls, 2)
+
+    def test_shadow_enhancement_deterministically_lifts_dark_detail(self) -> None:
+        image = np.full((64, 128, 3), 12, dtype=np.uint8)
+        image[16:48, 32:64] = 20
+        image[16:48, 64:96] = 30
+
+        enhanced = enhance_shadowed_detector_image(image)
+        original_metrics = measure_detector_lighting(image)
+        enhanced_metrics = measure_detector_lighting(enhanced)
+
+        self.assertEqual(enhanced.shape, image.shape)
+        self.assertEqual(enhanced.dtype, np.uint8)
+        self.assertGreater(
+            enhanced_metrics.mean_brightness,
+            original_metrics.mean_brightness,
+        )
+        self.assertGreater(
+            float(enhanced[16:48, 64:96].mean() - enhanced[16:48, 32:64].mean()),
+            float(image[16:48, 64:96].mean() - image[16:48, 32:64].mean()),
+        )
+
     def test_model_is_initialized_once_and_reused_for_each_detection(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             model_dir = Path(temp_directory)
