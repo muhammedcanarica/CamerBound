@@ -1242,7 +1242,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         worker.submit_frame(20, Direction.EXIT, frame)
         self.assertEqual(worker.pending_frame_count, 2)
 
-    def test_analysis_ingestion_keeps_twenty_frames_when_ui_preview_is_coalesced(self) -> None:
+    def test_analysis_ingestion_keeps_bounded_frames_when_ui_preview_is_coalesced(self) -> None:
         worker = PlateRecognitionWorker(
             self.plate_service,
             self.config,
@@ -1281,8 +1281,8 @@ class RecognitionPipelineTests(unittest.TestCase):
                     self.camera_service._on_frame_ready(camera_id, frame)
 
             snapshots = worker._frame_buffer.snapshots(camera_id)
-            self.assertEqual(len(snapshots), 20)
-            self.assertEqual(len({snapshot.frame_id for snapshot in snapshots}), 20)
+            self.assertEqual(len(snapshots), 16)
+            self.assertEqual(len({snapshot.frame_id for snapshot in snapshots}), 16)
             self.assertEqual(preview_frames, [])
             self.assertIs(snapshots[-1].full_frame, frames[-1])
             self.assertFalse(snapshots[-1].full_frame.flags.writeable)
@@ -1485,6 +1485,26 @@ class RecognitionPipelineTests(unittest.TestCase):
             [item.frame_id for item in buffer.snapshots(1)], [2, 3, 4]
         )
         self.assertEqual([item.frame_id for item in buffer.snapshots(2)], [20])
+
+    def test_two_fps_stream_keeps_five_seconds_of_unique_history_bounded(self) -> None:
+        config = replace(
+            self.config,
+            pre_detection_buffer_duration_ms=5_000,
+            pre_detection_buffer_max_frames_per_camera=16,
+        )
+        buffer = PreDetectionFrameBuffer(config)
+
+        for index in range(10):
+            buffer.ingest(
+                self._make_snapshot(index + 1, index * 0.5),
+                motion_score=0.0,
+            )
+
+        snapshots = buffer.snapshots(1)
+        self.assertEqual(len(snapshots), 10)
+        self.assertEqual(len({snapshot.frame_id for snapshot in snapshots}), 10)
+        self.assertLessEqual(buffer.ring_depth(1), 16)
+        self.assertEqual(config.recognition_interval_ms, 250)
 
     def test_motion_event_pins_pre_and_post_roll_and_closes_after_quiet(self) -> None:
         config = replace(
@@ -1699,6 +1719,59 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(detector.calls, 1)
         self.assertEqual(overlay_updates, [])
         self.assertFalse(thread.is_alive())
+
+    def test_worker_schedules_event_end_fallback_when_detector_never_succeeds(self) -> None:
+        provider = RecordingOcrProvider(confidence=0.97)
+        detector = FakePlateDetector([])
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=lambda: provider,
+            detector_factory=lambda: detector,
+        )
+        snapshots = tuple(
+            replace(
+                self._make_snapshot(
+                    800 + index,
+                    80.0 + index * 0.5,
+                    value=30 + index * 10,
+                ),
+                motion_score=0.05 + index * 0.01,
+            )
+            for index in range(3)
+        )
+        event = MotionEvent(
+            80,
+            1,
+            Direction.ENTRY,
+            80.0,
+            81.0,
+            time.monotonic(),
+            snapshots,
+        )
+        with worker._lock:
+            worker._completed_motion_events.append(event)
+        outcome_ready = threading.Event()
+        outcomes = []
+        worker.outcome_changed.connect(
+            lambda _camera_id, outcome: (
+                outcomes.append(outcome),
+                outcome_ready.set(),
+            ),
+            Qt.ConnectionType.DirectConnection,
+        )
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        try:
+            self.assertTrue(outcome_ready.wait(1.5))
+        finally:
+            worker.request_stop()
+            thread.join(2.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(detector.calls, 0)
+        self.assertIs(outcomes[0].state, RecognitionState.AWAITING_CONFIRMATION)
 
     def test_detector_continues_while_ocr_provider_is_blocked(self) -> None:
         started = threading.Event()
@@ -1957,19 +2030,23 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(result.replaced_job_type, OcrJobType.ZERO_DETECTION_FALLBACK)
         self.assertEqual([buffer.take().frame_id, buffer.take().frame_id], [3, 4])
 
-    def test_zero_detection_fallback_is_coalesced_and_released_after_consume(self) -> None:
+    def test_zero_detection_fallback_buffer_allows_two_then_coalesces(self) -> None:
         buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
         first = self._make_ocr_job(job_type=OcrJobType.ZERO_DETECTION_FALLBACK)
         second = self._make_ocr_job(job_type=OcrJobType.ZERO_DETECTION_FALLBACK)
+        third = self._make_ocr_job(job_type=OcrJobType.ZERO_DETECTION_FALLBACK)
 
-        buffer.add(first)
-        coalesced = buffer.add(second)
-        consumed = buffer.take()
-        accepted_again = buffer.add(second)
+        accepted_first = buffer.add(first)
+        accepted_second = buffer.add(second)
+        coalesced = buffer.add(third)
+        consumed = (buffer.take(), buffer.take())
+        accepted_again = buffer.add(third)
 
+        self.assertTrue(accepted_first.accepted)
+        self.assertTrue(accepted_second.accepted)
         self.assertFalse(coalesced.accepted)
         self.assertTrue(coalesced.coalesced)
-        self.assertIs(consumed, first)
+        self.assertEqual(consumed, (first, second))
         self.assertTrue(accepted_again.accepted)
 
     def test_fallback_coalescing_has_no_stuck_state_after_replace_stale_or_clear(self) -> None:
@@ -2025,9 +2102,10 @@ class RecognitionPipelineTests(unittest.TestCase):
             job_type=OcrJobType.ZERO_DETECTION_FALLBACK,
         )
         buffer.add(fallback)
+        buffer.add(replace(fallback, frame_id=42))
 
         with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
-            buffer.add(replace(fallback, frame_id=42))
+            buffer.add(replace(fallback, frame_id=43))
 
         diagnostic = captured.output[-1]
         self.assertIn("job_type=ZERO_DETECTION_FALLBACK", diagnostic)
@@ -2130,7 +2208,7 @@ class RecognitionPipelineTests(unittest.TestCase):
 
                 self.assertTrue(accepted.accepted)
                 self.assertIs(buffer.take(), crop)
-                self.assertEqual(buffer.pending_count(fallback_camera_id), 1)
+                self.assertEqual(buffer.pending_count(fallback_camera_id), 2)
 
     def test_normal_vehicle_detector_crops_save_while_fallback_jobs_are_pending(self) -> None:
         buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
@@ -2293,13 +2371,14 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
         after_interval = processor.prepare_job(
             1, Direction.ENTRY, frame,
-            captured_at=captured_at, observed_at=10.8, received_at=10.8,
+            captured_at=captured_at, observed_at=11.0, received_at=11.0,
             zero_detection_fallback_event_id=2,
         )
 
         self.assertEqual(first.job.fallback_reason, "zero-detection")
         self.assertIs(first.job.job_type, OcrJobType.ZERO_DETECTION_FALLBACK)
         self.assertIsNone(throttled.job)
+        self.assertEqual(throttled.fallback_skipped_reason, "fallback-spacing")
         self.assertEqual(after_interval.job.fallback_reason, "zero-detection")
 
     def test_static_zero_detection_does_not_generate_expensive_roi_jobs(self) -> None:
@@ -2327,7 +2406,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             )
         )
 
-    def test_motion_event_allows_only_one_zero_detection_fallback(self) -> None:
+    def test_motion_event_allows_at_most_two_zero_detection_fallbacks(self) -> None:
         processor = PlateDetectionProcessor(self.config, FakePlateDetector([]))
         frame = np.zeros((200, 400, 3), dtype=np.uint8)
         captured_at = datetime(2026, 8, 13, tzinfo=timezone.utc)
@@ -2340,8 +2419,9 @@ class RecognitionPipelineTests(unittest.TestCase):
             observed_at=10.0,
             received_at=10.0,
             zero_detection_fallback_event_id=7,
+            frame_id=1,
         )
-        repeated = processor.prepare_job(
+        second = processor.prepare_job(
             1,
             Direction.ENTRY,
             frame,
@@ -2349,11 +2429,295 @@ class RecognitionPipelineTests(unittest.TestCase):
             observed_at=11.0,
             received_at=11.0,
             zero_detection_fallback_event_id=7,
+            frame_id=2,
+        )
+        limited = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=captured_at,
+            observed_at=12.0,
+            received_at=12.0,
+            zero_detection_fallback_event_id=7,
+            frame_id=3,
         )
 
         self.assertIs(first.job.job_type, OcrJobType.ZERO_DETECTION_FALLBACK)
-        self.assertIsNone(repeated.job)
-        self.assertEqual(repeated.fallback_skipped_reason, "event-fallback-used")
+        self.assertIs(second.job.job_type, OcrJobType.ZERO_DETECTION_FALLBACK)
+        self.assertEqual((first.fallback_attempt, second.fallback_attempt), (1, 2))
+        self.assertIsNone(limited.job)
+        self.assertEqual(limited.fallback_skipped_reason, "fallback-limit")
+
+    def test_first_fallback_miss_does_not_block_later_event_frame(self) -> None:
+        processor = PlateDetectionProcessor(self.config, FakePlateDetector([]))
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        captured_at = datetime(2026, 8, 13, tzinfo=timezone.utc)
+
+        first = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=captured_at,
+            observed_at=10.0,
+            received_at=10.0,
+            frame_id=101,
+            zero_detection_fallback_event_id=9,
+            motion_score=0.05,
+        )
+        later = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=captured_at + timedelta(seconds=1),
+            observed_at=11.0,
+            received_at=11.0,
+            frame_id=102,
+            zero_detection_fallback_event_id=9,
+            motion_score=0.09,
+        )
+
+        self.assertIs(first.job.job_type, OcrJobType.ZERO_DETECTION_FALLBACK)
+        self.assertIs(later.job.job_type, OcrJobType.ZERO_DETECTION_FALLBACK)
+        self.assertEqual((first.fallback_attempt, later.fallback_attempt), (1, 2))
+        self.assertEqual(later.time_since_previous_attempt_ms, 1000.0)
+
+    def test_second_fallback_requires_different_frame_and_one_second_spacing(self) -> None:
+        processor = PlateDetectionProcessor(self.config, FakePlateDetector([]))
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        captured_at = datetime(2026, 8, 13, tzinfo=timezone.utc)
+        first = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=captured_at,
+            observed_at=20.0,
+            received_at=20.0,
+            frame_id=201,
+            zero_detection_fallback_event_id=10,
+            motion_score=0.05,
+        )
+        same_frame = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=captured_at,
+            observed_at=21.0,
+            received_at=21.0,
+            frame_id=201,
+            zero_detection_fallback_event_id=10,
+            motion_score=0.08,
+        )
+        too_soon = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=captured_at,
+            observed_at=20.999,
+            received_at=20.999,
+            frame_id=202,
+            zero_detection_fallback_event_id=10,
+            motion_score=0.08,
+        )
+        spaced = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=captured_at,
+            observed_at=21.0,
+            received_at=21.0,
+            frame_id=203,
+            zero_detection_fallback_event_id=10,
+            motion_score=0.08,
+        )
+
+        self.assertIsNotNone(first.job)
+        self.assertEqual(same_frame.fallback_skipped_reason, "same-frame")
+        self.assertEqual(too_soon.fallback_skipped_reason, "fallback-spacing")
+        self.assertIsNotNone(spaced.job)
+        self.assertEqual(spaced.time_since_previous_attempt_ms, 1000.0)
+
+    def test_event_end_adds_final_fallback_from_best_eligible_frame(self) -> None:
+        processor = PlateDetectionProcessor(self.config, FakePlateDetector([]))
+        frames = (
+            replace(self._make_snapshot(301, 30.0, value=20), motion_score=0.05),
+            replace(self._make_snapshot(302, 30.5, value=40), motion_score=0.20),
+            replace(self._make_snapshot(303, 31.2, value=60), motion_score=0.12),
+        )
+        event = MotionEvent(
+            event_id=11,
+            camera_id=1,
+            direction=Direction.ENTRY,
+            started_at=30.0,
+            ended_at=31.2,
+            enqueued_at=31.2,
+            frames=frames,
+        )
+        first = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frames[0].full_frame,
+            captured_at=frames[0].captured_at,
+            observed_at=frames[0].observed_at,
+            received_at=frames[0].received_at,
+            frame_id=frames[0].frame_id,
+            zero_detection_fallback_event_id=event.event_id,
+            motion_score=frames[0].motion_score,
+        )
+
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            final = processor.prepare_event_end_fallback(event, ring_depth=10)
+
+        self.assertEqual(first.fallback_attempt, 1)
+        self.assertIsNotNone(final.job)
+        self.assertEqual(final.job.frame_id, 303)
+        self.assertEqual(final.job.detector_source, "event-end")
+        self.assertEqual(final.fallback_attempt, 2)
+        self.assertEqual(final.event_frames, 3)
+        self.assertEqual(final.ring_depth, 10)
+        diagnostic = captured.output[-1]
+        for expected in (
+            "camera_id=1",
+            "event_id=11",
+            "fallback_attempt=2/2",
+            "frame_id=303",
+            "motion_score=0.1200",
+            "fallback_reason=event-end",
+            "time_since_previous_attempt_ms=1200.0",
+            "event_frames=3",
+            "ring_depth=10",
+        ):
+            self.assertIn(expected, diagnostic)
+
+    def test_event_end_does_not_exceed_two_attempts(self) -> None:
+        processor = PlateDetectionProcessor(self.config, FakePlateDetector([]))
+        frames = tuple(
+            replace(
+                self._make_snapshot(400 + index, 40.0 + index, value=index),
+                motion_score=0.10,
+            )
+            for index in range(3)
+        )
+        event = MotionEvent(12, 1, Direction.ENTRY, 40.0, 42.0, 42.0, frames)
+        for snapshot in frames[:2]:
+            processor.prepare_job(
+                1,
+                Direction.ENTRY,
+                snapshot.full_frame,
+                captured_at=snapshot.captured_at,
+                observed_at=snapshot.observed_at,
+                received_at=snapshot.received_at,
+                frame_id=snapshot.frame_id,
+                zero_detection_fallback_event_id=event.event_id,
+                motion_score=snapshot.motion_score,
+            )
+
+        final = processor.prepare_event_end_fallback(event, ring_depth=3)
+
+        self.assertIsNone(final.job)
+        self.assertEqual(final.fallback_skipped_reason, "fallback-limit")
+
+    def test_detector_crop_success_prevents_event_end_roi_fallback(self) -> None:
+        detection = PlateDetection(0.9, x=20, y=10, width=100, height=30)
+        processor = PlateDetectionProcessor(
+            self.config,
+            FakePlateDetector([detection]),
+        )
+        snapshot = replace(
+            self._make_snapshot(501, 50.0, value=80),
+            motion_score=0.10,
+        )
+        event = MotionEvent(
+            13,
+            1,
+            Direction.ENTRY,
+            50.0,
+            50.0,
+            50.0,
+            (snapshot,),
+        )
+        crop = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            snapshot.full_frame,
+            captured_at=snapshot.captured_at,
+            observed_at=snapshot.observed_at,
+            received_at=snapshot.received_at,
+            frame_id=snapshot.frame_id,
+            zero_detection_fallback_event_id=event.event_id,
+            motion_score=snapshot.motion_score,
+        )
+
+        final = processor.prepare_event_end_fallback(event, ring_depth=1)
+
+        self.assertIs(crop.job.job_type, OcrJobType.DETECTOR_CROP)
+        self.assertIsNone(final.job)
+        self.assertEqual(final.fallback_skipped_reason, "detector-success")
+
+    def test_replay_and_event_end_do_not_repeat_live_fallback_frame(self) -> None:
+        processor = PlateDetectionProcessor(self.config, FakePlateDetector([]))
+        snapshot = replace(
+            self._make_snapshot(601, 60.0, value=30),
+            motion_score=0.10,
+        )
+        event = MotionEvent(
+            14,
+            1,
+            Direction.ENTRY,
+            60.0,
+            60.0,
+            60.0,
+            (snapshot,),
+        )
+        live = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            snapshot.full_frame,
+            captured_at=snapshot.captured_at,
+            observed_at=snapshot.observed_at,
+            received_at=snapshot.received_at,
+            frame_id=snapshot.frame_id,
+            zero_detection_fallback_event_id=event.event_id,
+            motion_score=snapshot.motion_score,
+        )
+        replay = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            snapshot.full_frame,
+            captured_at=snapshot.captured_at,
+            observed_at=snapshot.observed_at,
+            received_at=snapshot.received_at,
+            frame_id=snapshot.frame_id,
+            detector_source="replay",
+            allow_zero_detection_fallback=False,
+            zero_detection_fallback_event_id=event.event_id,
+            motion_score=snapshot.motion_score,
+        )
+        final = processor.prepare_event_end_fallback(event, ring_depth=1)
+
+        self.assertEqual(live.fallback_attempt, 1)
+        self.assertIsNone(replay.job)
+        self.assertEqual(replay.fallback_skipped_reason, "replay-zero-detection")
+        self.assertIsNone(final.job)
+
+    def test_zero_detection_event_state_is_bounded(self) -> None:
+        processor = PlateDetectionProcessor(self.config, FakePlateDetector([]))
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        captured_at = datetime(2026, 8, 13, tzinfo=timezone.utc)
+
+        for event_id in range(40):
+            processor.prepare_job(
+                1,
+                Direction.ENTRY,
+                frame,
+                captured_at=captured_at,
+                observed_at=70.0 + event_id,
+                received_at=70.0 + event_id,
+                frame_id=700 + event_id,
+                zero_detection_fallback_event_id=event_id,
+                motion_score=0.10,
+            )
+
+        self.assertEqual(processor.zero_detection_event_state_count, 32)
 
     def test_detection_processor_exception_queues_detector_error_fallback(self) -> None:
         processor = PlateDetectionProcessor(

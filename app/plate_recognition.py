@@ -92,6 +92,10 @@ CONFIRMED_PLATE_LIMIT = 256
 PENDING_DECISION_CAMERA_LIMIT = 16
 PENDING_DECISION_OBSERVATION_LIMIT = 32
 PENDING_DECISION_PLATE_LIMIT = 8
+ZERO_DETECTION_FALLBACK_MAX_ATTEMPTS = 2
+ZERO_DETECTION_FALLBACK_MIN_SPACING_MS = 1_000
+ZERO_DETECTION_EVENT_STATE_LIMIT = 32
+COMPLETED_MOTION_EVENT_LIMIT = 32
 
 
 def _log_plate_detector_diagnostics(
@@ -617,6 +621,14 @@ class _ActiveMotionEvent:
     frames: deque[FrameSnapshot]
 
 
+@dataclass(slots=True)
+class _ZeroDetectionEventState:
+    attempt_count: int = 0
+    last_attempt_at: float | None = None
+    attempted_frame_ids: set[int] = field(default_factory=set)
+    detector_crop_seen: bool = False
+
+
 class PreDetectionFrameBuffer:
     """Thread-safe per-camera RAM ring and lightweight motion-event builder."""
 
@@ -720,6 +732,11 @@ class PreDetectionFrameBuffer:
             event = self._events.get(camera_id)
             return event.event_id if event is not None else None
 
+    def active_event_frame_count(self, camera_id: int) -> int:
+        with self._lock:
+            event = self._events.get(camera_id)
+            return len(event.frames) if event is not None else 0
+
     def ring_depth(self, camera_id: int) -> int:
         with self._lock:
             return len(self._rings.get(camera_id, ()))
@@ -820,6 +837,13 @@ class _ReplayEventWork:
     remaining: deque[FrameSnapshot]
 
 
+@dataclass(frozen=True, slots=True)
+class ReplayFrameItem:
+    event_id: int
+    snapshot: FrameSnapshot
+    event_frames: int
+
+
 class ReplayEventBuffer:
     """Camera-fair bounded queue of temporally selected historical snapshots."""
 
@@ -871,6 +895,10 @@ class ReplayEventBuffer:
         return True
 
     def take(self, now: float | None = None) -> FrameSnapshot | None:
+        item = self.take_with_event(now)
+        return item.snapshot if item is not None else None
+
+    def take_with_event(self, now: float | None = None) -> ReplayFrameItem | None:
         now = time.monotonic() if now is None else now
         maximum_age = self.config.replay_event_max_age_ms / 1000.0
         with self._lock:
@@ -892,7 +920,11 @@ class ReplayEventBuffer:
                 snapshot = work.remaining.popleft()
                 if not work.remaining:
                     camera_events.popleft()
-                return snapshot
+                return ReplayFrameItem(
+                    work.event.event_id,
+                    snapshot,
+                    len(work.event.frames),
+                )
         return None
 
     def pending_event_count(self, camera_id: int | None = None) -> int:
@@ -942,6 +974,11 @@ class DetectionJobResult:
     roi_brightness: float
     fallback_skipped_reason: str | None = None
     motion_event_id: int | None = None
+    fallback_attempt: int = 0
+    time_since_previous_attempt_ms: float | None = None
+    motion_score: float = 0.0
+    event_frames: int = 0
+    ring_depth: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1000,9 +1037,17 @@ class OcrJobBuffer:
             stale_discarded = self._discard_stale_locked(
                 camera_jobs, time.monotonic()
             )
+            same_type_pending = sum(
+                item.job_type is job.job_type for item in camera_jobs
+            )
+            pending_limit = (
+                ZERO_DETECTION_FALLBACK_MAX_ATTEMPTS
+                if job.job_type is OcrJobType.ZERO_DETECTION_FALLBACK
+                else 1
+            )
             if (
                 job.job_type is not OcrJobType.DETECTOR_CROP
-                and any(item.job_type is job.job_type for item in camera_jobs)
+                and same_type_pending >= pending_limit
             ):
                 accepted = False
                 dropped = 1
@@ -1173,7 +1218,11 @@ class PlateDetectionProcessor:
         self.config = config
         self.detector = detector
         self._last_zero_detection_fallback_at: dict[int, float] = {}
-        self._last_zero_detection_fallback_event_id: dict[int, int] = {}
+        self._zero_detection_events: dict[
+            tuple[int, int], _ZeroDetectionEventState
+        ] = {}
+        self._detector_crop_frame_ids: dict[int, deque[int]] = defaultdict(deque)
+        self._detector_crop_frame_id_sets: dict[int, set[int]] = defaultdict(set)
         self._last_detector_error_logged_at: dict[int, float] = {}
 
     def prepare_job(
@@ -1189,6 +1238,9 @@ class PlateDetectionProcessor:
         detector_source: str = "live",
         allow_zero_detection_fallback: bool = True,
         zero_detection_fallback_event_id: int | None = None,
+        motion_score: float | None = None,
+        event_frames: int = 0,
+        ring_depth: int = 0,
     ) -> DetectionJobResult:
         roi_crop = crop_roi(frame, self.config.roi_for(direction))
         if roi_crop is None:
@@ -1203,6 +1255,8 @@ class PlateDetectionProcessor:
         fallback_reason = "detector-disabled" if used_roi_fallback else None
         ocr_crops: list[np.ndarray] = []
         fallback_skipped_reason: str | None = None
+        fallback_attempt = 0
+        time_since_previous_attempt_ms: float | None = None
 
         if detector_config.enabled and self.detector is not None:
             try:
@@ -1238,8 +1292,20 @@ class PlateDetectionProcessor:
                     if plate_crop is not None:
                         ocr_crops.append(plate_crop)
                         ocr_crop_detections.append(detection)
+                if ocr_crops and zero_detection_fallback_event_id is not None:
+                    self._event_state(
+                        camera_id,
+                        zero_detection_fallback_event_id,
+                    ).detector_crop_seen = True
+                if ocr_crops and frame_id is not None:
+                    self._remember_detector_crop_frame(camera_id, frame_id)
                 if not ocr_crops:
-                    should_fallback, fallback_skipped_reason = (
+                    (
+                        should_fallback,
+                        fallback_skipped_reason,
+                        fallback_attempt,
+                        time_since_previous_attempt_ms,
+                    ) = (
                         self._should_run_zero_detection_fallback(
                             camera_id,
                             observed_at,
@@ -1247,6 +1313,10 @@ class PlateDetectionProcessor:
                             detector_config.zero_detection_roi_fallback_interval_ms,
                             allow_zero_detection_fallback,
                             zero_detection_fallback_event_id,
+                            frame_id,
+                            motion_score,
+                            event_frames,
+                            ring_depth,
                         )
                     )
                     if should_fallback:
@@ -1277,6 +1347,11 @@ class PlateDetectionProcessor:
                 brightness,
                 fallback_skipped_reason,
                 zero_detection_fallback_event_id,
+                fallback_attempt,
+                time_since_previous_attempt_ms,
+                motion_score or 0.0,
+                event_frames,
+                ring_depth,
             )
 
         full_frame = frame
@@ -1328,6 +1403,11 @@ class PlateDetectionProcessor:
             brightness,
             fallback_skipped_reason,
             zero_detection_fallback_event_id,
+            fallback_attempt,
+            time_since_previous_attempt_ms,
+            motion_score or 0.0,
+            event_frames,
+            ring_depth,
         )
 
     def _should_run_zero_detection_fallback(
@@ -1338,24 +1418,285 @@ class PlateDetectionProcessor:
         interval_ms: int,
         allowed_for_source: bool,
         motion_event_id: int | None,
-    ) -> tuple[bool, str | None]:
+        frame_id: int | None,
+        motion_score: float | None,
+        event_frames: int,
+        ring_depth: int,
+    ) -> tuple[bool, str | None, int, float | None]:
         if not enabled:
-            return False, "disabled"
+            return False, "disabled", 0, None
         if not allowed_for_source:
-            return False, "replay-zero-detection"
+            return False, "replay-zero-detection", 0, None
         if motion_event_id is None:
-            return False, "no-meaningful-motion"
-        if self._last_zero_detection_fallback_event_id.get(camera_id) == motion_event_id:
-            return False, "event-fallback-used"
+            return False, "no-meaningful-motion", 0, None
+        state = self._event_state(camera_id, motion_event_id)
+        if frame_id is not None and frame_id in state.attempted_frame_ids:
+            return False, "same-frame", state.attempt_count, None
+        if state.attempt_count >= ZERO_DETECTION_FALLBACK_MAX_ATTEMPTS:
+            return False, "fallback-limit", state.attempt_count, None
+        if (
+            motion_score is not None
+            and motion_score
+            < self.config.motion_changed_pixel_ratio
+            * MOTION_CONTINUE_THRESHOLD_RATIO
+        ):
+            return False, "no-meaningful-motion", state.attempt_count, None
         last_fallback_at = self._last_zero_detection_fallback_at.get(camera_id)
+        time_since_previous_attempt_ms = (
+            None
+            if last_fallback_at is None
+            else max(0.0, (observed_at - last_fallback_at) * 1000.0)
+        )
+        spacing_ms = max(interval_ms, ZERO_DETECTION_FALLBACK_MIN_SPACING_MS)
         if (
             last_fallback_at is not None
-            and (observed_at - last_fallback_at) * 1000.0 < interval_ms
+            and time_since_previous_attempt_ms < spacing_ms
         ):
-            return False, "interval-throttled"
+            return (
+                False,
+                "fallback-spacing",
+                state.attempt_count,
+                time_since_previous_attempt_ms,
+            )
         self._last_zero_detection_fallback_at[camera_id] = observed_at
-        self._last_zero_detection_fallback_event_id[camera_id] = motion_event_id
-        return True, None
+        state.attempt_count += 1
+        state.last_attempt_at = observed_at
+        if frame_id is not None:
+            state.attempted_frame_ids.add(frame_id)
+        LOGGER.debug(
+            "Zero-detection fallback camera_id=%s event_id=%s "
+            "fallback_attempt=%s/%s frame_id=%s motion_score=%.4f "
+            "fallback_reason=zero-detection fallback_skipped_reason=none "
+            "time_since_previous_attempt_ms=%s event_frames=%s ring_depth=%s",
+            camera_id,
+            motion_event_id,
+            state.attempt_count,
+            ZERO_DETECTION_FALLBACK_MAX_ATTEMPTS,
+            frame_id,
+            motion_score or 0.0,
+            (
+                "none"
+                if time_since_previous_attempt_ms is None
+                else f"{time_since_previous_attempt_ms:.1f}"
+            ),
+            event_frames,
+            ring_depth,
+        )
+        return True, None, state.attempt_count, time_since_previous_attempt_ms
+
+    def _event_state(
+        self,
+        camera_id: int,
+        event_id: int,
+    ) -> _ZeroDetectionEventState:
+        key = (camera_id, event_id)
+        state = self._zero_detection_events.get(key)
+        if state is not None:
+            return state
+        if len(self._zero_detection_events) >= ZERO_DETECTION_EVENT_STATE_LIMIT:
+            oldest_key = next(iter(self._zero_detection_events))
+            self._zero_detection_events.pop(oldest_key, None)
+        state = _ZeroDetectionEventState()
+        self._zero_detection_events[key] = state
+        return state
+
+    @property
+    def zero_detection_event_state_count(self) -> int:
+        return len(self._zero_detection_events)
+
+    def prepare_event_end_fallback(
+        self,
+        event: MotionEvent,
+        *,
+        ring_depth: int,
+    ) -> DetectionJobResult:
+        key = (event.camera_id, event.event_id)
+        state = self._event_state(event.camera_id, event.event_id)
+        detector_config = self.config.plate_detector
+        base_result = {
+            "detections": (),
+            "used_roi_fallback": False,
+            "fallback_reason": None,
+            "detector_ms": 0.0,
+            "roi_brightness": 0.0,
+            "motion_event_id": event.event_id,
+            "fallback_attempt": state.attempt_count,
+            "motion_score": 0.0,
+            "event_frames": len(event.frames),
+            "ring_depth": ring_depth,
+        }
+        try:
+            if not detector_config.zero_detection_roi_fallback_enabled:
+                return DetectionJobResult(
+                    job=None,
+                    fallback_skipped_reason="disabled",
+                    **base_result,
+                )
+            detector_crop_frames = self._detector_crop_frame_id_sets.get(
+                event.camera_id,
+                set(),
+            )
+            if state.detector_crop_seen or any(
+                snapshot.frame_id in detector_crop_frames
+                for snapshot in event.frames
+            ):
+                return DetectionJobResult(
+                    job=None,
+                    fallback_skipped_reason="detector-success",
+                    **base_result,
+                )
+            if state.attempt_count >= ZERO_DETECTION_FALLBACK_MAX_ATTEMPTS:
+                return DetectionJobResult(
+                    job=None,
+                    fallback_skipped_reason="fallback-limit",
+                    **base_result,
+                )
+
+            spacing_ms = max(
+                detector_config.zero_detection_roi_fallback_interval_ms,
+                ZERO_DETECTION_FALLBACK_MIN_SPACING_MS,
+            )
+            previous_attempt_at = self._last_zero_detection_fallback_at.get(
+                event.camera_id
+            )
+            candidates = [
+                snapshot
+                for snapshot in event.frames
+                if snapshot.frame_id not in state.attempted_frame_ids
+                and snapshot.motion_score
+                >= self.config.motion_changed_pixel_ratio
+                * MOTION_CONTINUE_THRESHOLD_RATIO
+                and (
+                    previous_attempt_at is None
+                    or (snapshot.observed_at - previous_attempt_at) * 1000.0
+                    >= spacing_ms
+                )
+                and crop_roi(
+                    snapshot.full_frame,
+                    self.config.roi_for(snapshot.direction),
+                )
+                is not None
+            ]
+            if not candidates:
+                has_meaningful_unused = any(
+                    snapshot.frame_id not in state.attempted_frame_ids
+                    and snapshot.motion_score
+                    >= self.config.motion_changed_pixel_ratio
+                    * MOTION_CONTINUE_THRESHOLD_RATIO
+                    for snapshot in event.frames
+                )
+                return DetectionJobResult(
+                    job=None,
+                    fallback_skipped_reason=(
+                        "fallback-spacing"
+                        if has_meaningful_unused and previous_attempt_at is not None
+                        else "no-meaningful-motion"
+                    ),
+                    **base_result,
+                )
+
+            selected = max(
+                candidates,
+                key=lambda snapshot: (
+                    snapshot.motion_score,
+                    _snapshot_roi_sharpness(snapshot, self.config.roi_for),
+                    snapshot.observed_at,
+                    snapshot.frame_id,
+                ),
+            )
+            time_since_previous_attempt_ms = (
+                None
+                if previous_attempt_at is None
+                else max(
+                    0.0,
+                    (selected.observed_at - previous_attempt_at) * 1000.0,
+                )
+            )
+            state.attempt_count += 1
+            state.last_attempt_at = selected.observed_at
+            state.attempted_frame_ids.add(selected.frame_id)
+            self._last_zero_detection_fallback_at[event.camera_id] = (
+                selected.observed_at
+            )
+            roi_crop = crop_roi(
+                selected.full_frame,
+                self.config.roi_for(selected.direction),
+            )
+            if roi_crop is None:
+                return DetectionJobResult(
+                    job=None,
+                    fallback_skipped_reason="no-meaningful-motion",
+                    **base_result,
+                )
+            full_frame = selected.full_frame
+            if full_frame.flags.writeable:
+                full_frame = full_frame.copy()
+                full_frame.setflags(write=False)
+            job = OcrJob(
+                camera_id=event.camera_id,
+                direction=event.direction,
+                captured_at=selected.captured_at,
+                observed_at=selected.observed_at,
+                received_at=selected.received_at,
+                queued_at=time.monotonic(),
+                full_frame=full_frame,
+                roi_crop=roi_crop,
+                ocr_crops=(roi_crop,),
+                detections=(),
+                used_roi_fallback=True,
+                fallback_reason="zero-detection-event-end",
+                detector_ms=0.0,
+                quality_score=ocr_job_quality_score((roi_crop,), ()),
+                job_type=OcrJobType.ZERO_DETECTION_FALLBACK,
+                frame_id=selected.frame_id,
+                detector_source="event-end",
+                ocr_crop_detections=(),
+            )
+            LOGGER.debug(
+                "Zero-detection fallback camera_id=%s event_id=%s "
+                "fallback_attempt=%s/%s frame_id=%s motion_score=%.4f "
+                "fallback_reason=event-end fallback_skipped_reason=none "
+                "time_since_previous_attempt_ms=%s event_frames=%s ring_depth=%s",
+                event.camera_id,
+                event.event_id,
+                state.attempt_count,
+                ZERO_DETECTION_FALLBACK_MAX_ATTEMPTS,
+                selected.frame_id,
+                selected.motion_score,
+                (
+                    "none"
+                    if time_since_previous_attempt_ms is None
+                    else f"{time_since_previous_attempt_ms:.1f}"
+                ),
+                len(event.frames),
+                ring_depth,
+            )
+            return DetectionJobResult(
+                job=job,
+                detections=(),
+                used_roi_fallback=True,
+                fallback_reason="zero-detection-event-end",
+                detector_ms=0.0,
+                roi_brightness=roi_mean_brightness(roi_crop),
+                motion_event_id=event.event_id,
+                fallback_attempt=state.attempt_count,
+                time_since_previous_attempt_ms=time_since_previous_attempt_ms,
+                motion_score=selected.motion_score,
+                event_frames=len(event.frames),
+                ring_depth=ring_depth,
+            )
+        finally:
+            self._zero_detection_events.pop(key, None)
+
+    def _remember_detector_crop_frame(self, camera_id: int, frame_id: int) -> None:
+        recent_set = self._detector_crop_frame_id_sets[camera_id]
+        if frame_id in recent_set:
+            return
+        recent = self._detector_crop_frame_ids[camera_id]
+        recent.append(frame_id)
+        recent_set.add(frame_id)
+        while len(recent) > RECENT_PROCESSED_FRAME_ID_LIMIT:
+            recent_set.discard(recent.popleft())
 
     def _log_detector_error(
         self,
@@ -2607,6 +2948,9 @@ class _PendingFrame:
     captured_at: datetime
     frame_id: int = 0
     motion_event_id: int | None = None
+    motion_score: float = 0.0
+    event_frames: int = 0
+    ring_depth: int = 0
 
 
 class PlateOcrWorker:
@@ -2760,6 +3104,9 @@ class PlateRecognitionWorker(QObject):
         )
         self._frame_buffer = PreDetectionFrameBuffer(config)
         self._replay_buffer = ReplayEventBuffer(config)
+        self._completed_motion_events: deque[MotionEvent] = deque(
+            maxlen=COMPLETED_MOTION_EVENT_LIMIT
+        )
         self._processed_frame_ids: dict[int, deque[int]] = defaultdict(deque)
         self._processed_frame_id_sets: dict[int, set[int]] = defaultdict(set)
         self._live_frames_since_replay = 0
@@ -2779,6 +3126,7 @@ class PlateRecognitionWorker(QObject):
             owned_frame = frame.copy()
         if isinstance(owned_frame, np.ndarray):
             owned_frame.setflags(write=False)
+            completed_events: tuple[MotionEvent, ...] = ()
             snapshot = FrameSnapshot(
                 frame_id=frame_id,
                 camera_id=camera_id,
@@ -2791,15 +3139,26 @@ class PlateRecognitionWorker(QObject):
             completed_events = self._frame_buffer.ingest(snapshot)
             for event in completed_events:
                 self._replay_buffer.add(event)
+            stored_snapshot = self._frame_buffer.snapshots(camera_id)[-1]
             motion_event_id = (
                 completed_events[-1].event_id
                 if completed_events
                 else self._frame_buffer.active_event_id(camera_id)
             )
+            event_frames = (
+                len(completed_events[-1].frames)
+                if completed_events
+                else self._frame_buffer.active_event_frame_count(camera_id)
+            )
+            ring_depth = self._frame_buffer.ring_depth(camera_id)
             self._log_ring_diagnostics(camera_id, observed_at)
             self._log_ingest_fps(camera_id, observed_at)
         else:
+            completed_events = ()
             motion_event_id = None
+            stored_snapshot = None
+            event_frames = 0
+            ring_depth = 0
         item = _PendingFrame(
             direction=direction,
             frame=owned_frame,
@@ -2808,8 +3167,16 @@ class PlateRecognitionWorker(QObject):
             captured_at=captured_at,
             frame_id=frame_id,
             motion_event_id=motion_event_id,
+            motion_score=(
+                stored_snapshot.motion_score
+                if stored_snapshot is not None
+                else 0.0
+            ),
+            event_frames=event_frames,
+            ring_depth=ring_depth,
         )
         with self._lock:
+            self._completed_motion_events.extend(completed_events)
             if camera_id not in self._known_camera_ids:
                 self._known_camera_ids.add(camera_id)
                 self._camera_order.append(camera_id)
@@ -2892,16 +3259,47 @@ class PlateRecognitionWorker(QObject):
                     )
                 )
                 if pending is None:
+                    completed_event = self._take_completed_motion_event(
+                        replay_enabled=(
+                            detector is not None
+                            and self.config.plate_detector.enabled
+                        )
+                    )
+                    if completed_event is not None:
+                        result = detector_processor.prepare_event_end_fallback(
+                            completed_event,
+                            ring_depth=self._frame_buffer.ring_depth(
+                                completed_event.camera_id
+                            ),
+                        )
+                        buffer_result = (
+                            self._job_buffer.add(result.job)
+                            if result.job is not None
+                            else None
+                        )
+                        self._log_event_end_fallback(
+                            completed_event,
+                            result,
+                            buffer_result,
+                        )
+                        continue
                     self._wake_event.wait(0.05)
                     self._wake_event.clear()
                     continue
                 source, camera_id, item = pending
                 if not self._claim_detector_frame(camera_id, item.frame_id):
                     LOGGER.debug(
-                        "Duplicate detector frame skipped camera_id=%s frame_id=%s source=%s",
+                        "Duplicate detector frame skipped camera_id=%s frame_id=%s "
+                        "source=%s motion_event_id=%s motion_score=%.4f "
+                        "fallback_skipped_reason=same-frame event_frames=%s "
+                        "ring_depth=%s",
                         camera_id,
                         item.frame_id,
                         source,
+                        item.motion_event_id,
+                        item.motion_score,
+                        item.event_frames,
+                        item.ring_depth,
                     )
                     continue
                 try:
@@ -2916,6 +3314,9 @@ class PlateRecognitionWorker(QObject):
                         detector_source=source,
                         allow_zero_detection_fallback=(source == "live"),
                         zero_detection_fallback_event_id=item.motion_event_id,
+                        motion_score=item.motion_score,
+                        event_frames=item.event_frames,
+                        ring_depth=item.ring_depth,
                     )
                 except Exception as exc:
                     LOGGER.exception("Transient plate detector error")
@@ -2963,6 +3364,7 @@ class PlateRecognitionWorker(QObject):
                 self._known_camera_ids.clear()
                 self._processed_frame_ids.clear()
                 self._processed_frame_id_sets.clear()
+                self._completed_motion_events.clear()
                 self._ingest_diagnostic_started_at.clear()
                 self._ingest_diagnostic_counts.clear()
             self.status_changed.emit(RecognitionStatus.STOPPED, "OCR durduruldu.")
@@ -3000,7 +3402,9 @@ class PlateRecognitionWorker(QObject):
             "fallback_reason=%s source=%s frame_id=%s original_frame_age_ms=%.1f "
             "replay_queue_depth=%s job_type=%s priority=%s detector_crop_count=%s "
             "accepted=%s replaced_job_type=%s drop_reason=%s coalesced=%s "
-            "fallback_skipped_reason=%s motion_active=%s motion_event_id=%s",
+            "fallback_skipped_reason=%s motion_active=%s motion_event_id=%s "
+            "fallback_attempt=%s/%s motion_score=%.4f "
+            "time_since_previous_attempt_ms=%s event_frames=%s ring_depth=%s",
             camera_id,
             item.direction.value,
             result.detector_ms,
@@ -3048,6 +3452,56 @@ class PlateRecognitionWorker(QObject):
             result.fallback_skipped_reason or "none",
             "yes" if result.motion_event_id is not None else "no",
             result.motion_event_id,
+            result.fallback_attempt,
+            ZERO_DETECTION_FALLBACK_MAX_ATTEMPTS,
+            result.motion_score,
+            (
+                "none"
+                if result.time_since_previous_attempt_ms is None
+                else f"{result.time_since_previous_attempt_ms:.1f}"
+            ),
+            result.event_frames,
+            result.ring_depth,
+        )
+
+    def _log_event_end_fallback(
+        self,
+        event: MotionEvent,
+        result: DetectionJobResult,
+        buffer_result: OcrBufferAddResult | None,
+    ) -> None:
+        if not LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        LOGGER.debug(
+            "Event-end fallback camera_id=%s event_id=%s fallback_attempt=%s/%s "
+            "frame_id=%s motion_score=%.4f fallback_reason=%s "
+            "fallback_skipped_reason=%s time_since_previous_attempt_ms=%s "
+            "event_frames=%s ring_depth=%s accepted=%s drop_reason=%s",
+            event.camera_id,
+            event.event_id,
+            result.fallback_attempt,
+            ZERO_DETECTION_FALLBACK_MAX_ATTEMPTS,
+            result.job.frame_id if result.job is not None else None,
+            result.motion_score,
+            result.fallback_reason or "none",
+            result.fallback_skipped_reason or "none",
+            (
+                "none"
+                if result.time_since_previous_attempt_ms is None
+                else f"{result.time_since_previous_attempt_ms:.1f}"
+            ),
+            result.event_frames,
+            result.ring_depth,
+            (
+                "no"
+                if buffer_result is None
+                else "yes" if buffer_result.accepted else "no"
+            ),
+            (
+                buffer_result.drop_reason
+                if buffer_result is not None and buffer_result.drop_reason is not None
+                else "none"
+            ),
         )
 
     def _log_ring_diagnostics(self, camera_id: int, now: float) -> None:
@@ -3135,9 +3589,10 @@ class PlateRecognitionWorker(QObject):
         return None
 
     def _take_replay_frame(self) -> tuple[str, int, _PendingFrame] | None:
-        snapshot = self._replay_buffer.take()
-        if snapshot is None:
+        replay_item = self._replay_buffer.take_with_event()
+        if replay_item is None:
             return None
+        snapshot = replay_item.snapshot
         return (
             "replay",
             snapshot.camera_id,
@@ -3148,8 +3603,24 @@ class PlateRecognitionWorker(QObject):
                 observed_at=snapshot.observed_at,
                 captured_at=snapshot.captured_at,
                 frame_id=snapshot.frame_id,
+                motion_event_id=replay_item.event_id,
+                motion_score=snapshot.motion_score,
+                event_frames=replay_item.event_frames,
+                ring_depth=self._frame_buffer.ring_depth(snapshot.camera_id),
             ),
         )
+
+    def _take_completed_motion_event(
+        self,
+        *,
+        replay_enabled: bool,
+    ) -> MotionEvent | None:
+        if not replay_enabled or self._replay_buffer.pending_event_count() > 0:
+            return None
+        with self._lock:
+            if self._latest_frames or not self._completed_motion_events:
+                return None
+            return self._completed_motion_events.popleft()
 
     def _claim_detector_frame(self, camera_id: int, frame_id: int) -> bool:
         recent_set = self._processed_frame_id_sets[camera_id]
