@@ -127,11 +127,13 @@ Same-camera same-plate duplicate cooldown: 120 saniye
 
 Detector açıkken OpenVINO modeli yalnızca yapılandırılmış ENTRY/EXIT ROI üzerinde çalışır. Yalnızca modelin `plate` sınıfı OCR'a gönderilir; `vehicle` sınıfı OCR'a gönderilmez. Detection confidence ve bbox alanına göre en iyi iki plaka crop'u seçilir. Detector exception verirse `fallback_to_roi_ocr=true` ile mevcut ROI OCR akışı korunur. Detector başarıyla çalışıp hiç kullanılabilir plate crop üretmezse safety fallback yalnız meaningful motion event içinde, 750 ms throttle'a da uyarak event başına en fazla bir kez denenir; statik yolda pahalı OCR çağrısı yapılmaz.
 
-Detector ve PaddleOCR ayrı worker'larda çalışır; OCR inference sürerken detector round-robin olarak her kameranın en yeni frame'ini işlemeye devam eder. Üretilen OCR job'ları kamera başına en fazla 3 adet RAM'de tutulur. ROI fallback job'ları OCR kuyruğunda 2500 ms, gerçek detector crop'ları ise uzun bir non-preemptive fallback sırasında kaybolmamaları için bounded olarak 12000 ms bekleyebilir. Job türleri açıkça `DETECTOR_CROP`, `DETECTOR_ERROR_FALLBACK` ve `ZERO_DETECTION_FALLBACK` olarak sınıflandırılır. Tüketici önce detector crop'larını, sonra detector-error fallback'lerini, son olarak zero-detection fallback'lerini seçer; her öncelik seviyesinde ENTRY/EXIT round-robin adaleti korunur. Buffer dolduğunda düşük öncelikli job önce evict edilir; yalnız aynı öncelikte detector confidence, crop alanı ve Laplacian sharpness kullanan ucuz kalite skoru karşılaştırılır. Kamera başına her fallback türünden en fazla bir pending job tutulur, böylece tekrar eden fallback'ler coalesce edilir ve gerçek detector crop'larını dolduramaz. OCR job, crop ile birlikte aynı immutable full camera frame referansını ve frame zamanlarını taşıdığı için confirmation gözlem zamanı ile confirmed-record JPEG'i doğru frame'e bağlı kalır. Video veya sürekli frame kaydı yapılmaz.
+Detector ve PaddleOCR ayrı worker'larda çalışır; OCR inference sürerken detector round-robin olarak her kameranın en yeni frame'ini işlemeye devam eder. Üretilen OCR job'ları kamera başına en fazla 3 adet RAM'de tutulur. ROI fallback job'ları OCR kuyruğunda 2500 ms, gerçek detector crop'ları ise uzun bir non-preemptive fallback sırasında kaybolmamaları için bounded olarak 12000 ms bekleyebilir. Job türleri açıkça `DETECTOR_CROP`, `DETECTOR_ERROR_FALLBACK`, `ZERO_DETECTION_FALLBACK` ve en düşük öncelikli `STATIC_ZERO_DETECTION_RESCUE` olarak sınıflandırılır. Tüketici yüksek öncelikli detector crop'larından başlayarak işler; her öncelik seviyesinde ENTRY/EXIT round-robin adaleti korunur. Buffer dolduğunda düşük öncelikli job önce evict edilir; yalnız aynı öncelikte detector confidence, crop alanı ve Laplacian sharpness kullanan ucuz kalite skoru karşılaştırılır. Kamera başına her fallback türü bounded tutulur, böylece tekrar eden fallback'ler gerçek detector crop'larını dolduramaz. OCR job, crop ile birlikte aynı immutable full camera frame referansını ve frame zamanlarını taşıdığı için confirmation gözlem zamanı ile confirmed-record JPEG'i doğru frame'e bağlı kalır. Video veya sürekli frame kaydı yapılmaz.
 
 UI preview ve recognition frame yolları ayrıdır. `CameraWorker` tarafından worker seviyesinde throttle edilip bir kez kopyalanan frame önce `analysis_frame_ready` üzerinden doğrudan thread-safe recognition ingest yoluna bırakılır. Aynı immutable ndarray daha sonra UI için latest-frame coalescing'e girer; yavaş UI event loop analysis ring'e ulaşan frameleri düşürmez. Recognition ingest callback'i UI/SQLite/inference çalıştırmaz ve kamera yönünü startup'ta hazırlanan runtime cache'den okur.
 
-Zero-detection ROI fallback yalnız meaningful motion event sırasında veya event kapanış frame'inde üretilebilir ve aynı kamera/motion event için en fazla bir kez çalışır. Boş/statik yolda 750 ms aralıkla full ROI OCR başlatılmaz. Historical replay frame'lerinde detector crop bulunursa yüksek öncelikli OCR korunur; zero detection durumunda her replay frame için full ROI OCR çalıştırılmaz. Detector-error fallback bu motion kuralından bağımsız kalır.
+Zero-detection ROI fallback yalnız meaningful motion event sırasında veya event kapanış frame'inde üretilebilir. İki denemelik toplam bütçenin yalnız ilki live yolda harcanabilir; ikinci deneme olay sonundaki daha geç ve daha kaliteli frame için ayrılır. Böylece araç uzaktayken yapılan erken deneme, yakın/okunaklı son kareyi kör bırakmaz. Historical replay frame'lerinde zero detection için full ROI OCR çalıştırılmaz. Motion üretmeyen fakat detector'ın sürekli kaçırdığı sabit araç için 2500 ms warm-up/cooldown'lu, tek pending job'lı ve en düşük öncelikli static rescue korunur. Detector-error fallback bu motion kuralından bağımsız kalır.
+
+Geniş ROI doğrudan 256×256 model girişine dönüştürüldüğünde yatay ve dikey ölçekler DEBUG logunda ayrıca raporlanır. Birincil detector ve kontrollü shadow pass sonuç vermezse en fazla üç örtüşen yatay tile üzerinde bounded recovery çalışır; tile koordinatları tekrar original ROI koordinatlarına çevrilir ve çakışan sonuçlar birleştirilir. Tile recovery crop'ları küçük plaka çevresindeki bağlamı kaybetmemek için ayrı `tiled_recovery_crop_padding_ratio=0.5` ayarını kullanır; normal detector crop padding'i `0.15` kalır. Başarılı birincil detector çağrısında tile maliyeti yoktur.
 
 Detector crop preprocessing'i değiştirilmemiştir. Full ROI fallback ise maksimum 960 px genişlikte iki hafif variant kullanır: önce compact color variant tek başına denenir; geçerli ve minimum kaliteyi geçen plaka bulunamazsa CLAHE/low-light enhanced ikinci variant ayrı çağrıda denenir. Böylece büyük ENTRY ROI için 2x upscale dahil 3–4 variantı tek Paddle çağrısına verme kaldırılmıştır. PaddleOCR CPU kullanımı desteklenen `cpu_threads=4` ayarıyla sınırlandırılarak OpenVINO detector'ın CPU starvation riski azaltılır.
 
@@ -149,6 +151,7 @@ Varsayılan detector ayarları:
   "backend": "openvino",
   "min_confidence": 0.15,
   "crop_padding_ratio": 0.15,
+  "tiled_recovery_crop_padding_ratio": 0.5,
   "max_plate_candidates_per_frame": 2,
   "fallback_to_roi_ocr": true,
   "zero_detection_roi_fallback_enabled": true,
@@ -170,7 +173,7 @@ models/plate_detector/vehicle-license-plate-detection-barrier-0123/
 
 Runtime model indirmez ve internete bağlanmaz. Model bulunamazsa açık diagnostic üretilir; fallback açıksa uygulama mevcut ROI OCR hattıyla çalışmaya devam eder. `debug_overlay=true` olduğunda yalnızca ADMIN dashboard preview kopyasında `PLATE 87%` benzeri kutular çizilir. Kaydedilen araç JPEG'i orijinal full frame olmaya devam eder.
 
-Bu Open Model Zoo modeli MobileNetV2 + SSD tabanlı generic/pretrained bir araç ve plaka detector'ıdır; Türk plakaları için özel eğitilmiş değildir. Resmî model açıklamasında doğrulama alanı Çin plakaları/önden görünen araçlar olarak belirtilir. Türk plaka performansı M15/M16 saha görüntülerinde ayrıca ölçülmelidir.
+Bu Open Model Zoo modeli MobileNetV2 + SSD tabanlı generic/pretrained bir araç ve plaka detector'ıdır; Türk plakaları için özel eğitilmiş değildir. Resmî model açıklamasında doğrulama alanı Çin plakaları/önden görünen araçlar ve minimum 96 piksel plaka genişliği olarak belirtilir. Türk plaka performansı saha görüntülerinde ayrıca ölçülmelidir. Model değiştirilmemiştir; production offline model ve Apache-2.0 bildirim sınırı korunur.
 
 Throttle edilmiş DEBUG diagnostic örneği:
 
@@ -178,12 +181,25 @@ Throttle edilmiş DEBUG diagnostic örneği:
 OCR diagnostics camera_id=2 direction=EXIT roi=1280x460 detector_ms=12.0 plates=0 det_conf=none plate_crops=1280x460 ocr_ms=75.0 total_recognition_ms=87.0 fallback=roi fallback_reason=zero-detection candidate=yes
 ```
 
-Aynı saha frame'inde detector açık/kapalı karşılaştırması:
+Aynı saha frame'inde gerçek OpenVINO/PaddleOCR aşamalarını karşılaştırma:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\test_plate_ocr.py frame.jpg --direction EXIT --detector-mode on --save-debug debug\detector-on
-.\.venv\Scripts\python.exe scripts\test_plate_ocr.py frame.jpg --direction EXIT --detector-mode off --save-debug debug\detector-off
+.\.venv\Scripts\python.exe scripts\test_plate_ocr.py frame.jpg --direction EXIT --mode detector-only --save-debug debug\detector-only
+.\.venv\Scripts\python.exe scripts\test_plate_ocr.py frame.jpg --direction EXIT --mode detector-ocr --save-debug debug\detector-ocr
+.\.venv\Scripts\python.exe scripts\test_plate_ocr.py frame.jpg --direction EXIT --mode roi-ocr --save-debug debug\roi-ocr
+.\.venv\Scripts\python.exe scripts\test_plate_ocr.py frame.jpg --direction EXIT --mode compare --save-debug debug\compare
 ```
+
+`compare`, doğrudan resize, aspect-preserving letterbox ve bounded tile detector sonuçlarını; ardından detector-crop OCR ile full-ROI OCR ham segmentlerini aynı process içinde raporlar. Normal UI'yi veya production ayarlarını değiştirmez.
+
+Canlı recognition hattına giren bir sonraki immutable raw frame'i development tanısı için tek sefer kaydetmek gerekirse uygulamayı aynı PowerShell oturumunda şu şekilde başlatın:
+
+```powershell
+$env:CAMERBOUND_CAPTURE_NEXT_RECOGNITION_FRAME="1"
+.\run.bat
+```
+
+Yalnız ilk detector frame'i `debug/recognition-frames/` altına yazılır; klasör Git tarafından yok sayılır ve özellik varsayılan olarak kapalıdır. DEBUG OCR diagnostics, worker aşaması, job türü, fallback nedeni, raw OCR segmenti, normalize/valid aday sonucu ve nihai rejection state'ini birlikte raporlar.
 
 ### Detector modelini geliştirme ortamında hazırlama
 

@@ -32,6 +32,7 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                                 "backend": "openvino",
                                 "min_confidence": 0.50,
                                 "crop_padding_ratio": 0.15,
+                                "tiled_recovery_crop_padding_ratio": 0.5,
                                 "max_plate_candidates_per_frame": 2,
                                 "fallback_to_roi_ocr": True,
                                 "zero_detection_roi_fallback_enabled": True,
@@ -56,6 +57,7 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(detector.backend, "openvino")
         self.assertEqual(detector.min_confidence, 0.50)
         self.assertEqual(detector.crop_padding_ratio, 0.15)
+        self.assertEqual(detector.tiled_recovery_crop_padding_ratio, 0.5)
         self.assertEqual(detector.max_plate_candidates_per_frame, 2)
         self.assertTrue(detector.fallback_to_roi_ocr)
         self.assertTrue(detector.zero_detection_roi_fallback_enabled)
@@ -99,6 +101,7 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                                 "backend": "unknown",
                                 "min_confidence": 2,
                                 "crop_padding_ratio": -1,
+                                "tiled_recovery_crop_padding_ratio": 2,
                                 "max_plate_candidates_per_frame": 0,
                                 "fallback_to_roi_ocr": "yes",
                                 "zero_detection_roi_fallback_enabled": "yes",
@@ -120,6 +123,7 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(detector.backend, "openvino")
         self.assertEqual(detector.min_confidence, 0.50)
         self.assertEqual(detector.crop_padding_ratio, 0.15)
+        self.assertEqual(detector.tiled_recovery_crop_padding_ratio, 0.5)
         self.assertEqual(detector.max_plate_candidates_per_frame, 2)
         self.assertTrue(detector.fallback_to_roi_ocr)
         self.assertTrue(detector.zero_detection_roi_fallback_enabled)

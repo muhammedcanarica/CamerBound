@@ -32,6 +32,7 @@ DEFAULT_CAPTURE_JPEG_QUALITY = 60
 PLATE_DETECTOR_MODEL_NAME = "vehicle-license-plate-detection-barrier-0123"
 DEFAULT_PLATE_DETECTOR_MIN_CONFIDENCE = 0.50
 DEFAULT_PLATE_DETECTOR_CROP_PADDING_RATIO = 0.15
+DEFAULT_TILED_RECOVERY_CROP_PADDING_RATIO = 0.50
 DEFAULT_MAX_PLATE_CANDIDATES_PER_FRAME = 2
 DEFAULT_ZERO_DETECTION_ROI_FALLBACK_ENABLED = True
 DEFAULT_ZERO_DETECTION_ROI_FALLBACK_INTERVAL_MS = 750
@@ -70,6 +71,9 @@ class PlateDetectorConfig:
     backend: str = "openvino"
     min_confidence: float = DEFAULT_PLATE_DETECTOR_MIN_CONFIDENCE
     crop_padding_ratio: float = DEFAULT_PLATE_DETECTOR_CROP_PADDING_RATIO
+    tiled_recovery_crop_padding_ratio: float = (
+        DEFAULT_TILED_RECOVERY_CROP_PADDING_RATIO
+    )
     max_plate_candidates_per_frame: int = DEFAULT_MAX_PLATE_CANDIDATES_PER_FRAME
     fallback_to_roi_ocr: bool = True
     zero_detection_roi_fallback_enabled: bool = (
@@ -562,6 +566,15 @@ def _load_plate_detector(
             1.0,
             float,
             "plate_detector.crop_padding_ratio",
+            warnings,
+        ),
+        tiled_recovery_crop_padding_ratio=_bounded_number(
+            raw.get("tiled_recovery_crop_padding_ratio"),
+            DEFAULT_TILED_RECOVERY_CROP_PADDING_RATIO,
+            0.0,
+            1.0,
+            float,
+            "plate_detector.tiled_recovery_crop_padding_ratio",
             warnings,
         ),
         max_plate_candidates_per_frame=_bounded_number(

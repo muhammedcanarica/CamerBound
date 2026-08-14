@@ -95,9 +95,11 @@ PENDING_DECISION_CAMERA_LIMIT = 16
 PENDING_DECISION_OBSERVATION_LIMIT = 32
 PENDING_DECISION_PLATE_LIMIT = 8
 ZERO_DETECTION_FALLBACK_MAX_ATTEMPTS = 2
+ZERO_DETECTION_LIVE_FALLBACK_MAX_ATTEMPTS = 1
 ZERO_DETECTION_FALLBACK_MIN_SPACING_MS = 1_000
 ZERO_DETECTION_EVENT_STATE_LIMIT = 32
 COMPLETED_MOTION_EVENT_LIMIT = 32
+RAW_RECOGNITION_CAPTURE_ENV = "CAMERBOUND_CAPTURE_NEXT_RECOGNITION_FRAME"
 
 
 def _log_plate_detector_diagnostics(
@@ -134,7 +136,9 @@ def _log_plate_detector_diagnostics(
         "detections=%s raw_candidates=%s plate_class_candidates=%s "
         "highest_plate_confidence=%s confidence_rejected=%s bbox_rejected=%s "
         "detector_input=%sx%s input_layout=%s input_dtype=%s roi_size=%sx%s "
-        "raw_detector_ms=%.1f enhanced_detector_ms=%.1f detector_latency_ms=%.1f",
+        "resize_scale_x=%.4f resize_scale_y=%.4f aspect_distortion_ratio=%.2f "
+        "tiled_recovery=%s recovery_tiles=%s raw_detector_ms=%.1f "
+        "enhanced_detector_ms=%.1f tiled_detector_ms=%.1f detector_latency_ms=%.1f",
         camera_id,
         source,
         diagnostics.detector_variant,
@@ -158,9 +162,19 @@ def _log_plate_detector_diagnostics(
         diagnostics.input_dtype,
         roi_crop.shape[1],
         roi_crop.shape[0],
+        diagnostics.resize_scale_x,
+        diagnostics.resize_scale_y,
+        diagnostics.aspect_distortion_ratio,
+        "yes" if diagnostics.tiled_recovery_pass else "no",
+        diagnostics.recovery_tile_count,
         diagnostics.raw_detector_ms,
         diagnostics.enhanced_detector_ms,
-        diagnostics.raw_detector_ms + diagnostics.enhanced_detector_ms,
+        diagnostics.tiled_detector_ms,
+        (
+            diagnostics.raw_detector_ms
+            + diagnostics.enhanced_detector_ms
+            + diagnostics.tiled_detector_ms
+        ),
     )
 
 
@@ -1259,6 +1273,9 @@ class PlateDetectionProcessor:
         self._last_static_rescue_at: dict[int, float] = {}
         self._last_valid_candidate_at: dict[int, float] = {}
         self._rescue_state_lock = threading.Lock()
+        self._raw_capture_pending = (
+            os.getenv(RAW_RECOGNITION_CAPTURE_ENV, "").strip() == "1"
+        )
 
     def prepare_job(
         self,
@@ -1280,6 +1297,7 @@ class PlateDetectionProcessor:
         roi_crop = crop_roi(frame, self.config.roi_for(direction))
         if roi_crop is None:
             return DetectionJobResult(None, (), False, None, 0.0, 0.0)
+        self._capture_raw_frame_once(camera_id, direction, frame)
 
         detector_started_at = time.perf_counter()
         detector_config = self.config.plate_detector
@@ -1290,12 +1308,22 @@ class PlateDetectionProcessor:
         fallback_reason = "detector-disabled" if used_roi_fallback else None
         ocr_crops: list[np.ndarray] = []
         fallback_skipped_reason: str | None = None
+        tiled_recovery = False
         fallback_attempt = 0
         time_since_previous_attempt_ms: float | None = None
 
         if detector_config.enabled and self.detector is not None:
             try:
                 detections = self.detector.detect(roi_crop)
+                tiled_recovery = (
+                    getattr(self.detector, "last_diagnostics", None) is not None
+                    and getattr(
+                        self.detector.last_diagnostics,
+                        "detector_variant",
+                        None,
+                    )
+                    == "tiled"
+                )
                 _log_plate_detector_diagnostics(
                     camera_id,
                     detector_source,
@@ -1324,7 +1352,11 @@ class PlateDetectionProcessor:
                     plate_crop = crop_padded_plate(
                         roi_crop,
                         detection,
-                        detector_config.crop_padding_ratio,
+                        (
+                            detector_config.tiled_recovery_crop_padding_ratio
+                            if tiled_recovery
+                            else detector_config.crop_padding_ratio
+                        ),
                     )
                     if plate_crop is not None:
                         ocr_crops.append(plate_crop)
@@ -1514,6 +1546,35 @@ class PlateDetectionProcessor:
         )
         return True, "none"
 
+    def _capture_raw_frame_once(
+        self,
+        camera_id: int,
+        direction: Direction,
+        frame: object,
+    ) -> None:
+        if not self._raw_capture_pending or not isinstance(frame, np.ndarray):
+            return
+        self._raw_capture_pending = False
+        try:
+            output_dir = application_root() / "debug" / "recognition-frames"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            output_path = output_dir / (
+                f"camera-{camera_id}-{direction.value.lower()}-{timestamp}.jpg"
+            )
+            if cv2.imwrite(str(output_path), frame):
+                LOGGER.info("One-shot recognition frame captured path=%s", output_path)
+            else:
+                LOGGER.warning(
+                    "One-shot recognition frame capture failed path=%s",
+                    output_path,
+                )
+        except OSError as exc:
+            LOGGER.warning(
+                "One-shot recognition frame capture failed error_type=%s",
+                type(exc).__name__,
+            )
+
     def note_valid_candidate(self, camera_id: int, observed_at: float) -> None:
         with self._rescue_state_lock:
             self._last_valid_candidate_at[camera_id] = observed_at
@@ -1540,8 +1601,8 @@ class PlateDetectionProcessor:
         state = self._event_state(camera_id, motion_event_id)
         if frame_id is not None and frame_id in state.attempted_frame_ids:
             return False, "same-frame", state.attempt_count, None
-        if state.attempt_count >= ZERO_DETECTION_FALLBACK_MAX_ATTEMPTS:
-            return False, "fallback-limit", state.attempt_count, None
+        if state.attempt_count >= ZERO_DETECTION_LIVE_FALLBACK_MAX_ATTEMPTS:
+            return False, "event-end-attempt-reserved", state.attempt_count, None
         if (
             motion_score is not None
             and motion_score
@@ -1706,9 +1767,9 @@ class PlateDetectionProcessor:
             selected = max(
                 candidates,
                 key=lambda snapshot: (
-                    snapshot.motion_score,
                     _snapshot_roi_sharpness(snapshot, self.config.roi_for),
                     snapshot.observed_at,
+                    snapshot.motion_score,
                     snapshot.frame_id,
                 ),
             )
@@ -1883,10 +1944,20 @@ class PlateRecognitionProcessor:
         fallback_reason = "detector-disabled" if used_roi_fallback else None
         ocr_crops: list[np.ndarray] = []
         ocr_crop_detections: list[PlateDetection | None] = []
+        tiled_recovery = False
 
         if detector_config.enabled and self.detector is not None:
             try:
                 detections = self.detector.detect(roi_crop)
+                tiled_recovery = (
+                    getattr(self.detector, "last_diagnostics", None) is not None
+                    and getattr(
+                        self.detector.last_diagnostics,
+                        "detector_variant",
+                        None,
+                    )
+                    == "tiled"
+                )
                 _log_plate_detector_diagnostics(
                     camera_id,
                     "live",
@@ -1919,7 +1990,11 @@ class PlateRecognitionProcessor:
                     plate_crop = crop_padded_plate(
                         roi_crop,
                         detection,
-                        detector_config.crop_padding_ratio,
+                        (
+                            detector_config.tiled_recovery_crop_padding_ratio
+                            if tiled_recovery
+                            else detector_config.crop_padding_ratio
+                        ),
                     )
                     if plate_crop is not None:
                         ocr_crops.append(plate_crop)
@@ -2135,6 +2210,7 @@ class PlateRecognitionProcessor:
         self._log_queued_ocr_diagnostics(
             job=job,
             variants=attempted_variants,
+            segments=segments,
             queue_depth=queue_depth,
             ocr_started_at=ocr_started_at,
             preprocess_ms=preprocess_ms,
@@ -2966,6 +3042,7 @@ class PlateRecognitionProcessor:
         *,
         job: OcrJob,
         variants: Sequence[np.ndarray],
+        segments: Sequence[OcrSegment],
         queue_depth: int,
         ocr_started_at: float,
         preprocess_ms: float,
@@ -3004,7 +3081,7 @@ class PlateRecognitionProcessor:
             "preprocess_ms=%.1f inference_ms=%.1f end_to_end_ms=%.1f "
             "job_type=%s priority=%s source=%s frame_id=%s fallback_reason=%s "
             "candidate=%s recognition_state=%s candidate_rejection_reason=%s "
-            "confirmation=%s/%s",
+            "confirmation=%s/%s raw_ocr_segments=%s",
             job.camera_id,
             job.direction.value,
             brightness,
@@ -3025,6 +3102,7 @@ class PlateRecognitionProcessor:
             candidate_rejection_reason,
             outcome.confirmation_count,
             outcome.confirmation_required,
+            _format_raw_ocr_segments(segments),
         )
 
     def _log_detector_error(
@@ -4064,6 +4142,22 @@ def _image_resolution(image: object) -> str:
     if not isinstance(image, np.ndarray) or image.ndim < 2:
         return "unknown"
     return f"{image.shape[1]}x{image.shape[0]}"
+
+
+def _format_raw_ocr_segments(segments: Sequence[OcrSegment]) -> str:
+    if not segments:
+        return "none"
+    values: list[str] = []
+    for segment in segments[:12]:
+        raw = segment.text.replace("|", "/").replace("\n", " ")[:48]
+        corrected = correct_plate_candidate(segment.text)
+        values.append(
+            f"v{segment.variant_index}:{raw!r}:{segment.confidence:.3f}:"
+            f"{corrected or 'invalid'}"
+        )
+    if len(segments) > len(values):
+        values.append(f"+{len(segments) - len(values)}-more")
+    return "|".join(values)
 
 
 def select_best_candidate(

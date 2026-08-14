@@ -34,6 +34,7 @@
       "backend": "openvino",
       "min_confidence": 0.15,
       "crop_padding_ratio": 0.15,
+      "tiled_recovery_crop_padding_ratio": 0.5,
       "max_plate_candidates_per_frame": 2,
       "fallback_to_roi_ocr": true,
       "zero_detection_roi_fallback_enabled": true,

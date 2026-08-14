@@ -25,6 +25,9 @@ HIGHLIGHT_PERCENTILE = 0.90
 SHADOW_LIFT_GAMMA = 0.72
 SHADOW_CLAHE_CLIP_LIMIT = 2.0
 SHADOW_CLAHE_GRID_SIZE = (8, 8)
+DETECTOR_RECOVERY_TILE_ASPECT_RATIO = 2.0
+DETECTOR_RECOVERY_TILE_MIN_WIDTH = 384
+DETECTOR_RECOVERY_MAX_TILES = 3
 
 
 class PlateDetectorError(RuntimeError):
@@ -85,6 +88,12 @@ class DetectorDiagnostics:
     highest_plate_confidence: float | None = None
     confidence_rejected_count: int = 0
     bbox_rejected_count: int = 0
+    resize_scale_x: float = 0.0
+    resize_scale_y: float = 0.0
+    aspect_distortion_ratio: float = 1.0
+    tiled_recovery_pass: bool = False
+    recovery_tile_count: int = 0
+    tiled_detector_ms: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,38 +188,73 @@ class OpenVinoPlateDetector:
             return raw_detections
 
         lighting = measure_detector_lighting(image)
-        if not lighting.is_difficult:
-            self.last_diagnostics = DetectorDiagnostics(
-                detector_variant="raw",
-                raw_brightness=lighting.mean_brightness,
-                shadow_metric=lighting.shadow_metric,
-                enhanced_pass=False,
-                raw_detector_ms=raw_detector_ms,
-                enhanced_detector_ms=0.0,
-                detections=0,
-                **self._diagnostic_context(image, raw_parse),
+        enhanced_detections: list[PlateDetection] = []
+        enhanced_detector_ms = 0.0
+        enhanced_pass = lighting.is_difficult
+        if enhanced_pass:
+            enhanced = enhance_shadowed_detector_image(image)
+            enhanced_started_at = time.perf_counter()
+            enhanced_detections, enhanced_parse = self._infer_detections(
+                enhanced,
+                coordinate_width=image.shape[1],
+                coordinate_height=image.shape[0],
             )
-            return []
+            enhanced_detector_ms = (
+                time.perf_counter() - enhanced_started_at
+            ) * 1000.0
+            if enhanced_detections:
+                self.last_diagnostics = DetectorDiagnostics(
+                    detector_variant="enhanced",
+                    raw_brightness=lighting.mean_brightness,
+                    shadow_metric=lighting.shadow_metric,
+                    enhanced_pass=True,
+                    raw_detector_ms=raw_detector_ms,
+                    enhanced_detector_ms=enhanced_detector_ms,
+                    detections=len(enhanced_detections),
+                    **self._diagnostic_context(image, enhanced_parse),
+                )
+                return enhanced_detections
 
-        enhanced = enhance_shadowed_detector_image(image)
-        enhanced_started_at = time.perf_counter()
-        enhanced_detections, enhanced_parse = self._infer_detections(
-            enhanced,
-            coordinate_width=image.shape[1],
-            coordinate_height=image.shape[0],
-        )
-        enhanced_detector_ms = (time.perf_counter() - enhanced_started_at) * 1000.0
+        tiles = detector_recovery_tiles(image)
+        tiled_started_at = time.perf_counter()
+        tiled_detections: list[PlateDetection] = []
+        tiled_parse = SsdParseDiagnostics(0, 0, None, 0, 0)
+        for x_offset, tile in tiles:
+            tile_detections, tile_parse = self._infer_detections(
+                tile,
+                coordinate_width=tile.shape[1],
+                coordinate_height=tile.shape[0],
+            )
+            tiled_detections.extend(
+                PlateDetection(
+                    confidence=detection.confidence,
+                    x=detection.x + x_offset,
+                    y=detection.y,
+                    width=detection.width,
+                    height=detection.height,
+                )
+                for detection in tile_detections
+            )
+            tiled_parse = _merge_parse_diagnostics(tiled_parse, tile_parse)
+        tiled_detector_ms = (time.perf_counter() - tiled_started_at) * 1000.0
+        tiled_detections = _deduplicate_detections(tiled_detections)
+        final_parse = tiled_parse if tiles else raw_parse
         self.last_diagnostics = DetectorDiagnostics(
-            detector_variant="enhanced",
+            detector_variant="tiled" if tiled_detections else (
+                "enhanced" if enhanced_pass else "raw"
+            ),
             raw_brightness=lighting.mean_brightness,
             shadow_metric=lighting.shadow_metric,
-            enhanced_pass=True,
+            enhanced_pass=enhanced_pass,
             raw_detector_ms=raw_detector_ms,
             enhanced_detector_ms=enhanced_detector_ms,
-            detections=len(enhanced_detections),
-            **self._diagnostic_context(image, enhanced_parse),
+            detections=len(tiled_detections),
+            tiled_recovery_pass=bool(tiles),
+            recovery_tile_count=len(tiles),
+            tiled_detector_ms=tiled_detector_ms,
+            **self._diagnostic_context(image, final_parse),
         )
-        return enhanced_detections
+        return tiled_detections
 
     def _infer_detections(
         self,
@@ -247,6 +291,8 @@ class OpenVinoPlateDetector:
         image: np.ndarray,
         parse: SsdParseDiagnostics,
     ) -> dict[str, object]:
+        scale_x = self._input_width / max(1, image.shape[1])
+        scale_y = self._input_height / max(1, image.shape[0])
         return {
             "input_width": self._input_width,
             "input_height": self._input_height,
@@ -259,7 +305,92 @@ class OpenVinoPlateDetector:
             "highest_plate_confidence": parse.highest_plate_confidence,
             "confidence_rejected_count": parse.confidence_rejected_count,
             "bbox_rejected_count": parse.bbox_rejected_count,
+            "resize_scale_x": scale_x,
+            "resize_scale_y": scale_y,
+            "aspect_distortion_ratio": max(scale_x, scale_y) / max(
+                min(scale_x, scale_y), 1e-9
+            ),
         }
+
+
+def detector_recovery_tiles(
+    image: np.ndarray,
+    *,
+    maximum: int = DETECTOR_RECOVERY_MAX_TILES,
+) -> tuple[tuple[int, np.ndarray], ...]:
+    """Return bounded horizontal views that preserve more small-plate pixels."""
+    height, width = image.shape[:2]
+    tile_width = min(
+        width,
+        max(
+            DETECTOR_RECOVERY_TILE_MIN_WIDTH,
+            round(height * DETECTOR_RECOVERY_TILE_ASPECT_RATIO),
+        ),
+    )
+    maximum = max(0, maximum)
+    if maximum == 0 or tile_width >= width:
+        return ()
+    tile_count = min(maximum, math.ceil(width / tile_width) + 1)
+    starts = {
+        round(index * (width - tile_width) / max(1, tile_count - 1))
+        for index in range(tile_count)
+    }
+    return tuple(
+        (start, image[:, start : start + tile_width]) for start in sorted(starts)
+    )
+
+
+def _merge_parse_diagnostics(
+    first: SsdParseDiagnostics,
+    second: SsdParseDiagnostics,
+) -> SsdParseDiagnostics:
+    confidences = tuple(
+        value
+        for value in (
+            first.highest_plate_confidence,
+            second.highest_plate_confidence,
+        )
+        if value is not None
+    )
+    return SsdParseDiagnostics(
+        raw_candidate_count=first.raw_candidate_count + second.raw_candidate_count,
+        plate_class_candidate_count=(
+            first.plate_class_candidate_count + second.plate_class_candidate_count
+        ),
+        highest_plate_confidence=max(confidences) if confidences else None,
+        confidence_rejected_count=(
+            first.confidence_rejected_count + second.confidence_rejected_count
+        ),
+        bbox_rejected_count=first.bbox_rejected_count + second.bbox_rejected_count,
+    )
+
+
+def _deduplicate_detections(
+    detections: Sequence[PlateDetection],
+) -> list[PlateDetection]:
+    kept: list[PlateDetection] = []
+    for detection in sorted(
+        detections,
+        key=lambda item: (item.confidence, item.area),
+        reverse=True,
+    ):
+        if any(_intersection_over_union(detection, other) >= 0.50 for other in kept):
+            continue
+        kept.append(detection)
+    return kept
+
+
+def _intersection_over_union(
+    first: PlateDetection,
+    second: PlateDetection,
+) -> float:
+    x1 = max(first.x, second.x)
+    y1 = max(first.y, second.y)
+    x2 = min(first.x + first.width, second.x + second.width)
+    y2 = min(first.y + first.height, second.y + second.height)
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    union = first.area + second.area - intersection
+    return intersection / union if union > 0 else 0.0
 
 
 def measure_detector_lighting(image: np.ndarray) -> DetectorLightingMetrics:

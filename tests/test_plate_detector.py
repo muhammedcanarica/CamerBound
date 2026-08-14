@@ -12,6 +12,7 @@ from app.plate_detector import (
     PlateDetection,
     PlateDetectorModelNotFound,
     crop_padded_plate,
+    detector_recovery_tiles,
     enhance_shadowed_detector_image,
     measure_detector_lighting,
     parse_ssd_plate_detections,
@@ -137,6 +138,47 @@ def _make_sequenced_detector(
 
 
 class PlateDetectorTests(unittest.TestCase):
+    def test_recovery_tiles_are_horizontal_overlapping_and_bounded(self) -> None:
+        image = np.zeros((256, 956, 3), dtype=np.uint8)
+
+        tiles = detector_recovery_tiles(image)
+
+        self.assertEqual([offset for offset, _tile in tiles], [0, 222, 444])
+        self.assertEqual([tile.shape for _offset, tile in tiles], [(256, 512, 3)] * 3)
+        self.assertTrue(all(np.shares_memory(image, tile) for _offset, tile in tiles))
+
+    def test_direct_miss_is_recovered_by_bounded_tile_and_maps_coordinates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [
+                    _empty_ssd_output(),
+                    _empty_ssd_output(),
+                    _plate_ssd_output(
+                        0.80,
+                        x_min=0.20,
+                        y_min=0.20,
+                        x_max=0.40,
+                        y_max=0.40,
+                    ),
+                    _empty_ssd_output(),
+                ],
+            )
+
+            detections = detector.detect(
+                np.full((256, 956, 3), 120, dtype=np.uint8)
+            )
+
+        self.assertEqual(request.calls, 4)
+        self.assertEqual(len(detections), 1)
+        self.assertEqual(
+            (detections[0].x, detections[0].y, detections[0].width, detections[0].height),
+            (324, 51, 103, 51),
+        )
+        self.assertEqual(detector.last_diagnostics.detector_variant, "tiled")
+        self.assertTrue(detector.last_diagnostics.tiled_recovery_pass)
+        self.assertEqual(detector.last_diagnostics.recovery_tile_count, 3)
+
     def test_bright_raw_miss_does_not_run_enhanced_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             detector, request = _make_sequenced_detector(
@@ -299,6 +341,7 @@ class PlateDetectorTests(unittest.TestCase):
         self.assertEqual(diagnostics.input_layout, "NHWC")
         self.assertEqual(diagnostics.input_dtype, "uint8")
         self.assertEqual((diagnostics.roi_width, diagnostics.roi_height), (200, 100))
+        self.assertAlmostEqual(diagnostics.aspect_distortion_ratio, 2.0)
         self.assertEqual(request.tensors[0].shape, (1, 256, 256, 3))
         self.assertEqual(request.tensors[0].dtype, np.uint8)
         np.testing.assert_array_equal(request.tensors[0][0, 0, 0], [11, 22, 33])
