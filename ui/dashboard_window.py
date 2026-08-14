@@ -42,6 +42,9 @@ from ui.records_widget import (
 )
 
 
+AUTO_REFRESH_INTERVAL_MS = 5_000
+
+
 @dataclass(slots=True)
 class CameraCardWidgets:
     preview: QLabel
@@ -93,9 +96,9 @@ class DashboardHome(QWidget):
         header = QHBoxLayout()
         header.addWidget(QLabel("Dashboard", objectName="pageTitle"))
         header.addStretch()
-        refresh_button = QPushButton("Yenile")
-        refresh_button.clicked.connect(self.refresh)
-        header.addWidget(refresh_button)
+        self.refresh_button = QPushButton("Yenile")
+        self.refresh_button.clicked.connect(self.refresh)
+        header.addWidget(self.refresh_button)
         layout.addLayout(header)
 
         camera_layout = QHBoxLayout()
@@ -160,7 +163,7 @@ class DashboardHome(QWidget):
         )
         return card
 
-    def refresh(self) -> None:
+    def refresh(self, *, preserve_preview: bool = False) -> None:
         try:
             cameras = self.camera_service.list_cameras()
             records = self.plate_service.get_recent_records(self.user, 20)
@@ -177,15 +180,31 @@ class DashboardHome(QWidget):
                 f"Son okunan plaka: {latest.plate}" if latest else "Son okunan plaka: -"
             )
             if camera is None:
-                self._set_card_status(direction, CameraStatus.ERROR, "Kamera kaydı bulunamadı")
+                self._set_card_status(
+                    direction,
+                    CameraStatus.ERROR,
+                    "Kamera kaydı bulunamadı",
+                    preserve_preview=preserve_preview,
+                )
             elif not camera.enabled:
-                self._set_card_status(direction, CameraStatus.STOPPED, "Kamera pasif")
+                self._set_card_status(
+                    direction,
+                    CameraStatus.STOPPED,
+                    "Kamera pasif",
+                    preserve_preview=preserve_preview,
+                )
             elif not camera.stream_url:
-                self._set_card_status(direction, CameraStatus.ERROR, "Kamera URL'si tanımlı değil")
+                self._set_card_status(
+                    direction,
+                    CameraStatus.ERROR,
+                    "Kamera URL'si tanımlı değil",
+                    preserve_preview=preserve_preview,
+                )
             else:
                 self._set_card_status(
                     direction,
                     self.camera_service.get_status(camera.id),
+                    preserve_preview=preserve_preview,
                 )
         self._populate_recent(records)
 
@@ -327,6 +346,7 @@ class DashboardHome(QWidget):
         status: CameraStatus,
         text: str | None = None,
         tooltip: str = "",
+        preserve_preview: bool = False,
     ) -> None:
         card = self.camera_cards[direction]
         status_texts = {
@@ -347,9 +367,13 @@ class DashboardHome(QWidget):
         card.status.setToolTip(tooltip or text or "")
         card.status.setStyleSheet(f"color:{status_colors[status]}; font-weight:600;")
 
-        if status is CameraStatus.STOPPED:
+        if status is CameraStatus.STOPPED and not preserve_preview:
             self._clear_preview(direction, text or "Kamera görüntüsü bekleniyor")
-        elif status is CameraStatus.ERROR and direction not in self._latest_images:
+        elif (
+            status is CameraStatus.ERROR
+            and direction not in self._latest_images
+            and not preserve_preview
+        ):
             self._clear_preview(direction, text or "Kamera bağlantısı kurulamadı")
 
     def _display_image(self, direction: Direction, image: QImage) -> None:
@@ -489,6 +513,11 @@ class DashboardWindow(QMainWindow):
         self._build_ui()
         if self.recognition_service is not None:
             self.recognition_service.record_saved.connect(self._refresh_record_pages)
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.setInterval(AUTO_REFRESH_INTERVAL_MS)
+        self._auto_refresh_timer.timeout.connect(self._refresh_active_data_page)
+        self.logout_requested.connect(self._auto_refresh_timer.stop)
+        self._auto_refresh_timer.start()
 
     def _build_ui(self) -> None:
         root = QWidget(objectName="appRoot")
@@ -592,6 +621,19 @@ class DashboardWindow(QMainWindow):
         if callable(refresh):
             refresh()
 
+    @Slot()
+    def _refresh_active_data_page(self) -> None:
+        page = self.stack.currentWidget()
+        if not isinstance(
+            page,
+            (DashboardHome, RecordsWidget, InsideVehiclesWidget),
+        ):
+            return
+        if isinstance(page, DashboardHome):
+            page.refresh(preserve_preview=True)
+        else:
+            page.refresh()
+
     @Slot(object)
     def _refresh_record_pages(self, _record: PlateRecord) -> None:
         for page in self.pages[1:3]:
@@ -608,6 +650,7 @@ class DashboardWindow(QMainWindow):
                 refresh()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._auto_refresh_timer.stop()
         if not self._camera_shutdown_started:
             self._camera_shutdown_started = True
             self.camera_service.stop_all()

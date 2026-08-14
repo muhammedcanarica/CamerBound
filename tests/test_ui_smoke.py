@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -46,6 +47,7 @@ from app.plate_recognition import (
 from app.plate_service import PlateService
 from main import ApplicationController
 from ui.admin_widget import CameraCredentialsDialog
+from ui.dashboard_window import AUTO_REFRESH_INTERVAL_MS
 from ui.styles import APP_STYLESHEET
 
 
@@ -381,6 +383,157 @@ class LoginFlowSmokeTest(unittest.TestCase):
         camera_settings.refresh()
         self.assertFalse(camera_settings.cleanup_old_button.isEnabled())
         self.assertIn("Süresiz", camera_settings.cleanup_old_button.toolTip())
+
+    def test_auto_refresh_targets_only_visible_data_page_and_stops_with_window(self) -> None:
+        admin = self.controller.auth_service.authenticate("admin", "admin123")
+        self.controller.show_dashboard(admin)
+        dashboard = self.controller.dashboard_window
+        data_pages = dashboard.pages[:3]
+
+        self.assertEqual(
+            dashboard._auto_refresh_timer.interval(),
+            AUTO_REFRESH_INTERVAL_MS,
+        )
+        self.assertEqual(AUTO_REFRESH_INTERVAL_MS, 5_000)
+        self.assertTrue(dashboard._auto_refresh_timer.isActive())
+
+        with patch.object(data_pages[0], "refresh") as dashboard_refresh, patch.object(
+            data_pages[1], "refresh"
+        ) as records_refresh, patch.object(
+            data_pages[2], "refresh"
+        ) as inside_refresh:
+            refreshes = (dashboard_refresh, records_refresh, inside_refresh)
+            for active_index, expected_refresh in enumerate(refreshes):
+                with self.subTest(active_index=active_index):
+                    for refresh in refreshes:
+                        refresh.reset_mock()
+                    dashboard.stack.setCurrentIndex(active_index)
+                    dashboard._refresh_active_data_page()
+                    if active_index == 0:
+                        expected_refresh.assert_called_once_with(preserve_preview=True)
+                    else:
+                        expected_refresh.assert_called_once_with()
+                    for hidden_refresh in refreshes:
+                        if hidden_refresh is not expected_refresh:
+                            hidden_refresh.assert_not_called()
+
+            for refresh in refreshes:
+                refresh.reset_mock()
+            dashboard.stack.setCurrentIndex(3)
+            dashboard._refresh_active_data_page()
+            for refresh in refreshes:
+                refresh.assert_not_called()
+
+        dashboard.logout_requested.emit()
+        self.assertFalse(dashboard._auto_refresh_timer.isActive())
+
+    def test_auto_refresh_is_data_only_and_record_saved_refresh_remains_immediate(self) -> None:
+        admin = self.controller.auth_service.authenticate("admin", "admin123")
+        self.controller.show_dashboard(admin)
+        dashboard = self.controller.dashboard_window
+        dashboard.stack.setCurrentIndex(0)
+
+        with patch.object(
+            self.controller.camera_service, "start_camera"
+        ) as start_camera, patch.object(
+            self.controller.camera_service, "stop_camera"
+        ) as stop_camera, patch.object(
+            self.controller.camera_service, "stop_all"
+        ) as stop_all, patch.object(
+            self.controller.recognition_service, "start"
+        ) as recognition_start, patch.object(
+            self.controller.recognition_service, "stop"
+        ) as recognition_stop, patch.object(
+            self.controller.recognition_service, "apply_config"
+        ) as apply_config, patch.object(
+            dashboard.dashboard_home, "_clear_preview"
+        ) as clear_preview:
+            dashboard._refresh_active_data_page()
+
+        start_camera.assert_not_called()
+        stop_camera.assert_not_called()
+        stop_all.assert_not_called()
+        recognition_start.assert_not_called()
+        recognition_stop.assert_not_called()
+        apply_config.assert_not_called()
+        clear_preview.assert_not_called()
+
+        camera = self.controller.camera_service.list_cameras()[0]
+        record = self.controller.plate_service.save_plate_detection(
+            "34AUTO01",
+            camera.id,
+            0.97,
+        )
+        with patch.object(
+            self.controller.plate_service,
+            "get_recent_records",
+            wraps=self.controller.plate_service.get_recent_records,
+        ) as recent_records, patch.object(
+            self.controller.plate_service,
+            "get_record_day_summaries",
+            wraps=self.controller.plate_service.get_record_day_summaries,
+        ) as record_days, patch.object(
+            self.controller.plate_service,
+            "get_vehicles_inside",
+            wraps=self.controller.plate_service.get_vehicles_inside,
+        ) as vehicles_inside:
+            self.controller.recognition_service.record_saved.emit(record)
+
+        recent_records.assert_called_once()
+        record_days.assert_called_once()
+        vehicles_inside.assert_called_once()
+
+    def test_manual_refresh_page_switch_and_records_filter_state_are_preserved(self) -> None:
+        admin = self.controller.auth_service.authenticate("admin", "admin123")
+        self.controller.show_dashboard(admin)
+        dashboard = self.controller.dashboard_window
+        home, records_page, inside_page = dashboard.pages[:3]
+
+        with patch.object(
+            self.controller.plate_service,
+            "get_recent_records",
+            wraps=self.controller.plate_service.get_recent_records,
+        ) as recent_records:
+            home.refresh_button.click()
+        recent_records.assert_called_once()
+
+        with patch.object(
+            self.controller.plate_service,
+            "get_record_day_summaries",
+            wraps=self.controller.plate_service.get_record_day_summaries,
+        ) as record_days:
+            records_page.refresh_button.click()
+        record_days.assert_called_once()
+
+        with patch.object(
+            self.controller.plate_service,
+            "get_vehicles_inside",
+            wraps=self.controller.plate_service.get_vehicles_inside,
+        ) as vehicles_inside:
+            inside_page.refresh_button.click()
+        vehicles_inside.assert_called_once()
+
+        with patch.object(records_page, "refresh") as records_refresh:
+            dashboard._activate_page(1)
+        records_refresh.assert_called_once_with()
+
+        dashboard.stack.setCurrentWidget(records_page)
+        records_page.search_input.setText("34ABC123")
+        records_page.search_input.setFocus()
+        records_page.search_input.setSelection(2, 3)
+        records_page.direction_filter.setCurrentIndex(1)
+        selected_date = date(2026, 8, 14)
+        records_page._selected_date = selected_date
+        self.application.processEvents()
+
+        dashboard._refresh_active_data_page()
+
+        self.assertEqual(records_page.search_input.text(), "34ABC123")
+        self.assertEqual(records_page.direction_filter.currentData(), Direction.ENTRY)
+        self.assertEqual(records_page._selected_date, selected_date)
+        self.assertTrue(records_page.search_input.hasFocus())
+        self.assertEqual(records_page.search_input.selectionStart(), 2)
+        self.assertEqual(records_page.search_input.selectedText(), "ABC")
 
     def test_camera_credentials_dialog_is_clear_secure_and_preserves_blank_password(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")

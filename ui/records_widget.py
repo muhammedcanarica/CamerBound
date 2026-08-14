@@ -77,11 +77,11 @@ class RecordsWidget(QWidget):
         self.direction_filter.addItem("Giriş", Direction.ENTRY)
         self.direction_filter.addItem("Çıkış", Direction.EXIT)
         self.direction_filter.currentIndexChanged.connect(self.refresh)
-        refresh_button = QPushButton("Ara / Yenile")
-        refresh_button.clicked.connect(self.refresh)
+        self.refresh_button = QPushButton("Ara / Yenile")
+        self.refresh_button.clicked.connect(self.refresh)
         filters.addWidget(self.search_input, 1)
         filters.addWidget(self.direction_filter)
-        filters.addWidget(refresh_button)
+        filters.addWidget(self.refresh_button)
         layout.addLayout(filters)
 
         self.table = QTableWidget()
@@ -93,6 +93,12 @@ class RecordsWidget(QWidget):
         layout.addWidget(self.table, 1)
 
     def refresh(self) -> None:
+        vertical_scroll = self.table.verticalScrollBar().value()
+        horizontal_scroll = self.table.horizontalScrollBar().value()
+        search_had_focus = self.search_input.hasFocus()
+        search_cursor = self.search_input.cursorPosition()
+        selection_start = self.search_input.selectionStart()
+        selection_length = len(self.search_input.selectedText())
         try:
             if self._selected_date is None:
                 summaries = self.plate_service.get_record_day_summaries(
@@ -114,6 +120,15 @@ class RecordsWidget(QWidget):
             self._populate_day_summaries(summaries)
         else:
             self._populate(records)
+        self.table.verticalScrollBar().setValue(vertical_scroll)
+        self.table.horizontalScrollBar().setValue(horizontal_scroll)
+        if search_had_focus:
+            if not self.search_input.hasFocus():
+                self.search_input.setFocus(Qt.FocusReason.OtherFocusReason)
+            if selection_start >= 0:
+                self.search_input.setSelection(selection_start, selection_length)
+            else:
+                self.search_input.setCursorPosition(search_cursor)
 
     def _populate_day_summaries(
         self, summaries: list[PlateRecordDaySummary]
@@ -247,9 +262,9 @@ class InsideVehiclesWidget(QWidget):
         header = QHBoxLayout()
         header.addWidget(QLabel("İçerideki Araçlar", objectName="pageTitle"))
         header.addStretch()
-        refresh_button = QPushButton("Yenile")
-        refresh_button.clicked.connect(self.refresh)
-        header.addWidget(refresh_button)
+        self.refresh_button = QPushButton("Yenile")
+        self.refresh_button.clicked.connect(self.refresh)
+        header.addWidget(self.refresh_button)
         layout.addLayout(header)
         description = QLabel(
             "Son hareketi giriş olan araçlar gösterilir.", objectName="mutedLabel"
