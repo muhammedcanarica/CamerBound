@@ -74,6 +74,26 @@ class DetectorDiagnostics:
     raw_detector_ms: float
     enhanced_detector_ms: float
     detections: int
+    input_width: int = 0
+    input_height: int = 0
+    input_layout: str = "unknown"
+    input_dtype: str = "unknown"
+    roi_width: int = 0
+    roi_height: int = 0
+    raw_candidate_count: int = 0
+    plate_class_candidate_count: int = 0
+    highest_plate_confidence: float | None = None
+    confidence_rejected_count: int = 0
+    bbox_rejected_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class SsdParseDiagnostics:
+    raw_candidate_count: int
+    plate_class_candidate_count: int
+    highest_plate_confidence: float | None
+    confidence_rejected_count: int
+    bbox_rejected_count: int
 
 
 class PlateDetector(Protocol):
@@ -139,7 +159,7 @@ class OpenVinoPlateDetector:
         self.last_diagnostics = None
 
         raw_started_at = time.perf_counter()
-        raw_detections = self._infer_detections(
+        raw_detections, raw_parse = self._infer_detections(
             image,
             coordinate_width=image.shape[1],
             coordinate_height=image.shape[0],
@@ -154,6 +174,7 @@ class OpenVinoPlateDetector:
                 raw_detector_ms=raw_detector_ms,
                 enhanced_detector_ms=0.0,
                 detections=len(raw_detections),
+                **self._diagnostic_context(image, raw_parse),
             )
             return raw_detections
 
@@ -167,12 +188,13 @@ class OpenVinoPlateDetector:
                 raw_detector_ms=raw_detector_ms,
                 enhanced_detector_ms=0.0,
                 detections=0,
+                **self._diagnostic_context(image, raw_parse),
             )
             return []
 
         enhanced = enhance_shadowed_detector_image(image)
         enhanced_started_at = time.perf_counter()
-        enhanced_detections = self._infer_detections(
+        enhanced_detections, enhanced_parse = self._infer_detections(
             enhanced,
             coordinate_width=image.shape[1],
             coordinate_height=image.shape[0],
@@ -186,6 +208,7 @@ class OpenVinoPlateDetector:
             raw_detector_ms=raw_detector_ms,
             enhanced_detector_ms=enhanced_detector_ms,
             detections=len(enhanced_detections),
+            **self._diagnostic_context(image, enhanced_parse),
         )
         return enhanced_detections
 
@@ -195,7 +218,7 @@ class OpenVinoPlateDetector:
         *,
         coordinate_width: int,
         coordinate_height: int,
-    ) -> list[PlateDetection]:
+    ) -> tuple[list[PlateDetection], SsdParseDiagnostics]:
         resized = cv2.resize(
             detector_image,
             (self._input_width, self._input_height),
@@ -212,12 +235,31 @@ class OpenVinoPlateDetector:
         except Exception as exc:
             raise PlateDetectorError(f"Plate detector inference başarısız: {exc}") from exc
 
-        return parse_ssd_plate_detections(
+        return _parse_ssd_plate_detections(
             output,
             image_width=coordinate_width,
             image_height=coordinate_height,
             min_confidence=self.config.min_confidence,
         )
+
+    def _diagnostic_context(
+        self,
+        image: np.ndarray,
+        parse: SsdParseDiagnostics,
+    ) -> dict[str, object]:
+        return {
+            "input_width": self._input_width,
+            "input_height": self._input_height,
+            "input_layout": self._input_layout,
+            "input_dtype": np.dtype(self._input_dtype).name,
+            "roi_width": image.shape[1],
+            "roi_height": image.shape[0],
+            "raw_candidate_count": parse.raw_candidate_count,
+            "plate_class_candidate_count": parse.plate_class_candidate_count,
+            "highest_plate_confidence": parse.highest_plate_confidence,
+            "confidence_rejected_count": parse.confidence_rejected_count,
+            "bbox_rejected_count": parse.bbox_rejected_count,
+        }
 
 
 def measure_detector_lighting(image: np.ndarray) -> DetectorLightingMetrics:
@@ -271,22 +313,54 @@ def parse_ssd_plate_detections(
     image_height: int,
     min_confidence: float,
 ) -> list[PlateDetection]:
+    plates, _diagnostics = _parse_ssd_plate_detections(
+        output,
+        image_width=image_width,
+        image_height=image_height,
+        min_confidence=min_confidence,
+    )
+    return plates
+
+
+def _parse_ssd_plate_detections(
+    output: object,
+    *,
+    image_width: int,
+    image_height: int,
+    min_confidence: float,
+) -> tuple[list[PlateDetection], SsdParseDiagnostics]:
     detections = np.asarray(output, dtype=np.float32)
     if detections.size == 0:
-        return []
+        return [], SsdParseDiagnostics(0, 0, None, 0, 0)
     if detections.shape[-1] != SSD_DETECTION_SIZE:
         raise PlateDetectorModelInvalid(
             "Plate detector output'unun son boyutu 7 olmalıdır."
         )
 
     plates: list[PlateDetection] = []
+    raw_candidate_count = 0
+    plate_class_candidate_count = 0
+    highest_plate_confidence: float | None = None
+    confidence_rejected_count = 0
+    bbox_rejected_count = 0
     for row in detections.reshape(-1, SSD_DETECTION_SIZE):
         image_id, label, confidence, x_min, y_min, x_max, y_max = row
         if image_id < 0:
             break
+        raw_candidate_count += 1
         if not np.all(np.isfinite(row)):
             continue
-        if int(label) != PLATE_CLASS_ID or float(confidence) < min_confidence:
+        if int(label) != PLATE_CLASS_ID:
+            continue
+        plate_class_candidate_count += 1
+        candidate_confidence = float(confidence)
+        highest_plate_confidence = (
+            candidate_confidence
+            if highest_plate_confidence is None
+            else max(highest_plate_confidence, candidate_confidence)
+        )
+        if candidate_confidence < min_confidence:
+            confidence_rejected_count += 1
             continue
 
         x1 = max(0, min(image_width, round(float(x_min) * image_width)))
@@ -296,6 +370,7 @@ def parse_ssd_plate_detections(
         width = x2 - x1
         height = y2 - y1
         if width <= 0 or height <= 0:
+            bbox_rejected_count += 1
             continue
         plates.append(
             PlateDetection(
@@ -306,7 +381,13 @@ def parse_ssd_plate_detections(
                 height=height,
             )
         )
-    return plates
+    return plates, SsdParseDiagnostics(
+        raw_candidate_count=raw_candidate_count,
+        plate_class_candidate_count=plate_class_candidate_count,
+        highest_plate_confidence=highest_plate_confidence,
+        confidence_rejected_count=confidence_rejected_count,
+        bbox_rejected_count=bbox_rejected_count,
+    )
 
 
 def select_plate_detections(

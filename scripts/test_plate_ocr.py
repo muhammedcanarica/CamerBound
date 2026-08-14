@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -23,6 +24,7 @@ from app.plate_recognition import (
     crop_roi,
     normalize_plate_text,
     preprocess_variants,
+    preprocess_roi_fallback_variants,
     roi_mean_brightness,
     select_best_candidate,
 )
@@ -78,12 +80,14 @@ def main() -> int:
     )
     detector_started_at = time.perf_counter()
     detections = []
+    detector_diagnostics = None
     ocr_crops = [crop]
     fallback = not detector_enabled
     if detector_enabled:
         try:
             detector = OpenVinoPlateDetector(detector_config)
             detections = detector.detect(crop)
+            detector_diagnostics = detector.last_diagnostics
             selected = select_plate_detections(
                 detections,
                 detector_config.max_plate_candidates_per_frame,
@@ -112,6 +116,30 @@ def main() -> int:
             ocr_crops = [crop]
             fallback = True
     detector_ms = (time.perf_counter() - detector_started_at) * 1000
+    if detector_diagnostics is not None:
+        highest_confidence = (
+            "none"
+            if detector_diagnostics.highest_plate_confidence is None
+            else f"{detector_diagnostics.highest_plate_confidence:.3f}"
+        )
+        print(
+            f"detector_variant={detector_diagnostics.detector_variant} "
+            f"raw_candidates={detector_diagnostics.raw_candidate_count} "
+            f"plate_class_candidates={detector_diagnostics.plate_class_candidate_count} "
+            f"highest_plate_confidence={highest_confidence} "
+            f"confidence_rejected={detector_diagnostics.confidence_rejected_count} "
+            f"bbox_rejected={detector_diagnostics.bbox_rejected_count} "
+            f"detector_input={detector_diagnostics.input_width}x{detector_diagnostics.input_height} "
+            f"input_layout={detector_diagnostics.input_layout} "
+            f"input_dtype={detector_diagnostics.input_dtype} "
+            f"roi_size={crop.shape[1]}x{crop.shape[0]}"
+        )
+    for index, detection in enumerate(detections):
+        print(
+            f"detector_bbox[{index}] confidence={detection.confidence:.3f} "
+            f"x={detection.x} y={detection.y} "
+            f"width={detection.width} height={detection.height}"
+        )
     if detector_enabled and not fallback and not ocr_crops:
         print(
             f"direction={direction.value} detector_ms={detector_ms:.1f} "
@@ -124,12 +152,35 @@ def main() -> int:
     variants = []
     for ocr_crop in ocr_crops:
         crop_brightness = roi_mean_brightness(ocr_crop)
-        variants.extend(
-            preprocess_variants(ocr_crop, brightness=crop_brightness)
-        )
+        if fallback:
+            variants.extend(
+                preprocess_roi_fallback_variants(
+                    ocr_crop,
+                    brightness=crop_brightness,
+                )
+            )
+        else:
+            variants.extend(
+                preprocess_variants(ocr_crop, brightness=crop_brightness)
+            )
     preprocess_ms = (time.perf_counter() - processing_started_at) * 1000
     inference_started_at = time.perf_counter()
-    segments = provider.recognize(variants)
+    if fallback:
+        segments = []
+        attempted_variants = []
+        for variant_index, variant in enumerate(variants):
+            attempted_variants.append(variant)
+            batch = provider.recognize([variant])
+            segments.extend(
+                replace(segment, variant_index=variant_index)
+                for segment in batch
+            )
+            candidate = select_best_candidate(segments, camera_id=0)
+            if candidate is not None and candidate.confidence >= config.min_confidence:
+                break
+        variants = attempted_variants
+    else:
+        segments = provider.recognize(variants)
     inference_ms = (time.perf_counter() - inference_started_at) * 1000
     total_ocr_ms = (time.perf_counter() - processing_started_at) * 1000
     print(
@@ -146,11 +197,9 @@ def main() -> int:
     )
     print("ocr_variants:")
     for index, variant in enumerate(variants):
-        name = (
-            OCR_VARIANT_NAMES[index]
-            if index < len(OCR_VARIANT_NAMES)
-            else f"variant-{index}"
-        )
+        fallback_names = ("roi-compact-color", "roi-compact-clahe")
+        names = fallback_names if fallback else OCR_VARIANT_NAMES
+        name = names[index] if index < len(names) else f"variant-{index}"
         print(f"  index={index} name={name} size={variant.shape[1]}x{variant.shape[0]}")
     if args.save_debug:
         paths = save_debug_images(

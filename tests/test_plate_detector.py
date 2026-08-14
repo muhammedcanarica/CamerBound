@@ -256,6 +256,52 @@ class PlateDetectorTests(unittest.TestCase):
         self.assertEqual(detector.config.min_confidence, 0.15)
         self.assertEqual(detections, [])
         self.assertEqual(request.calls, 2)
+        self.assertEqual(detector.last_diagnostics.raw_candidate_count, 1)
+        self.assertEqual(detector.last_diagnostics.plate_class_candidate_count, 1)
+        self.assertAlmostEqual(
+            detector.last_diagnostics.highest_plate_confidence,
+            0.149,
+            places=3,
+        )
+        self.assertEqual(detector.last_diagnostics.confidence_rejected_count, 1)
+
+    def test_diagnostics_explain_raw_class_confidence_and_bbox_filtering(self) -> None:
+        output = np.array(
+            [[[
+                _ssd_row(1, 0.99, 0.1, 0.1, 0.5, 0.5),
+                _ssd_row(2, 0.14, 0.1, 0.1, 0.5, 0.5),
+                _ssd_row(2, 0.80, 0.7, 0.2, 0.6, 0.5),
+                _ssd_row(2, 0.90, 0.2, 0.2, 0.7, 0.6),
+            ]]],
+            dtype=np.float32,
+        )
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [output],
+                min_confidence=0.15,
+            )
+            image = np.zeros((100, 200, 3), dtype=np.uint8)
+            image[:, :, 0] = 11
+            image[:, :, 1] = 22
+            image[:, :, 2] = 33
+
+            detections = detector.detect(image)
+
+        diagnostics = detector.last_diagnostics
+        self.assertEqual(len(detections), 1)
+        self.assertEqual(diagnostics.raw_candidate_count, 4)
+        self.assertEqual(diagnostics.plate_class_candidate_count, 3)
+        self.assertAlmostEqual(diagnostics.highest_plate_confidence, 0.90, places=5)
+        self.assertEqual(diagnostics.confidence_rejected_count, 1)
+        self.assertEqual(diagnostics.bbox_rejected_count, 1)
+        self.assertEqual((diagnostics.input_width, diagnostics.input_height), (256, 256))
+        self.assertEqual(diagnostics.input_layout, "NHWC")
+        self.assertEqual(diagnostics.input_dtype, "uint8")
+        self.assertEqual((diagnostics.roi_width, diagnostics.roi_height), (200, 100))
+        self.assertEqual(request.tensors[0].shape, (1, 256, 256, 3))
+        self.assertEqual(request.tensors[0].dtype, np.uint8)
+        np.testing.assert_array_equal(request.tensors[0][0, 0, 0], [11, 22, 33])
 
     def test_shadow_enhancement_deterministically_lifts_dark_detail(self) -> None:
         image = np.full((64, 128, 3), 12, dtype=np.uint8)

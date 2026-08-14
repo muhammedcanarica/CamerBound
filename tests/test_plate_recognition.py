@@ -1959,6 +1959,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         for fallback_type in (
             OcrJobType.DETECTOR_ERROR_FALLBACK,
             OcrJobType.ZERO_DETECTION_FALLBACK,
+            OcrJobType.STATIC_ZERO_DETECTION_RESCUE,
         ):
             with self.subTest(fallback_type=fallback_type):
                 buffer = OcrJobBuffer(max_per_camera=1, max_age_ms=2_500)
@@ -2049,6 +2050,22 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(consumed, (first, second))
         self.assertTrue(accepted_again.accepted)
 
+    def test_static_rescue_buffer_keeps_at_most_one_pending_job(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        first = self._make_ocr_job(
+            job_type=OcrJobType.STATIC_ZERO_DETECTION_RESCUE,
+            frame_id=1,
+        )
+        second = replace(first, frame_id=2)
+
+        accepted = buffer.add(first)
+        coalesced = buffer.add(second)
+
+        self.assertTrue(accepted.accepted)
+        self.assertFalse(coalesced.accepted)
+        self.assertTrue(coalesced.coalesced)
+        self.assertEqual(buffer.pending_count(1), 1)
+
     def test_fallback_coalescing_has_no_stuck_state_after_replace_stale_or_clear(self) -> None:
         replacement_buffer = OcrJobBuffer(max_per_camera=1, max_age_ms=2_500)
         zero = self._make_ocr_job(job_type=OcrJobType.ZERO_DETECTION_FALLBACK)
@@ -2128,6 +2145,10 @@ class RecognitionPipelineTests(unittest.TestCase):
 
     def test_ocr_consumer_follows_all_priority_tiers(self) -> None:
         buffer = OcrJobBuffer(max_per_camera=3, max_age_ms=2_500)
+        rescue = self._make_ocr_job(
+            camera_id=1,
+            job_type=OcrJobType.STATIC_ZERO_DETECTION_RESCUE,
+        )
         zero = self._make_ocr_job(
             camera_id=2,
             job_type=OcrJobType.ZERO_DETECTION_FALLBACK,
@@ -2140,15 +2161,16 @@ class RecognitionPipelineTests(unittest.TestCase):
             camera_id=2,
             job_type=OcrJobType.DETECTOR_CROP,
         )
-        for job in (zero, error, crop):
+        for job in (rescue, zero, error, crop):
             buffer.add(job)
 
         self.assertEqual(
-            [buffer.take().job_type for _ in range(3)],
+            [buffer.take().job_type for _ in range(4)],
             [
                 OcrJobType.DETECTOR_CROP,
                 OcrJobType.DETECTOR_ERROR_FALLBACK,
                 OcrJobType.ZERO_DETECTION_FALLBACK,
+                OcrJobType.STATIC_ZERO_DETECTION_RESCUE,
             ],
         )
 
@@ -2291,7 +2313,32 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIn("queue_wait_ms=", diagnostic)
         self.assertIn("candidate=34ABC123", diagnostic)
         self.assertIn("recognition_state=AWAITING_CONFIRMATION", diagnostic)
+        self.assertIn("candidate_rejection_reason=none", diagnostic)
         self.assertIn("confirmation=1/2", diagnostic)
+
+    def test_ocr_worker_diagnostics_include_candidate_rejection_reason(self) -> None:
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.64),
+            self.plate_service,
+            self.config,
+        )
+        job = self._make_ocr_job(
+            observed_at=time.monotonic(),
+            frame_id=56,
+            job_type=OcrJobType.DETECTOR_CROP,
+        )
+
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            outcome = processor.process_ocr_job(job, queue_depth=0)
+
+        diagnostic = next(
+            line for line in captured.output if "OCR worker diagnostics" in line
+        )
+        self.assertIs(outcome.state, RecognitionState.LOW_CONFIDENCE)
+        self.assertIn(
+            "candidate_rejection_reason=low_confidence",
+            diagnostic,
+        )
 
     def test_full_roi_fallback_uses_single_compact_variant_on_early_success(self) -> None:
         provider = RecordingOcrProvider(confidence=0.97)
@@ -2381,29 +2428,105 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(throttled.fallback_skipped_reason, "fallback-spacing")
         self.assertEqual(after_interval.job.fallback_reason, "zero-detection")
 
-    def test_static_zero_detection_does_not_generate_expensive_roi_jobs(self) -> None:
+    def test_static_zero_detection_rescue_is_warmed_up_and_throttled(self) -> None:
         processor = PlateDetectionProcessor(self.config, FakePlateDetector([]))
         frame = np.zeros((200, 400, 3), dtype=np.uint8)
         captured_at = datetime(2026, 8, 13, tzinfo=timezone.utc)
 
+        observed_times = (10.0, 11.0, 12.4, 12.5, 13.0, 15.0)
         results = [
             processor.prepare_job(
                 1,
                 Direction.ENTRY,
                 frame,
                 captured_at=captured_at,
-                observed_at=10.0 + index,
-                received_at=10.0 + index,
+                observed_at=observed_at,
+                received_at=observed_at,
             )
-            for index in range(20)
+            for observed_at in observed_times
         ]
 
-        self.assertTrue(all(result.job is None for result in results))
-        self.assertTrue(
-            all(
-                result.fallback_skipped_reason == "no-meaningful-motion"
-                for result in results
-            )
+        self.assertEqual(
+            [result.job is not None for result in results],
+            [False, False, False, True, False, True],
+        )
+        self.assertEqual(results[0].fallback_skipped_reason, "static-rescue-warmup")
+        self.assertIs(
+            results[3].job.job_type,
+            OcrJobType.STATIC_ZERO_DETECTION_RESCUE,
+        )
+        self.assertEqual(
+            results[3].job.fallback_reason,
+            "static-zero-detection-rescue",
+        )
+        self.assertEqual(results[4].fallback_skipped_reason, "static-rescue-cooldown")
+
+    def test_static_rescue_candidate_normalizes_expected_field_plate(self) -> None:
+        config = recognition_config(self.config.model_root, confirmations=1)
+        detection_processor = PlateDetectionProcessor(config, FakePlateDetector([]))
+        frame = np.zeros((540, 960, 3), dtype=np.uint8)
+        captured_at = datetime(2026, 8, 14, tzinfo=timezone.utc)
+        first = detection_processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=captured_at,
+            observed_at=10.0,
+            received_at=10.0,
+            frame_id=1,
+        )
+        rescue = detection_processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=captured_at,
+            observed_at=12.5,
+            received_at=12.5,
+            frame_id=2,
+        )
+        provider = RecordingOcrProvider(confidence=0.98)
+        provider.text = "06 GG 986"
+        recognition_processor = PlateRecognitionProcessor(
+            provider,
+            self.plate_service,
+            config,
+        )
+
+        outcome = recognition_processor.process_ocr_job(rescue.job, queue_depth=0)
+
+        self.assertIsNone(first.job)
+        self.assertIs(rescue.job.job_type, OcrJobType.STATIC_ZERO_DETECTION_RESCUE)
+        self.assertEqual(outcome.candidate.plate, "06GG986")
+        self.assertEqual(provider.calls, 1)
+        self.assertLessEqual(provider.images[0].shape[1], 960)
+
+    def test_recent_valid_candidate_suppresses_static_rescue_only(self) -> None:
+        processor = PlateDetectionProcessor(self.config, FakePlateDetector([]))
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        captured_at = datetime(2026, 8, 14, tzinfo=timezone.utc)
+        processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=captured_at,
+            observed_at=10.0,
+            received_at=10.0,
+        )
+        processor.note_valid_candidate(1, 12.4)
+
+        result = processor.prepare_job(
+            1,
+            Direction.ENTRY,
+            frame,
+            captured_at=captured_at,
+            observed_at=12.5,
+            received_at=12.5,
+        )
+
+        self.assertIsNone(result.job)
+        self.assertEqual(
+            result.fallback_skipped_reason,
+            "static-rescue-recent-recognition",
         )
 
     def test_motion_event_allows_at_most_two_zero_detection_fallbacks(self) -> None:
@@ -2771,6 +2894,15 @@ class RecognitionPipelineTests(unittest.TestCase):
             raw_detector_ms=8.4,
             enhanced_detector_ms=9.6,
             detections=1,
+            input_width=256,
+            input_height=256,
+            input_layout="NHWC",
+            input_dtype="uint8",
+            raw_candidate_count=4,
+            plate_class_candidate_count=2,
+            highest_plate_confidence=0.91,
+            confidence_rejected_count=1,
+            bbox_rejected_count=0,
         )
         processor = PlateDetectionProcessor(self.config, detector)
         frame = np.zeros((200, 400, 3), dtype=np.uint8)
@@ -2800,6 +2932,12 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIn("detections=1", diagnostic)
         self.assertIn("raw_detector_ms=8.4", diagnostic)
         self.assertIn("enhanced_detector_ms=9.6", diagnostic)
+        self.assertIn("raw_candidates=4", diagnostic)
+        self.assertIn("plate_class_candidates=2", diagnostic)
+        self.assertIn("highest_plate_confidence=0.910", diagnostic)
+        self.assertIn("confidence_rejected=1", diagnostic)
+        self.assertIn("detector_input=256x256", diagnostic)
+        self.assertIn("roi_size=320x110", diagnostic)
 
     def test_replay_detector_crop_keeps_detector_crop_priority_and_timestamps(self) -> None:
         processor = PlateDetectionProcessor(

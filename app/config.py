@@ -35,6 +35,8 @@ DEFAULT_PLATE_DETECTOR_CROP_PADDING_RATIO = 0.15
 DEFAULT_MAX_PLATE_CANDIDATES_PER_FRAME = 2
 DEFAULT_ZERO_DETECTION_ROI_FALLBACK_ENABLED = True
 DEFAULT_ZERO_DETECTION_ROI_FALLBACK_INTERVAL_MS = 750
+DEFAULT_STATIC_ZERO_DETECTION_RESCUE_ENABLED = True
+DEFAULT_STATIC_ZERO_DETECTION_RESCUE_INTERVAL_MS = 2_500
 DEFAULT_MAX_PENDING_OCR_JOBS_PER_CAMERA = 3
 DEFAULT_OCR_JOB_MAX_AGE_MS = 2_500
 DEFAULT_DETECTOR_CROP_OCR_JOB_MAX_AGE_MS = 12_000
@@ -75,6 +77,12 @@ class PlateDetectorConfig:
     )
     zero_detection_roi_fallback_interval_ms: int = (
         DEFAULT_ZERO_DETECTION_ROI_FALLBACK_INTERVAL_MS
+    )
+    static_zero_detection_rescue_enabled: bool = (
+        DEFAULT_STATIC_ZERO_DETECTION_RESCUE_ENABLED
+    )
+    static_zero_detection_rescue_interval_ms: int = (
+        DEFAULT_STATIC_ZERO_DETECTION_RESCUE_INTERVAL_MS
     )
     debug_overlay: bool = False
     debug_detection_overlay_ttl_ms: int = DEFAULT_DEBUG_DETECTION_OVERLAY_TTL_MS
@@ -516,6 +524,12 @@ def _load_plate_detector(
         "plate_detector.zero_detection_roi_fallback_enabled",
         warnings,
     )
+    static_zero_detection_rescue = _boolean_setting(
+        raw.get("static_zero_detection_rescue_enabled"),
+        DEFAULT_STATIC_ZERO_DETECTION_RESCUE_ENABLED,
+        "plate_detector.static_zero_detection_rescue_enabled",
+        warnings,
+    )
     debug_overlay = _boolean_setting(
         raw.get("debug_overlay"),
         False,
@@ -568,6 +582,16 @@ def _load_plate_detector(
             60_000,
             int,
             "plate_detector.zero_detection_roi_fallback_interval_ms",
+            warnings,
+        ),
+        static_zero_detection_rescue_enabled=static_zero_detection_rescue,
+        static_zero_detection_rescue_interval_ms=_bounded_number(
+            raw.get("static_zero_detection_rescue_interval_ms"),
+            DEFAULT_STATIC_ZERO_DETECTION_RESCUE_INTERVAL_MS,
+            500,
+            60_000,
+            int,
+            "plate_detector.static_zero_detection_rescue_interval_ms",
             warnings,
         ),
         debug_overlay=debug_overlay,

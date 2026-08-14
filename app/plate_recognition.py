@@ -56,6 +56,7 @@ class OcrJobType(StrEnum):
     DETECTOR_CROP = "DETECTOR_CROP"
     DETECTOR_ERROR_FALLBACK = "DETECTOR_ERROR_FALLBACK"
     ZERO_DETECTION_FALLBACK = "ZERO_DETECTION_FALLBACK"
+    STATIC_ZERO_DETECTION_RESCUE = "STATIC_ZERO_DETECTION_RESCUE"
 
     @property
     def priority(self) -> int:
@@ -63,6 +64,7 @@ class OcrJobType(StrEnum):
             OcrJobType.DETECTOR_CROP: 3,
             OcrJobType.DETECTOR_ERROR_FALLBACK: 2,
             OcrJobType.ZERO_DETECTION_FALLBACK: 1,
+            OcrJobType.STATIC_ZERO_DETECTION_RESCUE: 0,
         }[self]
 
 
@@ -102,12 +104,20 @@ def _log_plate_detector_diagnostics(
     camera_id: int,
     source: str,
     detector: PlateDetector,
+    roi_crop: np.ndarray,
+    last_logged_at: dict[tuple[int, str], float],
 ) -> None:
     if not LOGGER.isEnabledFor(logging.DEBUG):
         return
     diagnostics = getattr(detector, "last_diagnostics", None)
     if not isinstance(diagnostics, DetectorDiagnostics):
         return
+    now = time.monotonic()
+    key = (camera_id, source)
+    previous = last_logged_at.get(key)
+    if previous is not None and now - previous < OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS:
+        return
+    last_logged_at[key] = now
     brightness = (
         "not-evaluated"
         if diagnostics.raw_brightness is None
@@ -121,7 +131,10 @@ def _log_plate_detector_diagnostics(
     LOGGER.debug(
         "Plate detector diagnostics camera_id=%s source=%s detector_variant=%s "
         "brightness=%s raw_brightness=%s shadow_metric=%s enhanced_pass=%s "
-        "detections=%s raw_detector_ms=%.1f enhanced_detector_ms=%.1f",
+        "detections=%s raw_candidates=%s plate_class_candidates=%s "
+        "highest_plate_confidence=%s confidence_rejected=%s bbox_rejected=%s "
+        "detector_input=%sx%s input_layout=%s input_dtype=%s roi_size=%sx%s "
+        "raw_detector_ms=%.1f enhanced_detector_ms=%.1f detector_latency_ms=%.1f",
         camera_id,
         source,
         diagnostics.detector_variant,
@@ -130,8 +143,24 @@ def _log_plate_detector_diagnostics(
         shadow_metric,
         "yes" if diagnostics.enhanced_pass else "no",
         diagnostics.detections,
+        diagnostics.raw_candidate_count,
+        diagnostics.plate_class_candidate_count,
+        (
+            "none"
+            if diagnostics.highest_plate_confidence is None
+            else f"{diagnostics.highest_plate_confidence:.3f}"
+        ),
+        diagnostics.confidence_rejected_count,
+        diagnostics.bbox_rejected_count,
+        diagnostics.input_width,
+        diagnostics.input_height,
+        diagnostics.input_layout,
+        diagnostics.input_dtype,
+        roi_crop.shape[1],
+        roi_crop.shape[0],
         diagnostics.raw_detector_ms,
         diagnostics.enhanced_detector_ms,
+        diagnostics.raw_detector_ms + diagnostics.enhanced_detector_ms,
     )
 
 
@@ -1142,6 +1171,7 @@ class OcrJobBuffer:
                     OcrJobType.DETECTOR_CROP,
                     OcrJobType.DETECTOR_ERROR_FALLBACK,
                     OcrJobType.ZERO_DETECTION_FALLBACK,
+                    OcrJobType.STATIC_ZERO_DETECTION_RESCUE,
                 ):
                     for _ in range(len(self._camera_order)):
                         camera_id = self._camera_order.popleft()
@@ -1224,6 +1254,11 @@ class PlateDetectionProcessor:
         self._detector_crop_frame_ids: dict[int, deque[int]] = defaultdict(deque)
         self._detector_crop_frame_id_sets: dict[int, set[int]] = defaultdict(set)
         self._last_detector_error_logged_at: dict[int, float] = {}
+        self._last_detector_diagnostic_at: dict[tuple[int, str], float] = {}
+        self._first_static_miss_at: dict[int, float] = {}
+        self._last_static_rescue_at: dict[int, float] = {}
+        self._last_valid_candidate_at: dict[int, float] = {}
+        self._rescue_state_lock = threading.Lock()
 
     def prepare_job(
         self,
@@ -1265,6 +1300,8 @@ class PlateDetectionProcessor:
                     camera_id,
                     detector_source,
                     self.detector,
+                    roi_crop,
+                    self._last_detector_diagnostic_at,
                 )
             except Exception as exc:
                 self._log_detector_error(
@@ -1299,6 +1336,8 @@ class PlateDetectionProcessor:
                     ).detector_crop_seen = True
                 if ocr_crops and frame_id is not None:
                     self._remember_detector_crop_frame(camera_id, frame_id)
+                if ocr_crops:
+                    self._first_static_miss_at.pop(camera_id, None)
                 if not ocr_crops:
                     (
                         should_fallback,
@@ -1323,6 +1362,23 @@ class PlateDetectionProcessor:
                         used_roi_fallback = True
                         fallback_reason = "zero-detection"
                         ocr_crops = [roi_crop]
+                    elif zero_detection_fallback_event_id is None:
+                        static_rescue, static_skip_reason = (
+                            self._should_run_static_zero_detection_rescue(
+                                camera_id,
+                                observed_at,
+                                detector_config.static_zero_detection_rescue_enabled,
+                                detector_config.static_zero_detection_rescue_interval_ms,
+                                allow_zero_detection_fallback,
+                            )
+                        )
+                        if static_rescue:
+                            used_roi_fallback = True
+                            fallback_reason = "static-zero-detection-rescue"
+                            fallback_skipped_reason = None
+                            ocr_crops = [roi_crop]
+                        else:
+                            fallback_skipped_reason = static_skip_reason
         elif detector_config.enabled:
             if not detector_config.fallback_to_roi_ocr:
                 raise PlateDetectorError(
@@ -1370,6 +1426,8 @@ class PlateDetectionProcessor:
         job_type = OcrJobType.DETECTOR_CROP
         if fallback_reason == "zero-detection":
             job_type = OcrJobType.ZERO_DETECTION_FALLBACK
+        elif fallback_reason == "static-zero-detection-rescue":
+            job_type = OcrJobType.STATIC_ZERO_DETECTION_RESCUE
         elif used_roi_fallback:
             # Detector-disabled and detector-unavailable paths share the protected
             # detector-error fallback priority tier; fallback_reason stays explicit.
@@ -1409,6 +1467,56 @@ class PlateDetectionProcessor:
             event_frames,
             ring_depth,
         )
+
+    def _should_run_static_zero_detection_rescue(
+        self,
+        camera_id: int,
+        observed_at: float,
+        enabled: bool,
+        interval_ms: int,
+        allowed_for_source: bool,
+    ) -> tuple[bool, str]:
+        if not enabled:
+            return False, "static-rescue-disabled"
+        if not allowed_for_source:
+            return False, "replay-static-rescue"
+        interval_seconds = max(
+            interval_ms,
+            self.config.recognition_interval_ms,
+        ) / 1000.0
+        with self._rescue_state_lock:
+            first_miss_at = self._first_static_miss_at.setdefault(
+                camera_id,
+                observed_at,
+            )
+            if observed_at - first_miss_at < interval_seconds:
+                return False, "static-rescue-warmup"
+            last_candidate_at = self._last_valid_candidate_at.get(camera_id)
+            if (
+                last_candidate_at is not None
+                and observed_at - last_candidate_at < PLATE_PRESENCE_RELEASE_SECONDS
+            ):
+                return False, "static-rescue-recent-recognition"
+            last_rescue_at = self._last_static_rescue_at.get(camera_id)
+            if (
+                last_rescue_at is not None
+                and observed_at - last_rescue_at < interval_seconds
+            ):
+                return False, "static-rescue-cooldown"
+            self._last_static_rescue_at[camera_id] = observed_at
+        LOGGER.debug(
+            "Static zero-detection rescue camera_id=%s "
+            "fallback_reason=static-zero-detection-rescue "
+            "cooldown_ms=%s priority=%s",
+            camera_id,
+            int(interval_seconds * 1000.0),
+            OcrJobType.STATIC_ZERO_DETECTION_RESCUE.priority,
+        )
+        return True, "none"
+
+    def note_valid_candidate(self, camera_id: int, observed_at: float) -> None:
+        with self._rescue_state_lock:
+            self._last_valid_candidate_at[camera_id] = observed_at
 
     def _should_run_zero_detection_fallback(
         self,
@@ -1741,6 +1849,7 @@ class PlateRecognitionProcessor:
         self._last_diagnostic_logged_at: dict[int, float] = {}
         self._last_pipeline_state: dict[int, tuple[RecognitionState, str | None]] = {}
         self._last_detector_error_logged_at: dict[int, float] = {}
+        self._last_detector_diagnostic_at: dict[tuple[int, str], float] = {}
         self._last_zero_detection_fallback_at: dict[int, float] = {}
         self._observation_frame_ids: dict[int, deque[int]] = defaultdict(deque)
         self._observation_frame_id_sets: dict[int, set[int]] = defaultdict(set)
@@ -1778,7 +1887,13 @@ class PlateRecognitionProcessor:
         if detector_config.enabled and self.detector is not None:
             try:
                 detections = self.detector.detect(roi_crop)
-                _log_plate_detector_diagnostics(camera_id, "live", self.detector)
+                _log_plate_detector_diagnostics(
+                    camera_id,
+                    "live",
+                    self.detector,
+                    roi_crop,
+                    self._last_detector_diagnostic_at,
+                )
             except Exception as exc:
                 self._log_detector_error(
                     camera_id,
@@ -2872,12 +2987,24 @@ class PlateRecognitionProcessor:
         now = time.monotonic()
         end_to_end_ms = max(0.0, (now - job.observed_at) * 1000.0)
         brightness = roi_mean_brightness(job.roi_crop)
+        candidate_rejection_reason = "none"
+        if outcome.state in {
+            RecognitionState.NO_OCR_TEXT,
+            RecognitionState.NO_VALID_PLATE,
+            RecognitionState.LOW_CONFIDENCE,
+            RecognitionState.AMBIGUOUS_DISCARDED,
+            RecognitionState.DUPLICATE_SUPPRESSED,
+        }:
+            candidate_rejection_reason = (
+                outcome.suppression_reason or outcome.state.value.lower()
+            )
         LOGGER.debug(
             "OCR worker diagnostics camera_id=%s direction=%s brightness=%.1f "
             "low_light=%s variants=%s queue_depth=%s queue_wait_ms=%.1f "
             "preprocess_ms=%.1f inference_ms=%.1f end_to_end_ms=%.1f "
             "job_type=%s priority=%s source=%s frame_id=%s fallback_reason=%s "
-            "candidate=%s recognition_state=%s confirmation=%s/%s",
+            "candidate=%s recognition_state=%s candidate_rejection_reason=%s "
+            "confirmation=%s/%s",
             job.camera_id,
             job.direction.value,
             brightness,
@@ -2895,6 +3022,7 @@ class PlateRecognitionProcessor:
             job.fallback_reason or "none",
             candidate.plate if candidate is not None else "none",
             outcome.state.value,
+            candidate_rejection_reason,
             outcome.confirmation_count,
             outcome.confirmation_required,
         )
@@ -3112,6 +3240,7 @@ class PlateRecognitionWorker(QObject):
         self._live_frames_since_replay = 0
         self._ocr_worker: PlateOcrWorker | None = None
         self._ocr_thread: threading.Thread | None = None
+        self._detector_processor: PlateDetectionProcessor | None = None
 
     def submit_frame(self, camera_id: int, direction: Direction, frame: object) -> None:
         if self._stop_event.is_set():
@@ -3244,6 +3373,7 @@ class PlateRecognitionWorker(QObject):
                 return
 
             detector_processor = PlateDetectionProcessor(self.config, detector)
+            self._detector_processor = detector_processor
             active_message = "OCR aktif."
             active_message += detector_message
             if self.config.warnings:
@@ -3371,6 +3501,15 @@ class PlateRecognitionWorker(QObject):
             self.finished.emit()
 
     def _publish_outcome(self, camera_id: int, outcome: RecognitionOutcome) -> None:
+        if (
+            outcome.candidate is not None
+            and outcome.state is not RecognitionState.LOW_CONFIDENCE
+            and self._detector_processor is not None
+        ):
+            self._detector_processor.note_valid_candidate(
+                camera_id,
+                time.monotonic(),
+            )
         if outcome.candidate is not None:
             self.candidate_changed.emit(camera_id, outcome.candidate)
         if outcome.record is not None:

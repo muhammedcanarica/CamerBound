@@ -38,15 +38,17 @@
       "fallback_to_roi_ocr": true,
       "zero_detection_roi_fallback_enabled": true,
       "zero_detection_roi_fallback_interval_ms": 750,
+      "static_zero_detection_rescue_enabled": true,
+      "static_zero_detection_rescue_interval_ms": 2500,
       "debug_overlay": true,
       "debug_detection_overlay_ttl_ms": 500
     },
     "roi": {
       "ENTRY": {
         "x": 0.004166666666666667,
-        "y": 0.3851851851851852,
+        "y": 0.34814814814814815,
         "width": 0.9958333333333333,
-        "height": 0.43703703703703706
+        "height": 0.4740740740740741
       },
       "EXIT": {
         "x": 0.005357142857142857,

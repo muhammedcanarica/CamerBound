@@ -36,6 +36,8 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                                 "fallback_to_roi_ocr": True,
                                 "zero_detection_roi_fallback_enabled": True,
                                 "zero_detection_roi_fallback_interval_ms": 750,
+                                "static_zero_detection_rescue_enabled": True,
+                                "static_zero_detection_rescue_interval_ms": 2500,
                                 "debug_overlay": False,
                                 "debug_detection_overlay_ttl_ms": 500,
                             },
@@ -58,6 +60,8 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertTrue(detector.fallback_to_roi_ocr)
         self.assertTrue(detector.zero_detection_roi_fallback_enabled)
         self.assertEqual(detector.zero_detection_roi_fallback_interval_ms, 750)
+        self.assertTrue(detector.static_zero_detection_rescue_enabled)
+        self.assertEqual(detector.static_zero_detection_rescue_interval_ms, 2500)
         self.assertFalse(detector.debug_overlay)
         self.assertEqual(detector.debug_detection_overlay_ttl_ms, 500)
         self.assertEqual(config.max_pending_ocr_jobs_per_camera, 3)
@@ -99,6 +103,8 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                                 "fallback_to_roi_ocr": "yes",
                                 "zero_detection_roi_fallback_enabled": "yes",
                                 "zero_detection_roi_fallback_interval_ms": -1,
+                                "static_zero_detection_rescue_enabled": "yes",
+                                "static_zero_detection_rescue_interval_ms": 100,
                                 "debug_detection_overlay_ttl_ms": -1,
                             }
                         },
@@ -118,6 +124,8 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertTrue(detector.fallback_to_roi_ocr)
         self.assertTrue(detector.zero_detection_roi_fallback_enabled)
         self.assertEqual(detector.zero_detection_roi_fallback_interval_ms, 750)
+        self.assertTrue(detector.static_zero_detection_rescue_enabled)
+        self.assertEqual(detector.static_zero_detection_rescue_interval_ms, 2500)
         self.assertEqual(detector.debug_detection_overlay_ttl_ms, 500)
         self.assertEqual(config.max_pending_ocr_jobs_per_camera, 3)
         self.assertEqual(config.ocr_job_max_age_ms, 2500)
