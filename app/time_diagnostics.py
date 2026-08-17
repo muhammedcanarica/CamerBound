@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import locale
 import logging
 import platform
 import subprocess
@@ -148,6 +149,8 @@ class TimeDiagnosticsService:
             ["w32tm", "/query", query],
             capture_output=True,
             text=True,
+            encoding=locale.getpreferredencoding(False) or "utf-8",
+            errors="replace",
             timeout=self.timeout_seconds,
             check=False,
             shell=False,

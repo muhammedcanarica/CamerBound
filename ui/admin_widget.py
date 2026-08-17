@@ -253,8 +253,24 @@ class CameraSettingsWidget(QWidget):
         self.diagnostics_label.setWordWrap(True)
         diagnostics_button = QPushButton("Modelleri Kontrol Et")
         diagnostics_button.clicked.connect(self._run_diagnostics)
+        capture_buttons = QHBoxLayout()
+        self.capture_entry_recognition_frame_button = QPushButton(
+            "Sonraki ENTRY Frame'ini Kaydet"
+        )
+        self.capture_exit_recognition_frame_button = QPushButton(
+            "Sonraki EXIT Frame'ini Kaydet"
+        )
+        self.capture_entry_recognition_frame_button.clicked.connect(
+            partial(self._arm_recognition_frame_capture, Direction.ENTRY)
+        )
+        self.capture_exit_recognition_frame_button.clicked.connect(
+            partial(self._arm_recognition_frame_capture, Direction.EXIT)
+        )
+        capture_buttons.addWidget(self.capture_entry_recognition_frame_button)
+        capture_buttons.addWidget(self.capture_exit_recognition_frame_button)
         diagnostics_layout.addWidget(self.diagnostics_label)
         diagnostics_layout.addWidget(diagnostics_button)
+        diagnostics_layout.addLayout(capture_buttons)
         layout.addWidget(diagnostics_group)
         self.time_group = QGroupBox("Saat Durumu")
         self.time_group.setObjectName("timeDiagnosticsGroup")
@@ -751,9 +767,66 @@ class CameraSettingsWidget(QWidget):
                 ]
                 lines.append(f"Backend: {selection.label}")
             lines.append(f"Servis: {self.recognition_service.get_status().value}")
+            health = self.recognition_service.get_runtime_health()
+            last_frame = (
+                "yok"
+                if health.last_frame_age_seconds is None
+                else f"{health.last_frame_age_seconds:.1f} sn önce"
+            )
+            lines.append(
+                "Runtime: "
+                f"frame={health.frames_ingested} (son={last_frame}), "
+                f"detector={health.detector_frames_processed} "
+                f"(hit={health.detector_hits}, miss={health.detector_misses}), "
+                f"OCR={health.ocr_jobs_processed}/{health.ocr_jobs_queued}, "
+                f"aday={health.valid_candidates}, "
+                f"hata={health.ocr_inference_errors}, kayıt={health.saved_records}"
+            )
+            lines.append(
+                "Son OCR işi: "
+                + (
+                    "yok"
+                    if health.last_ocr_job_age_seconds is None
+                    else f"{health.last_ocr_job_age_seconds:.1f} sn önce"
+                )
+                + ", inference="
+                + (
+                    "yok"
+                    if health.last_inference_ok is None
+                    else "OK" if health.last_inference_ok else "HATA"
+                )
+                + f", aday={health.last_candidate or 'yok'}, "
+                + (
+                    "durum=yok"
+                    if health.last_state is None
+                    else f"durum={health.last_state.value}"
+                )
+            )
+            lines.append(
+                f"Queue: {health.queue_depth}, drop={health.dropped_jobs}, "
+                f"stale={health.stale_jobs}"
+            )
             self.diagnostics_ready.emit("\n".join(lines))
 
         threading.Thread(target=check, name="ocr-diagnostics", daemon=True).start()
+
+    def _arm_recognition_frame_capture(
+        self,
+        direction: Direction,
+        _checked: bool = False,
+    ) -> None:
+        if self.recognition_service is None:
+            self.diagnostics_label.setText("OCR servisi bu ekrana bağlı değil.")
+            return
+        if not self.recognition_service.arm_raw_capture(direction):
+            self.diagnostics_label.setText(
+                "Recognition worker henüz hazır değil; servis ACTIVE olduktan sonra tekrar deneyin."
+            )
+            return
+        self.diagnostics_label.setText(
+            f"Sonraki {direction.value} exact recognition frame için tek-shot kayıt hazır. "
+            "Full frame ve configured ROI debug/recognition-frames altında oluşturulacak."
+        )
 
     @Slot(str)
     def _show_diagnostics(self, message: str) -> None:

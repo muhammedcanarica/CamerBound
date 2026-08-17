@@ -135,7 +135,7 @@ Zero-detection ROI fallback yalnız meaningful motion event sırasında veya eve
 
 Geniş ROI doğrudan 256×256 model girişine dönüştürüldüğünde yatay ve dikey ölçekler DEBUG logunda ayrıca raporlanır. Birincil detector ve kontrollü shadow pass sonuç vermezse en fazla üç örtüşen yatay tile üzerinde bounded recovery çalışır; tile koordinatları tekrar original ROI koordinatlarına çevrilir ve çakışan sonuçlar birleştirilir. Tile recovery crop'ları küçük plaka çevresindeki bağlamı kaybetmemek için ayrı `tiled_recovery_crop_padding_ratio=0.5` ayarını kullanır; normal detector crop padding'i `0.15` kalır. Başarılı birincil detector çağrısında tile maliyeti yoktur.
 
-Detector crop için mean brightness tek başına kullanılmaz. Her crop'ta mean/median/p10/p90, percentile dynamic range, grayscale standard deviation, local contrast, Laplacian sharpness ve siyah/beyaz saturation oranları ucuz deterministic istatistiklerle ölçülür; crop dahili olarak `NORMAL`, `LOW_LIGHT`, `SHADOW_LOW_CONTRAST` veya `OVEREXPOSED` profiline ayrılır. Mevcut 3 variant ve karanlık crop'taki mevcut dördüncü low-light variant ilk hızlı deneme olarak korunur. `NORMAL` ve `OVEREXPOSED` crop'larda ek OCR çağrısı yapılmaz. İlk deneme geçerli ve minimum confidence değerini geçen aday üretmezse `LOW_LIGHT` veya mean-normal `SHADOW_LOW_CONTRAST` crop'ta yalnız saha A/B ölçümünde seçilen shape-preserving gamma-gray variantı ikinci ve son batch olarak denenir. Validator, correction cost, confirmation, queue ve job priority kuralları değişmez.
+Detector crop için mean brightness tek başına kullanılmaz. Her crop'ta mean/median/p10/p90, percentile dynamic range, grayscale standard deviation, local contrast, Laplacian sharpness ve siyah/beyaz saturation oranları ucuz deterministic istatistiklerle ölçülür; crop dahili olarak `NORMAL`, `LOW_LIGHT`, `SHADOW_LOW_CONTRAST` veya `OVEREXPOSED` profiline ayrılır. Mevcut 3 variant ve karanlık crop'taki mevcut dördüncü low-light variant ilk hızlı deneme olarak korunur. `NORMAL` ve `OVEREXPOSED` crop'larda ek OCR çağrısı yapılmaz. İlk deneme geçerli aday üretmezse, minimum confidence altında kalırsa veya zor ışık crop'ında ayrı variant kümeleri iki geçerli plaka arasında eşit desteğe sahipse yalnız saha A/B ölçümünde seçilen shape-preserving gamma-gray variantı ikinci ve son batch/tie-breaker olarak denenir. Validator, correction cost, confirmation, queue ve job priority kuralları değişmez.
 
 Full ROI fallback maksimum 960 px genişlikte iki hafif variant kullanır: önce compact color variant tek başına denenir; geçerli ve minimum kaliteyi geçen plaka bulunamazsa CLAHE/low-light enhanced ikinci variant ayrı çağrıda denenir. Böylece büyük ENTRY ROI için 2x upscale dahil 3–4 variantı tek Paddle çağrısına verme kaldırılmıştır. PaddleOCR CPU kullanımı desteklenen `cpu_threads=4` ayarıyla sınırlandırılarak OpenVINO detector'ın CPU starvation riski azaltılır.
 
@@ -185,6 +185,8 @@ OCR worker diagnostics camera_id=1 direction=ENTRY profiles=LOW_LIGHT crop_quali
 
 DEBUG kaydı variant adı, Paddle text-box sayısı, raw/normalized/corrected text, correction cost, OCR confidence, bbox, validator sonucu ve rejection reason alanlarını bounded olarak içerir. Böylece `text_detection_boxes=0` ile text box üretildiği halde geçerli Türk plakası çıkmaması birbirinden ayrılır. Log camera başına throttle edilir ve INFO seviyesini doldurmaz.
 
+Admin OCR Tanılama ekranı model dosyaları ve servis durumuna ek olarak çalışma süresindeki frame ingest, detector hit/miss, queued/processed OCR işi, inference hatası, kayıt, son OCR aktivitesi ve bounded queue drop/stale sayaçlarını gösterir. Böylece `ACTIVE` yalnız initialization başarısı olarak kalırken gerçek frame/inference aktivitesi ayrıca görülebilir.
+
 Aynı saha frame'inde gerçek OpenVINO/PaddleOCR aşamalarını karşılaştırma:
 
 ```powershell
@@ -209,7 +211,9 @@ $env:CAMERBOUND_CAPTURE_NEXT_RECOGNITION_FRAME="1"
 .\run.bat
 ```
 
-Yalnız ilk detector frame'i `debug/recognition-frames/` altına yazılır; klasör Git tarafından yok sayılır ve özellik varsayılan olarak kapalıdır. DEBUG OCR diagnostics, worker aşaması, job türü, fallback nedeni, raw OCR segmenti, normalize/valid aday sonucu ve nihai rejection state'ini birlikte raporlar.
+Yalnız ilk detector frame'inin eşleşen `-full.jpg` ve exact configured ROI `-roi.jpg` çifti `debug/recognition-frames/` altına yazılır; klasör Git tarafından yok sayılır ve özellik varsayılan olarak kapalıdır. DEBUG OCR diagnostics, worker aşaması, job türü, fallback nedeni, raw OCR segmenti, normalize/valid aday sonucu ve nihai rejection state'ini birlikte raporlar.
+
+Uygulama zaten çalışıyorsa ADMIN `OCR Tanılama` bölümündeki yön-hedefli `Sonraki ENTRY/EXIT Frame'ini Kaydet` düğmeleri aynı tek-shot kaydı runtime'da armar; diğer kameranın frame'i tetikleyiciyi tüketmez ve kamera/OCR worker yeniden başlatılmaz. Düğmeye hedef araç configured ROI içindeyken basın; dosya adı ve INFO capture satırındaki `frame_id`, aynı frame'in detector/queue/OCR DEBUG satırlarıyla kesin eşleşir. Capture edilen tek frame için detector ve OCR DEBUG diagnostic throttle'ı bypass edilir; normal frameler throttled kalır.
 
 ### Detector modelini geliştirme ortamında hazırlama
 
@@ -236,7 +240,7 @@ Model zaten hazırsa aynı komut pip, download veya conversion çalıştırmadan
 
 Yerel bir Open Model Zoo checkout'u kullanmak isteyen geliştiriciler için `--omz-tools-dir C:\path\to\open_model_zoo\tools\model_tools` desteği korunur. Bütün pip/download/conversion işlemleri yalnızca bu hazırlama scripti açıkça çalıştırıldığında yapılır; `main.py` ve `run.bat` tamamen offline kalır. Model binary dosyaları Git'e eklenmez. Model kaynağı ve lisans notu [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) dosyasındadır.
 
-Minimum OCR kalite filtresini geçen tüm geçerli ve normalize edilmiş plakalar, confidence değeri ne olursa olsun iki tutarlı observation ile doğrulanır. OCR confidence değeri yalnızca dahili filtreleme, sıralama ve DEBUG diagnostics için kullanılır; kullanıcı arayüzünde doğruluk yüzdesi olarak gösterilmez.
+Minimum OCR kalite filtresini geçen tüm geçerli ve normalize edilmiş plakalar, confidence değeri ne olursa olsun iki tutarlı observation ile doğrulanır. Provisional doğrulamadan sonra yapılandırılmış stabilizasyon penceresi bütünüyle beklenir; aynı frame'deki preprocessing variantları tek bağımsız observation sayılır. Pencere içinde oluşan tek karakterlik iki geçerli plaka çatışması bağımsız frame oylarıyla çözülür, yeterli üstünlük yoksa kayıt oluşturulmaz. D/O gibi karakterler plaka değerine özel bir kuralla birbirine dönüştürülmez. OCR confidence değeri yalnızca dahili filtreleme, sıralama ve DEBUG diagnostics için kullanılır; kullanıcı arayüzünde doğruluk yüzdesi olarak gösterilmez.
 
 Plate presence kontrolüne ek olarak, aynı kamera ve aynı normalize plaka için son DB kaydı transaction içinde kontrol edilir. İlk kayıttan sonraki 120 saniye boyunca ikinci DB satırı veya JPEG oluşturulmaz. ENTRY ve EXIT kameraları birbirinden bağımsızdır ve kontrol SQLite kayıtlarından yapıldığı için uygulama yeniden başlatıldığında da devam eder.
 

@@ -26,6 +26,7 @@ from app.plate_capture import PlateCaptureService
 from app.plate_detector import DetectorDiagnostics, PlateDetection, PlateDetectorError
 from app.plate_recognition import (
     ConfirmationTracker,
+    DetectionJobResult,
     FrameSnapshot,
     LOW_LIGHT_THRESHOLD,
     MotionEvent,
@@ -460,6 +461,32 @@ class PreprocessingTests(unittest.TestCase):
         self.assertEqual(result.shadow_variant_count, 1)
         self.assertEqual(result.candidate.plate, "06GG986")
         self.assertEqual(result.candidate.correction_cost, 2)
+        self.assertEqual(result.shadow_retry_reason, "missing-candidate")
+
+    def test_tied_variant_consensus_uses_shadow_as_bounded_tie_breaker(self) -> None:
+        provider = SequencedOcrProvider(
+            [
+                [
+                    OcrSegment("01 KAC 53", 0.88, (0.0, 0.0, 100.0, 30.0), 0),
+                    OcrSegment("01 KAC 53", 0.95, (0.0, 0.0, 100.0, 30.0), 1),
+                    OcrSegment("31 KAC 53", 0.94, (0.0, 0.0, 100.0, 30.0), 2),
+                    OcrSegment("31 KAC 53", 0.97, (0.0, 0.0, 100.0, 30.0), 3),
+                ],
+                [OcrSegment("01 KAC 53", 0.91, (0.0, 0.0, 100.0, 30.0))],
+            ]
+        )
+
+        result = recognize_detector_crops(
+            provider,
+            [self._plate_crop(65, 20)],
+            camera_id=1,
+            min_confidence=0.65,
+        )
+
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(result.shadow_retry_reason, "variant-consensus-conflict")
+        self.assertEqual(result.candidate.plate, "01KAC53")
+        self.assertEqual(result.candidate.variant_support, 3)
 
     def test_low_light_recovery_adds_only_distinct_gamma_gray_variant(self) -> None:
         provider = SequencedOcrProvider([[], []])
@@ -496,6 +523,7 @@ class PreprocessingTests(unittest.TestCase):
         self.assertEqual(result.shadow_variant_count, 1)
         self.assertEqual(result.candidate.plate, "34ABC123")
         self.assertEqual(result.candidate.confidence, 0.93)
+        self.assertEqual(result.shadow_retry_reason, "low-confidence")
 
     def test_ocr_job_priority_contract_is_unchanged(self) -> None:
         self.assertEqual(
@@ -1396,6 +1424,10 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(worker.pending_frame_count, 1)
         worker.submit_frame(20, Direction.EXIT, frame)
         self.assertEqual(worker.pending_frame_count, 2)
+        health = worker.runtime_health()
+        self.assertEqual(health.frames_ingested, 101)
+        self.assertIsNotNone(health.last_frame_age_seconds)
+        self.assertEqual(health.ocr_jobs_processed, 0)
 
     def test_analysis_ingestion_keeps_bounded_frames_when_ui_preview_is_coalesced(self) -> None:
         worker = PlateRecognitionWorker(
@@ -2503,6 +2535,64 @@ class RecognitionPipelineTests(unittest.TestCase):
             diagnostic,
         )
 
+    def test_one_shot_capture_bypasses_detector_and_ocr_log_throttles(self) -> None:
+        now = time.monotonic()
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        worker._last_detection_diagnostic_at[1] = now
+        item = _PendingFrame(
+            direction=Direction.ENTRY,
+            frame=np.zeros((200, 400, 3), dtype=np.uint8),
+            received_at=now,
+            observed_at=now,
+            captured_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
+            frame_id=88,
+        )
+        detection_result = DetectionJobResult(
+            None,
+            (),
+            False,
+            None,
+            5.0,
+            100.0,
+            diagnostic_capture=True,
+        )
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as detector_logs:
+            worker._log_detection_diagnostics(
+                1,
+                item,
+                detection_result,
+                None,
+            )
+        self.assertTrue(
+            any(
+                "Detector worker diagnostics" in line and "frame_id=88" in line
+                for line in detector_logs.output
+            )
+        )
+
+        processor = PlateRecognitionProcessor(
+            FakeOcrProvider(confidence=0.97),
+            self.plate_service,
+            self.config,
+        )
+        processor._last_diagnostic_logged_at[1] = now
+        job = replace(
+            self._make_ocr_job(observed_at=now, frame_id=88),
+            diagnostic_capture=True,
+        )
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as ocr_logs:
+            processor.process_ocr_job(job, queue_depth=0)
+        self.assertTrue(
+            any(
+                "OCR worker diagnostics" in line and "frame_id=88" in line
+                for line in ocr_logs.output
+            )
+        )
+
     def test_full_roi_fallback_uses_single_compact_variant_on_early_success(self) -> None:
         provider = RecordingOcrProvider(confidence=0.97)
         processor = PlateRecognitionProcessor(provider, self.plate_service, self.config)
@@ -2724,8 +2814,78 @@ class RecognitionPipelineTests(unittest.TestCase):
             captures = list(
                 (Path(temp_directory) / "debug" / "recognition-frames").glob("*.jpg")
             )
+            full_capture = cv2.imread(
+                str(next(path for path in captures if path.name.endswith("-full.jpg")))
+            )
+            roi_capture = cv2.imread(
+                str(next(path for path in captures if path.name.endswith("-roi.jpg")))
+            )
 
-        self.assertEqual(len(captures), 1)
+        self.assertEqual(len(captures), 2)
+        self.assertEqual(full_capture.shape[:2], frame.shape[:2])
+        expected_roi = crop_roi(frame, self.config.roi_for(Direction.ENTRY))
+        self.assertEqual(roi_capture.shape[:2], expected_roi.shape[:2])
+
+    def test_raw_recognition_capture_can_be_armed_after_initial_frame(self) -> None:
+        frame = np.full((200, 400, 3), 71, dtype=np.uint8)
+        captured_at = datetime(2026, 8, 17, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp_directory, patch.dict(
+            "os.environ",
+            {"CAMERBOUND_CAPTURE_NEXT_RECOGNITION_FRAME": ""},
+        ), patch(
+            "app.plate_recognition.application_root",
+            return_value=Path(temp_directory),
+        ):
+            processor = PlateDetectionProcessor(
+                self.config,
+                FakePlateDetector([]),
+            )
+            processor.prepare_job(
+                1,
+                Direction.ENTRY,
+                frame,
+                captured_at=captured_at,
+                observed_at=10.0,
+                received_at=10.0,
+            )
+            processor.arm_raw_capture(Direction.ENTRY)
+            processor.prepare_job(
+                1,
+                Direction.EXIT,
+                frame,
+                captured_at=captured_at,
+                observed_at=11.0,
+                received_at=11.0,
+            )
+            processor.prepare_job(
+                1,
+                Direction.ENTRY,
+                frame,
+                captured_at=captured_at,
+                observed_at=12.0,
+                received_at=12.0,
+            )
+            processor.prepare_job(
+                1,
+                Direction.ENTRY,
+                frame,
+                captured_at=captured_at,
+                observed_at=13.0,
+                received_at=13.0,
+            )
+            captures = list(
+                (Path(temp_directory) / "debug" / "recognition-frames").glob("*.jpg")
+            )
+
+        self.assertEqual(len(captures), 2)
+        self.assertEqual(
+            sum(path.name.endswith("-full.jpg") for path in captures),
+            1,
+        )
+        self.assertEqual(
+            sum(path.name.endswith("-roi.jpg") for path in captures),
+            1,
+        )
 
     def test_static_rescue_candidate_normalizes_expected_field_plate(self) -> None:
         config = recognition_config(self.config.model_root, confirmations=1)
@@ -3488,11 +3648,11 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
         self.assertAlmostEqual(float(saved_image.mean()), 50.0, delta=3.0)
 
-    def test_clean_three_detector_frames_can_finalize_after_minimum_hold(self) -> None:
+    def test_clean_three_detector_frames_wait_for_full_stabilization_window(self) -> None:
         processor = PlateRecognitionProcessor(
             SequencedOcrProvider(
                 [
-                    [OcrSegment("23ABC122", 0.97, (0, 0, 10, 10), 0)]
+                    [OcrSegment("34DRF848", 0.97, (0, 0, 10, 10), 0)]
                     for _ in range(3)
                 ]
             ),
@@ -3511,14 +3671,193 @@ class RecognitionPipelineTests(unittest.TestCase):
             self._make_ocr_job(frame_id=702, observed_at=25.2), queue_depth=0
         )
         time.sleep(0.52)
-        finalized = processor.process_ocr_job(
+        third = processor.process_ocr_job(
             self._make_ocr_job(frame_id=703, observed_at=25.4), queue_depth=0
         )
 
         self.assertIs(provisional.state, RecognitionState.STABILIZING)
-        self.assertIs(finalized.state, RecognitionState.SAVED)
-        self.assertEqual(finalized.record.plate, "23ABC122")
+        self.assertIs(third.state, RecognitionState.STABILIZING)
+        self.assertIsNone(third.record)
+        self.assertEqual(self._record_count(), 0)
+        finalized = processor.finalize_due(
+            processor.next_pending_deadline() + 0.01
+        )[0][1]
+        self.assertEqual(finalized.record.plate, "34DRF848")
         self.assertEqual(processor.pending_decision_count, 0)
+
+    def test_regression_early_orf_then_three_drf_frames_saves_drf(self) -> None:
+        texts = ("34ORF848", "34DRF848", "34DRF848", "34DRF848")
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [[OcrSegment(text, 0.97, (0, 0, 10, 10), 0)] for text in texts]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2000,
+                stabilization_min_hold_ms=500,
+            ),
+        )
+
+        outcomes = [
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    frame_id=710 + index,
+                    observed_at=26.0 + index * 0.2,
+                ),
+                queue_depth=0,
+            )
+            for index in range(len(texts))
+        ]
+
+        self.assertTrue(all(outcome.record is None for outcome in outcomes))
+        finalized = processor.finalize_due(
+            processor.next_pending_deadline() + 0.01
+        )[0][1]
+        self.assertIs(finalized.state, RecognitionState.SAVED)
+        self.assertEqual(finalized.record.plate, "34DRF848")
+        self.assertEqual(self._record_count(), 1)
+
+    def test_regression_two_orf_two_drf_frames_are_discarded_as_ambiguous(self) -> None:
+        texts = ("34ORF848", "34ORF848", "34DRF848", "34DRF848")
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [[OcrSegment(text, 0.97, (0, 0, 10, 10), 0)] for text in texts]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2000,
+                stabilization_min_hold_ms=500,
+            ),
+        )
+
+        for index in range(len(texts)):
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    frame_id=720 + index,
+                    observed_at=27.0 + index * 0.2,
+                ),
+                queue_depth=0,
+            )
+
+        finalized = processor.finalize_due(
+            processor.next_pending_deadline() + 0.01
+        )[0][1]
+        self.assertIs(finalized.state, RecognitionState.AMBIGUOUS_DISCARDED)
+        self.assertIsNone(finalized.record)
+        self.assertEqual(self._record_count(), 0)
+
+    def test_regression_same_frame_variants_count_as_one_orf_vote(self) -> None:
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [
+                        OcrSegment("34 ORF 848", 0.96, (0, 0, 10, 10), 0),
+                        OcrSegment("34ORF848", 0.97, (0, 0, 10, 10), 1),
+                        OcrSegment("34 ORF848", 0.95, (0, 0, 10, 10), 2),
+                    ]
+                ]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2000,
+                stabilization_min_hold_ms=500,
+            ),
+        )
+
+        outcome = processor.process_ocr_job(
+            self._make_ocr_job(frame_id=730, observed_at=28.0), queue_depth=0
+        )
+
+        self.assertIs(outcome.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertEqual(outcome.confirmation_count, 1)
+        self.assertEqual(outcome.candidate.plate, "34ORF848")
+        self.assertEqual(outcome.candidate.variant_support, 3)
+        self.assertEqual(self._record_count(), 0)
+
+    def test_regression_clean_orf_is_not_rewritten_to_drf(self) -> None:
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("34ORF848", 0.97, (0, 0, 10, 10), 0)]
+                    for _ in range(3)
+                ]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2000,
+                stabilization_min_hold_ms=500,
+            ),
+        )
+
+        outcomes = [
+            processor.process_ocr_job(
+                self._make_ocr_job(frame_id=740 + index, observed_at=29.0 + index * 0.2),
+                queue_depth=0,
+            )
+            for index in range(3)
+        ]
+
+        self.assertTrue(all(outcome.record is None for outcome in outcomes))
+        finalized = processor.finalize_due(
+            processor.next_pending_deadline() + 0.01
+        )[0][1]
+        self.assertIs(finalized.state, RecognitionState.SAVED)
+        self.assertEqual(finalized.record.plate, "34ORF848")
+
+    def test_regression_late_drf_evidence_prevents_early_orf_save(self) -> None:
+        texts = (
+            "34ORF848",
+            "34ORF848",
+            "34ORF848",
+            "34DRF848",
+            "34DRF848",
+            "34DRF848",
+            "34DRF848",
+        )
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [[OcrSegment(text, 0.97, (0, 0, 10, 10), 0)] for text in texts]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2000,
+                stabilization_min_hold_ms=500,
+            ),
+        )
+
+        processor.process_ocr_job(
+            self._make_ocr_job(frame_id=750, observed_at=30.0), queue_depth=0
+        )
+        processor.process_ocr_job(
+            self._make_ocr_job(frame_id=751, observed_at=30.2), queue_depth=0
+        )
+        time.sleep(0.52)
+        early_consensus = processor.process_ocr_job(
+            self._make_ocr_job(frame_id=752, observed_at=30.4), queue_depth=0
+        )
+
+        self.assertIs(early_consensus.state, RecognitionState.STABILIZING)
+        self.assertIsNone(early_consensus.record)
+        self.assertEqual(self._record_count(), 0)
+        for index in range(3, len(texts)):
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    frame_id=750 + index,
+                    observed_at=30.0 + index * 0.2,
+                ),
+                queue_depth=0,
+            )
+        finalized = processor.finalize_due(
+            processor.next_pending_deadline() + 0.01
+        )[0][1]
+        self.assertIs(finalized.state, RecognitionState.SAVED)
+        self.assertEqual(finalized.record.plate, "34DRF848")
+        self.assertEqual(self._record_count(), 1)
 
     def test_stabilization_applies_conflict_margin_rules(self) -> None:
         cases = (
@@ -4074,6 +4413,11 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         error_index = statuses.index(RecognitionStatus.ERROR)
         self.assertIn(RecognitionStatus.ACTIVE, statuses[error_index + 1 :])
+        health = worker.runtime_health()
+        self.assertEqual(health.frames_ingested, 2)
+        self.assertEqual(health.ocr_inference_errors, 1)
+        self.assertGreaterEqual(health.ocr_jobs_processed, 1)
+        self.assertIs(health.last_inference_ok, True)
 
     def test_debug_output_paths_are_created(self) -> None:
         output = Path(self.temp_directory.name) / "debug"

@@ -67,6 +67,7 @@ class OcrRun:
     shadow_variant_count: int
     inference_calls: int
     text_detection_box_counts: list[int | None]
+    shadow_retry_reason: str | None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -230,6 +231,7 @@ def _run_ocr(
             shadow_variant_count=result.shadow_variant_count,
             inference_calls=result.inference_calls,
             text_detection_box_counts=list(result.text_detection_box_counts),
+            shadow_retry_reason=result.shadow_retry_reason,
         )
 
     started = time.perf_counter()
@@ -310,6 +312,7 @@ def _run_ocr(
         ),
         inference_calls=inference_calls,
         text_detection_box_counts=text_detection_box_counts,
+        shadow_retry_reason=None,
     )
 
 
@@ -346,7 +349,8 @@ def _print_ocr(run: OcrRun) -> None:
         f"variants={len(run.variants)} preprocess_ms={run.preprocess_ms:.1f} "
         f"inference_ms={run.inference_ms:.1f} inference_calls={run.inference_calls} "
         f"current_variants={run.current_variant_count} "
-        f"shadow_variants={run.shadow_variant_count}"
+        f"shadow_variants={run.shadow_variant_count} "
+        f"shadow_retry_reason={run.shadow_retry_reason or 'none'}"
     )
     segments_by_variant: dict[int, list[OcrSegment]] = {}
     for segment in run.segments:

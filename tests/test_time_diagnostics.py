@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import locale
 import os
 import subprocess
 import tempfile
@@ -152,6 +153,11 @@ class TimeDiagnosticsServiceTests(unittest.TestCase):
         for _args, kwargs in runner.calls:
             self.assertIs(kwargs["shell"], False)
             self.assertEqual(kwargs["timeout"], 4.0)
+            self.assertEqual(
+                kwargs["encoding"],
+                locale.getpreferredencoding(False) or "utf-8",
+            )
+            self.assertEqual(kwargs["errors"], "replace")
             self.assertEqual(kwargs["creationflags"], getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 

@@ -261,6 +261,7 @@ class DetectorCropOcrResult:
     current_inference_ms: float
     shadow_preprocess_ms: float
     shadow_inference_ms: float
+    shadow_retry_reason: str | None
 
 
 class OcrProvider(Protocol):
@@ -671,7 +672,6 @@ class _PlateDecisionEvaluation:
     required_votes: int
     near_conflicts: tuple[str, ...]
     reliable: bool
-    early_finalizable: bool
     suppression_reason: str | None = None
 
 
@@ -697,6 +697,27 @@ class RecognitionOutcome:
     detections: tuple[PlateDetection, ...] = ()
     used_roi_fallback: bool = False
     suppression_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecognitionRuntimeHealth:
+    frames_ingested: int = 0
+    detector_frames_processed: int = 0
+    detector_hits: int = 0
+    detector_misses: int = 0
+    ocr_jobs_queued: int = 0
+    ocr_jobs_processed: int = 0
+    ocr_inference_errors: int = 0
+    valid_candidates: int = 0
+    saved_records: int = 0
+    queue_depth: int = 0
+    dropped_jobs: int = 0
+    stale_jobs: int = 0
+    last_frame_age_seconds: float | None = None
+    last_ocr_job_age_seconds: float | None = None
+    last_inference_ok: bool | None = None
+    last_candidate: str | None = None
+    last_state: RecognitionState | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1073,6 +1094,7 @@ class OcrJob:
     frame_id: int | None = None
     detector_source: str = "live"
     ocr_crop_detections: tuple[PlateDetection | None, ...] = ()
+    diagnostic_capture: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1090,6 +1112,7 @@ class DetectionJobResult:
     motion_score: float = 0.0
     event_frames: int = 0
     ring_depth: int = 0
+    diagnostic_capture: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1341,9 +1364,17 @@ class PlateDetectionProcessor:
         self._last_static_rescue_at: dict[int, float] = {}
         self._last_valid_candidate_at: dict[int, float] = {}
         self._rescue_state_lock = threading.Lock()
-        self._raw_capture_pending = (
-            os.getenv(RAW_RECOGNITION_CAPTURE_ENV, "").strip() == "1"
-        )
+        self._raw_capture_lock = threading.Lock()
+        self._raw_capture_pending = threading.Event()
+        self._raw_capture_direction: Direction | None = None
+        if os.getenv(RAW_RECOGNITION_CAPTURE_ENV, "").strip() == "1":
+            self._raw_capture_pending.set()
+
+    def arm_raw_capture(self, direction: Direction | None = None) -> None:
+        """Capture exactly one future CameraWorker recognition frame and ROI."""
+        with self._raw_capture_lock:
+            self._raw_capture_direction = direction
+            self._raw_capture_pending.set()
 
     def prepare_job(
         self,
@@ -1365,7 +1396,13 @@ class PlateDetectionProcessor:
         roi_crop = crop_roi(frame, self.config.roi_for(direction))
         if roi_crop is None:
             return DetectionJobResult(None, (), False, None, 0.0, 0.0)
-        self._capture_raw_frame_once(camera_id, direction, frame)
+        diagnostic_capture = self._capture_raw_frame_once(
+            camera_id,
+            direction,
+            frame,
+            roi_crop,
+            frame_id=frame_id,
+        )
 
         detector_started_at = time.perf_counter()
         detector_config = self.config.plate_detector
@@ -1508,6 +1545,7 @@ class PlateDetectionProcessor:
                 motion_score or 0.0,
                 event_frames,
                 ring_depth,
+                diagnostic_capture,
             )
 
         full_frame = frame
@@ -1522,6 +1560,7 @@ class PlateDetectionProcessor:
                 fallback_reason,
                 detector_ms,
                 brightness,
+                diagnostic_capture=diagnostic_capture,
             )
         job_type = OcrJobType.DETECTOR_CROP
         if fallback_reason == "zero-detection":
@@ -1551,6 +1590,7 @@ class PlateDetectionProcessor:
             frame_id=frame_id,
             detector_source=detector_source,
             ocr_crop_detections=tuple(ocr_crop_detections),
+            diagnostic_capture=diagnostic_capture,
         )
         return DetectionJobResult(
             job,
@@ -1566,6 +1606,7 @@ class PlateDetectionProcessor:
             motion_score or 0.0,
             event_frames,
             ring_depth,
+            diagnostic_capture,
         )
 
     def _should_run_static_zero_detection_rescue(
@@ -1619,29 +1660,58 @@ class PlateDetectionProcessor:
         camera_id: int,
         direction: Direction,
         frame: object,
-    ) -> None:
-        if not self._raw_capture_pending or not isinstance(frame, np.ndarray):
-            return
-        self._raw_capture_pending = False
+        roi_crop: np.ndarray,
+        *,
+        frame_id: int | None,
+    ) -> bool:
+        if not isinstance(frame, np.ndarray):
+            return False
+        with self._raw_capture_lock:
+            if not self._raw_capture_pending.is_set():
+                return False
+            if (
+                self._raw_capture_direction is not None
+                and self._raw_capture_direction is not direction
+            ):
+                return False
+            self._raw_capture_pending.clear()
+            self._raw_capture_direction = None
         try:
             output_dir = application_root() / "debug" / "recognition-frames"
             output_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            output_path = output_dir / (
-                f"camera-{camera_id}-{direction.value.lower()}-{timestamp}.jpg"
+            frame_token = f"-frame-{frame_id}" if frame_id is not None else ""
+            stem = (
+                f"camera-{camera_id}-{direction.value.lower()}"
+                f"{frame_token}-{timestamp}"
             )
-            if cv2.imwrite(str(output_path), frame):
-                LOGGER.info("One-shot recognition frame captured path=%s", output_path)
+            full_path = output_dir / f"{stem}-full.jpg"
+            roi_path = output_dir / f"{stem}-roi.jpg"
+            if cv2.imwrite(str(full_path), frame) and cv2.imwrite(
+                str(roi_path),
+                roi_crop,
+            ):
+                LOGGER.info(
+                    "One-shot recognition frame captured camera_id=%s frame_id=%s "
+                    "full_path=%s roi_path=%s",
+                    camera_id,
+                    frame_id,
+                    full_path,
+                    roi_path,
+                )
             else:
                 LOGGER.warning(
-                    "One-shot recognition frame capture failed path=%s",
-                    output_path,
+                    "One-shot recognition frame capture failed full_path=%s "
+                    "roi_path=%s",
+                    full_path,
+                    roi_path,
                 )
         except OSError as exc:
             LOGGER.warning(
                 "One-shot recognition frame capture failed error_type=%s",
                 type(exc).__name__,
             )
+        return True
 
     def note_valid_candidate(self, camera_id: int, observed_at: float) -> None:
         with self._rescue_state_lock:
@@ -2210,6 +2280,7 @@ class PlateRecognitionProcessor:
         inference_calls = 0
         shadow_preprocess_ms = 0.0
         shadow_inference_ms = 0.0
+        shadow_retry_reason: str | None = None
         if job.job_type is OcrJobType.DETECTOR_CROP:
             detector_ocr = recognize_detector_crops(
                 self.provider,
@@ -2240,6 +2311,7 @@ class PlateRecognitionProcessor:
             )
             shadow_preprocess_ms = detector_ocr.shadow_preprocess_ms
             shadow_inference_ms = detector_ocr.shadow_inference_ms
+            shadow_retry_reason = detector_ocr.shadow_retry_reason
         else:
             # Full ROI detection is the expensive safety path. Try the compact
             # color image first and only pay for enhanced contrast when needed.
@@ -2325,6 +2397,7 @@ class PlateRecognitionProcessor:
             inference_calls=inference_calls,
             shadow_preprocess_ms=shadow_preprocess_ms,
             shadow_inference_ms=shadow_inference_ms,
+            shadow_retry_reason=shadow_retry_reason,
         )
         return outcome
 
@@ -2440,12 +2513,9 @@ class PlateRecognitionProcessor:
             )
         if pending_decision is not None:
             evaluation = self._evaluate_pending_decision(pending_decision)
-            if (
-                evaluation.early_finalizable
-                and pending_decision.min_hold_until_monotonic is not None
-                and processing_now >= pending_decision.min_hold_until_monotonic
-            ):
-                return self._finalize_pending_decision(camera_id)
+            # A missing rival before the deadline is not proof that a later frame
+            # will not expose a one-character valid conflict. The configured
+            # window, rather than the minimum hold, owns final persistence.
             leader = evaluation.winner or candidate
             state = (
                 RecognitionState.STABILIZING
@@ -2701,7 +2771,7 @@ class PlateRecognitionProcessor:
         decision: PendingPlateDecision,
     ) -> _PlateDecisionEvaluation:
         if not decision.observations:
-            return _PlateDecisionEvaluation(None, 0, 0, 1, (), False, False)
+            return _PlateDecisionEvaluation(None, 0, 0, 1, (), False)
         provisional = decision.provisional_plate
         counts: dict[str, int] = defaultdict(int)
         groups: dict[str, list[_PlateEvidenceObservation]] = defaultdict(list)
@@ -2781,19 +2851,39 @@ class PlateRecognitionProcessor:
             and post_save_safe
             and (margin_ok or trailing_reversal)
         )
-        early_finalizable = (
-            reliable
-            and not competing
-            and not correction_risk
-            and post_save_near_plate is None
-            and detector_votes >= RISKY_CONFIRMATIONS_REQUIRED
-            and winner_votes >= RISKY_CONFIRMATIONS_REQUIRED
-        )
         near_conflicts = tuple(sorted(competing))
         if not reliable and suppression_reason is None and competing:
             suppression_reason = "near-duplicate-ambiguity"
         confidence = sum(item.candidate.confidence for item in winner_items) / winner_votes
         winner = replace(winner, confidence=confidence)
+        candidate_evidence = "|".join(
+            (
+                f"{plate}:votes={len(items)},"
+                f"frames={','.join(str(item.frame_key) for item in items)},"
+                f"variant_support={sum(item.candidate.variant_support for item in items)},"
+                f"confidence={sum(item.candidate.confidence for item in items) / len(items):.3f},"
+                f"correction_costs={','.join(str(item.candidate.correction_cost) for item in items)},"
+                f"detector_votes={sum(item.candidate.detector_crop_evidence for item in items)},"
+                f"raw={items[-1].candidate.raw_text.replace('|', '/').replace(chr(10), ' ')[:48]!r}"
+            )
+            for plate, items in sorted(cluster.items())
+        )
+        LOGGER.debug(
+            "Plate stabilization evaluation camera_id=%s provisional=%s "
+            "candidates=%s winner=%s winner_votes=%s runner_up_votes=%s "
+            "required_votes=%s near_conflicts=%s reliable=%s "
+            "finalization=window-deadline suppression_reason=%s",
+            decision.camera_id,
+            provisional or "none",
+            candidate_evidence or "none",
+            winner.plate,
+            winner_votes,
+            runner_up_votes,
+            required_votes,
+            ",".join(near_conflicts) or "none",
+            reliable,
+            suppression_reason or "none",
+        )
         return _PlateDecisionEvaluation(
             winner=winner,
             winner_votes=winner_votes,
@@ -2801,7 +2891,6 @@ class PlateRecognitionProcessor:
             required_votes=required_votes,
             near_conflicts=near_conflicts,
             reliable=reliable,
-            early_finalizable=early_finalizable,
             suppression_reason=suppression_reason,
         )
 
@@ -3166,6 +3255,7 @@ class PlateRecognitionProcessor:
         inference_calls: int,
         shadow_preprocess_ms: float,
         shadow_inference_ms: float,
+        shadow_retry_reason: str | None,
     ) -> None:
         if not LOGGER.isEnabledFor(logging.DEBUG):
             return
@@ -3174,6 +3264,7 @@ class PlateRecognitionProcessor:
             last_logged_at is not None
             and ocr_started_at - last_logged_at
             < OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS
+            and not job.diagnostic_capture
         ):
             return
         self._last_diagnostic_logged_at[job.camera_id] = ocr_started_at
@@ -3198,6 +3289,7 @@ class PlateRecognitionProcessor:
             "queue_depth=%s queue_wait_ms=%.1f "
             "preprocess_ms=%.1f inference_ms=%.1f end_to_end_ms=%.1f "
             "shadow_preprocess_ms=%.1f shadow_inference_ms=%.1f "
+            "shadow_retry_reason=%s "
             "job_type=%s priority=%s source=%s frame_id=%s fallback_reason=%s "
             "candidate=%s recognition_state=%s candidate_rejection_reason=%s "
             "confirmation=%s/%s detector_bboxes=%s text_detection_boxes=%s "
@@ -3223,6 +3315,7 @@ class PlateRecognitionProcessor:
             end_to_end_ms,
             shadow_preprocess_ms,
             shadow_inference_ms,
+            shadow_retry_reason or "none",
             job.job_type.value,
             job.job_type.priority,
             job.detector_source,
@@ -3313,6 +3406,8 @@ class PlateOcrWorker:
         stop_event: threading.Event,
         on_outcome: Callable[[int, RecognitionOutcome], None],
         on_status: Callable[[RecognitionStatus, str], None],
+        on_job_processed: Callable[[OcrJob, RecognitionOutcome], None] | None = None,
+        on_inference_error: Callable[[], None] | None = None,
     ) -> None:
         self.plate_service = plate_service
         self.config = config
@@ -3321,6 +3416,8 @@ class PlateOcrWorker:
         self.stop_event = stop_event
         self.on_outcome = on_outcome
         self.on_status = on_status
+        self.on_job_processed = on_job_processed
+        self.on_inference_error = on_inference_error
         self.initialized = threading.Event()
         self.failed = threading.Event()
         self.initialization_error: Exception | None = None
@@ -3399,11 +3496,15 @@ class PlateOcrWorker:
                 except Exception as exc:
                     LOGGER.exception("Transient OCR inference error")
                     self.on_status(RecognitionStatus.ERROR, f"OCR hatası: {exc}")
+                    if self.on_inference_error is not None:
+                        self.on_inference_error()
                     recovering_from_error = True
                     continue
                 if recovering_from_error:
                     self.on_status(RecognitionStatus.ACTIVE, "OCR yeniden aktif.")
                     recovering_from_error = False
+                if self.on_job_processed is not None:
+                    self.on_job_processed(job, outcome)
                 self.on_outcome(job.camera_id, outcome)
                 if not emit_due_outcomes():
                     recovering_from_error = True
@@ -3461,6 +3562,27 @@ class PlateRecognitionWorker(QObject):
         self._ocr_worker: PlateOcrWorker | None = None
         self._ocr_thread: threading.Thread | None = None
         self._detector_processor: PlateDetectionProcessor | None = None
+        self._frames_ingested = 0
+        self._detector_frames_processed = 0
+        self._detector_hits = 0
+        self._detector_misses = 0
+        self._ocr_jobs_queued = 0
+        self._ocr_jobs_processed = 0
+        self._ocr_inference_errors = 0
+        self._valid_candidates = 0
+        self._saved_records = 0
+        self._last_frame_at: float | None = None
+        self._last_ocr_job_at: float | None = None
+        self._last_inference_ok: bool | None = None
+        self._last_candidate: str | None = None
+        self._last_state: RecognitionState | None = None
+
+    def arm_raw_capture(self, direction: Direction | None = None) -> bool:
+        processor = self._detector_processor
+        if processor is None:
+            return False
+        processor.arm_raw_capture(direction)
+        return True
 
     def submit_frame(self, camera_id: int, direction: Direction, frame: object) -> None:
         if self._stop_event.is_set():
@@ -3470,6 +3592,8 @@ class PlateRecognitionWorker(QObject):
         with self._lock:
             frame_id = self._next_frame_id
             self._next_frame_id += 1
+            self._frames_ingested += 1
+            self._last_frame_at = observed_at
         owned_frame = frame
         if isinstance(frame, np.ndarray) and frame.flags.writeable:
             owned_frame = frame.copy()
@@ -3553,6 +3677,8 @@ class PlateRecognitionWorker(QObject):
             self._stop_event,
             self._publish_outcome,
             self.status_changed.emit,
+            self._record_ocr_job_processed,
+            self._record_ocr_inference_error,
         )
         ocr_thread = threading.Thread(
             target=ocr_worker.run,
@@ -3627,6 +3753,8 @@ class PlateRecognitionWorker(QObject):
                             if result.job is not None
                             else None
                         )
+                        if buffer_result is not None and buffer_result.accepted:
+                            self._record_ocr_job_queued()
                         self._log_event_end_fallback(
                             completed_event,
                             result,
@@ -3677,6 +3805,7 @@ class PlateRecognitionWorker(QObject):
                     continue
                 if source == "live":
                     self.detections_changed.emit(camera_id, result.detections)
+                self._record_detector_result(bool(result.detections))
                 if result.job is None:
                     if source == "live":
                         self.outcome_changed.emit(
@@ -3694,6 +3823,8 @@ class PlateRecognitionWorker(QObject):
                     )
                     continue
                 buffer_result = self._job_buffer.add(result.job)
+                if buffer_result.accepted:
+                    self._record_ocr_job_queued()
                 self._log_detection_diagnostics(
                     camera_id,
                     item,
@@ -3720,7 +3851,79 @@ class PlateRecognitionWorker(QObject):
             self.status_changed.emit(RecognitionStatus.STOPPED, "OCR durduruldu.")
             self.finished.emit()
 
+    def runtime_health(self) -> RecognitionRuntimeHealth:
+        now = time.monotonic()
+        with self._lock:
+            values = {
+                "frames_ingested": self._frames_ingested,
+                "detector_frames_processed": self._detector_frames_processed,
+                "detector_hits": self._detector_hits,
+                "detector_misses": self._detector_misses,
+                "ocr_jobs_queued": self._ocr_jobs_queued,
+                "ocr_jobs_processed": self._ocr_jobs_processed,
+                "ocr_inference_errors": self._ocr_inference_errors,
+                "valid_candidates": self._valid_candidates,
+                "saved_records": self._saved_records,
+                "last_frame_age_seconds": (
+                    None
+                    if self._last_frame_at is None
+                    else max(0.0, now - self._last_frame_at)
+                ),
+                "last_ocr_job_age_seconds": (
+                    None
+                    if self._last_ocr_job_at is None
+                    else max(0.0, now - self._last_ocr_job_at)
+                ),
+                "last_inference_ok": self._last_inference_ok,
+                "last_candidate": self._last_candidate,
+                "last_state": self._last_state,
+            }
+        return RecognitionRuntimeHealth(
+            **values,
+            queue_depth=self._job_buffer.pending_count(),
+            dropped_jobs=self._job_buffer.dropped_count,
+            stale_jobs=self._job_buffer.stale_count,
+        )
+
+    def _record_detector_result(self, detected: bool) -> None:
+        with self._lock:
+            self._detector_frames_processed += 1
+            if detected:
+                self._detector_hits += 1
+            else:
+                self._detector_misses += 1
+
+    def _record_ocr_job_queued(self) -> None:
+        with self._lock:
+            self._ocr_jobs_queued += 1
+
+    def _record_ocr_job_processed(
+        self,
+        _job: OcrJob,
+        outcome: RecognitionOutcome,
+    ) -> None:
+        with self._lock:
+            self._ocr_jobs_processed += 1
+            self._last_ocr_job_at = time.monotonic()
+            self._last_inference_ok = True
+            self._last_state = outcome.state
+            if outcome.candidate is not None:
+                self._valid_candidates += 1
+                self._last_candidate = outcome.candidate.plate
+
+    def _record_ocr_inference_error(self) -> None:
+        with self._lock:
+            self._ocr_inference_errors += 1
+            self._last_ocr_job_at = time.monotonic()
+            self._last_inference_ok = False
+
     def _publish_outcome(self, camera_id: int, outcome: RecognitionOutcome) -> None:
+        with self._lock:
+            self._last_state = outcome.state
+            if outcome.candidate is not None:
+                self._last_candidate = outcome.candidate.plate
+            if outcome.record is not None:
+                self._saved_records += 1
         if (
             outcome.candidate is not None
             and outcome.state is not RecognitionState.LOW_CONFIDENCE
@@ -3751,6 +3954,7 @@ class PlateRecognitionWorker(QObject):
         if (
             last_logged_at is not None
             and now - last_logged_at < OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS
+            and not result.diagnostic_capture
         ):
             return
         self._last_detection_diagnostic_at[camera_id] = now
@@ -4104,6 +4308,21 @@ class PlateRecognitionService(QObject):
     def get_status(self) -> RecognitionStatus:
         return self._status
 
+    def get_runtime_health(self) -> RecognitionRuntimeHealth:
+        with self._ingest_lock:
+            runtime = self._runtime
+        if runtime is None:
+            return RecognitionRuntimeHealth()
+        return runtime.worker.runtime_health()
+
+    def arm_raw_capture(self, direction: Direction | None = None) -> bool:
+        """Arm a bounded capture without restarting cameras or OCR workers."""
+        with self._ingest_lock:
+            runtime = self._runtime
+        if runtime is None:
+            return False
+        return runtime.worker.arm_raw_capture(direction)
+
     def apply_config(self, config: PlateRecognitionConfig) -> None:
         """Apply OCR settings while camera preview threads keep running."""
         was_running = self._runtime is not None
@@ -4446,14 +4665,24 @@ def recognize_detector_crops(
     shadow_preprocess_ms = 0.0
     shadow_inference_ms = 0.0
     inference_calls = 1 if variants else 0
-    needs_shadow_recovery = (
-        candidate is None or candidate.confidence < min_confidence
-    ) and any(
+    shadow_recovery_eligible = any(
         _is_shadow_recovery_eligible(profile, crop_metrics)
         for profile, crop_metrics in zip(profiles, metrics)
     )
+    shadow_retry_reason: str | None = None
+    if shadow_recovery_eligible:
+        if candidate is None:
+            shadow_retry_reason = "missing-candidate"
+        elif candidate.confidence < min_confidence:
+            shadow_retry_reason = "low-confidence"
+        elif _has_disjoint_variant_consensus_conflict(
+            segments,
+            candidate,
+            camera_id,
+        ):
+            shadow_retry_reason = "variant-consensus-conflict"
 
-    if needs_shadow_recovery:
+    if shadow_retry_reason is not None:
         shadow_preprocess_started = time.perf_counter()
         shadow_variants: list[np.ndarray] = []
         for crop_index, (crop, profile) in enumerate(zip(crops, profiles)):
@@ -4523,11 +4752,34 @@ def recognize_detector_crops(
         current_inference_ms=current_inference_ms,
         shadow_preprocess_ms=shadow_preprocess_ms,
         shadow_inference_ms=shadow_inference_ms,
+        shadow_retry_reason=shadow_retry_reason,
     )
 
 
 def _crop_variant_name(name: str, crop_index: int, crop_count: int) -> str:
     return name if crop_count == 1 else f"crop-{crop_index}-{name}"
+
+
+def _has_disjoint_variant_consensus_conflict(
+    segments: Sequence[OcrSegment],
+    candidate: PlateCandidate,
+    camera_id: int,
+) -> bool:
+    """Detect a tied valid rival supported by a separate variant set."""
+    if not candidate.supporting_variants:
+        return False
+    supporting_variants = set(candidate.supporting_variants)
+    remaining = [
+        segment
+        for segment in segments
+        if segment.variant_index not in supporting_variants
+    ]
+    rival = select_best_candidate(remaining, camera_id)
+    return bool(
+        rival is not None
+        and rival.plate != candidate.plate
+        and rival.variant_support >= candidate.variant_support
+    )
 
 
 def _is_shadow_recovery_eligible(
