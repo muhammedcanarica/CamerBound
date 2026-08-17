@@ -15,11 +15,19 @@ def save_debug_images(
     crop: np.ndarray,
     variants: Sequence[np.ndarray],
     segments: Sequence[OcrSegment],
+    variant_names: Sequence[str] | None = None,
 ) -> tuple[Path, ...]:
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     items = [("01-source.jpg", source), ("02-roi.jpg", crop)]
-    items.extend((f"{index + 3:02d}-variant-{index}.jpg", image) for index, image in enumerate(variants))
+    names = list(variant_names or ())
+    items.extend(
+        (
+            f"{index + 3:02d}-variant-{_safe_name(names[index] if index < len(names) else str(index))}.jpg",
+            image,
+        )
+        for index, image in enumerate(variants)
+    )
     for filename, image in items:
         path = output_dir / filename
         if not cv2.imwrite(str(path), image):
@@ -43,8 +51,18 @@ def save_debug_images(
                 1,
                 cv2.LINE_AA,
             )
-        path = output_dir / f"{len(items) + variant_index + 1:02d}-result-{variant_index}.jpg"
+        label = names[variant_index] if variant_index < len(names) else str(variant_index)
+        path = output_dir / (
+            f"{len(items) + variant_index + 1:02d}-result-{_safe_name(label)}.jpg"
+        )
         if not cv2.imwrite(str(path), annotated):
             raise OSError(f"Debug görseli yazılamadı: {path}")
         paths.append(path)
     return tuple(paths)
+
+
+def _safe_name(value: str) -> str:
+    return "".join(
+        character if character.isascii() and character.isalnum() else "-"
+        for character in value
+    ).strip("-") or "unnamed"

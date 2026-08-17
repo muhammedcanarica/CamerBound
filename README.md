@@ -135,7 +135,9 @@ Zero-detection ROI fallback yalnız meaningful motion event sırasında veya eve
 
 Geniş ROI doğrudan 256×256 model girişine dönüştürüldüğünde yatay ve dikey ölçekler DEBUG logunda ayrıca raporlanır. Birincil detector ve kontrollü shadow pass sonuç vermezse en fazla üç örtüşen yatay tile üzerinde bounded recovery çalışır; tile koordinatları tekrar original ROI koordinatlarına çevrilir ve çakışan sonuçlar birleştirilir. Tile recovery crop'ları küçük plaka çevresindeki bağlamı kaybetmemek için ayrı `tiled_recovery_crop_padding_ratio=0.5` ayarını kullanır; normal detector crop padding'i `0.15` kalır. Başarılı birincil detector çağrısında tile maliyeti yoktur.
 
-Detector crop preprocessing'i değiştirilmemiştir. Full ROI fallback ise maksimum 960 px genişlikte iki hafif variant kullanır: önce compact color variant tek başına denenir; geçerli ve minimum kaliteyi geçen plaka bulunamazsa CLAHE/low-light enhanced ikinci variant ayrı çağrıda denenir. Böylece büyük ENTRY ROI için 2x upscale dahil 3–4 variantı tek Paddle çağrısına verme kaldırılmıştır. PaddleOCR CPU kullanımı desteklenen `cpu_threads=4` ayarıyla sınırlandırılarak OpenVINO detector'ın CPU starvation riski azaltılır.
+Detector crop için mean brightness tek başına kullanılmaz. Her crop'ta mean/median/p10/p90, percentile dynamic range, grayscale standard deviation, local contrast, Laplacian sharpness ve siyah/beyaz saturation oranları ucuz deterministic istatistiklerle ölçülür; crop dahili olarak `NORMAL`, `LOW_LIGHT`, `SHADOW_LOW_CONTRAST` veya `OVEREXPOSED` profiline ayrılır. Mevcut 3 variant ve karanlık crop'taki mevcut dördüncü low-light variant ilk hızlı deneme olarak korunur. `NORMAL` ve `OVEREXPOSED` crop'larda ek OCR çağrısı yapılmaz. İlk deneme geçerli ve minimum confidence değerini geçen aday üretmezse `LOW_LIGHT` veya mean-normal `SHADOW_LOW_CONTRAST` crop'ta yalnız saha A/B ölçümünde seçilen shape-preserving gamma-gray variantı ikinci ve son batch olarak denenir. Validator, correction cost, confirmation, queue ve job priority kuralları değişmez.
+
+Full ROI fallback maksimum 960 px genişlikte iki hafif variant kullanır: önce compact color variant tek başına denenir; geçerli ve minimum kaliteyi geçen plaka bulunamazsa CLAHE/low-light enhanced ikinci variant ayrı çağrıda denenir. Böylece büyük ENTRY ROI için 2x upscale dahil 3–4 variantı tek Paddle çağrısına verme kaldırılmıştır. PaddleOCR CPU kullanımı desteklenen `cpu_threads=4` ayarıyla sınırlandırılarak OpenVINO detector'ın CPU starvation riski azaltılır.
 
 Detector öncesindeki rolling ring her kamera için son 2000 ms ve en fazla 20 full-resolution frame ile sınırlıdır. ROI, yaklaşık 160 piksel genişliğe küçültülüp grayscale/blur/absdiff ile ucuz bir değişen-piksel oranı hesaplanır. Motion event 500 ms pre-roll, 700 ms post-roll ve 400 ms quiet hysteresis kullanır; event en fazla 4000 ms sürer. Event frame'leri zamansal bin'lere bölünür ve her bin içindeki en keskin ROI seçilerek en fazla 8 historical frame replay edilir. Detector 2 live frame / 1 replay frame oranıyla iki kaynağı dengeler; replay kuyruğu kamera başına 2 event ve 8000 ms scheduling yaşı ile bounded'dır.
 
@@ -178,8 +180,10 @@ Bu Open Model Zoo modeli MobileNetV2 + SSD tabanlı generic/pretrained bir araç
 Throttle edilmiş DEBUG diagnostic örneği:
 
 ```text
-OCR diagnostics camera_id=2 direction=EXIT roi=1280x460 detector_ms=12.0 plates=0 det_conf=none plate_crops=1280x460 ocr_ms=75.0 total_recognition_ms=87.0 fallback=roi fallback_reason=zero-detection candidate=yes
+OCR worker diagnostics camera_id=1 direction=ENTRY profiles=LOW_LIGHT crop_quality=crop0=131x48,mean=42.2,median=31.0,p10=22.0,p90=91.0,range=69.0,stddev=26.1,local=6.1,sharpness=178.2 current_variants=4 shadow_variants=0 inference_calls=1 job_type=DETECTOR_CROP frame_id=123 candidate=01KAC53 recognition_state=AWAITING_CONFIRMATION
 ```
+
+DEBUG kaydı variant adı, Paddle text-box sayısı, raw/normalized/corrected text, correction cost, OCR confidence, bbox, validator sonucu ve rejection reason alanlarını bounded olarak içerir. Böylece `text_detection_boxes=0` ile text box üretildiği halde geçerli Türk plakası çıkmaması birbirinden ayrılır. Log camera başına throttle edilir ve INFO seviyesini doldurmaz.
 
 Aynı saha frame'inde gerçek OpenVINO/PaddleOCR aşamalarını karşılaştırma:
 
@@ -190,7 +194,13 @@ Aynı saha frame'inde gerçek OpenVINO/PaddleOCR aşamalarını karşılaştırm
 .\.venv\Scripts\python.exe scripts\test_plate_ocr.py frame.jpg --direction EXIT --mode compare --save-debug debug\compare
 ```
 
-`compare`, doğrudan resize, aspect-preserving letterbox ve bounded tile detector sonuçlarını; ardından detector-crop OCR ile full-ROI OCR ham segmentlerini aynı process içinde raporlar. Normal UI'yi veya production ayarlarını değiştirmez.
+`compare`, doğrudan resize, aspect-preserving letterbox ve bounded tile detector sonuçlarını; ardından current detector-crop, ayrı shadow-color baseline, production için seçilmiş shadow grayscale ve full-ROI OCR ham segmentlerini raporlar. Crop metrikleri, profile, preprocessing/inference süresi, inference çağrı sayısı, text-box sayısı ve en iyi aday ayrı satırlardadır. `--save-debug` source, ROI, detector overlay, original detector crop, adlandırılmış current/shadow variantları ve OCR result kutularını yazar. Normal UI'yi veya production ayarlarını değiştirmez.
+
+Aynı kamera/açıdan gölge ve güneş frame'lerini tek komutta karşılaştırmak için:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\test_plate_ocr.py shadow.jpg --compare-image sun.jpg --direction ENTRY --mode compare --save-debug debug\shadow-sun
+```
 
 Canlı recognition hattına giren bir sonraki immutable raw frame'i development tanısı için tek sefer kaydetmek gerekirse uygulamayı aynı PowerShell oturumunda şu şekilde başlatın:
 

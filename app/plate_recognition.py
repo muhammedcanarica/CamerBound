@@ -68,6 +68,13 @@ class OcrJobType(StrEnum):
         }[self]
 
 
+class OcrImageProfile(StrEnum):
+    NORMAL = "NORMAL"
+    LOW_LIGHT = "LOW_LIGHT"
+    SHADOW_LOW_CONTRAST = "SHADOW_LOW_CONTRAST"
+    OVEREXPOSED = "OVEREXPOSED"
+
+
 LOGGER = logging.getLogger(__name__)
 PLATE_PRESENCE_RELEASE_SECONDS = 15
 OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS = 5.0
@@ -78,11 +85,29 @@ RECENT_PROCESSED_FRAME_ID_LIMIT = 256
 LIVE_FRAMES_PER_REPLAY_FRAME = 2
 LOW_LIGHT_THRESHOLD = 85.0
 LOW_LIGHT_GAMMA = 0.72
+SHADOW_DYNAMIC_RANGE_THRESHOLD = 80.0
+SHADOW_GRAYSCALE_STDDEV_THRESHOLD = 30.0
+SHADOW_LOCAL_CONTRAST_THRESHOLD = 12.0
+SHADOW_MAX_MEAN_LUMINANCE = 200.0
+SHADOW_MIN_RECOVERABLE_DYNAMIC_RANGE = 12.0
+SHADOW_MIN_RECOVERABLE_LOCAL_CONTRAST = 2.0
+OVEREXPOSED_P10_THRESHOLD = 220.0
+OVEREXPOSED_WHITE_RATIO_THRESHOLD = 0.60
+SATURATED_BLACK_MAX_VALUE = 5
+SATURATED_WHITE_MIN_VALUE = 250
 OCR_VARIANT_NAMES = (
     "adaptive-color",
     "adaptive-clahe",
     "upscaled-2x-clahe-sharpened",
     "low-light-gamma-clahe-sharpened",
+)
+SHADOW_OCR_VARIANT_NAMES = (
+    "shadow-gamma-gray",
+)
+SHADOW_COMPARISON_VARIANT_NAMES = (
+    "shadow-gamma-color",
+    "shadow-gamma-gray",
+    "shadow-gamma-clahe-gray",
 )
 ROI_FALLBACK_MAX_WIDTH = 960
 RISKY_CONFIRMATIONS_REQUIRED = 3
@@ -100,6 +125,22 @@ ZERO_DETECTION_FALLBACK_MIN_SPACING_MS = 1_000
 ZERO_DETECTION_EVENT_STATE_LIMIT = 32
 COMPLETED_MOTION_EVENT_LIMIT = 32
 RAW_RECOGNITION_CAPTURE_ENV = "CAMERBOUND_CAPTURE_NEXT_RECOGNITION_FRAME"
+
+
+@dataclass(frozen=True, slots=True)
+class CropQualityMetrics:
+    width: int
+    height: int
+    luma_mean: float
+    luma_median: float
+    luma_p10: float
+    luma_p90: float
+    dynamic_range: float
+    grayscale_stddev: float
+    local_contrast: float
+    laplacian_sharpness: float
+    saturated_black_ratio: float
+    saturated_white_ratio: float
 
 
 def _log_plate_detector_diagnostics(
@@ -204,6 +245,24 @@ class PlateCandidate:
     spatial_alias_evidence: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class DetectorCropOcrResult:
+    variants: tuple[np.ndarray, ...]
+    variant_names: tuple[str, ...]
+    segments: tuple[OcrSegment, ...]
+    candidate: PlateCandidate | None
+    quality_metrics: tuple[CropQualityMetrics, ...]
+    profiles: tuple[OcrImageProfile, ...]
+    current_variant_count: int
+    shadow_variant_count: int
+    inference_calls: int
+    text_detection_box_counts: tuple[int | None, ...]
+    current_preprocess_ms: float
+    current_inference_ms: float
+    shadow_preprocess_ms: float
+    shadow_inference_ms: float
+
+
 class OcrProvider(Protocol):
     def recognize(self, images: Sequence[np.ndarray]) -> list[OcrSegment]: ...
 
@@ -263,10 +322,13 @@ class PaddleOcrProvider:
             # official PP-OCRv5 models; the regular CPU executor is compatible.
             options["enable_mkldnn"] = False
         self._pipeline = pipeline_factory(**options)
+        self.last_detection_box_counts: tuple[int, ...] = ()
 
     def recognize(self, images: Sequence[np.ndarray]) -> list[OcrSegment]:
         segments: list[OcrSegment] = []
+        detection_box_counts = [0] * len(images)
         if not images:
+            self.last_detection_box_counts = ()
             return segments
         results = self._pipeline.predict(input=list(images))
         for result_index, result in enumerate(results):
@@ -279,6 +341,11 @@ class PaddleOcrProvider:
             texts = data.get("rec_texts", [])
             scores = data.get("rec_scores", [])
             boxes = data.get("rec_boxes", [])
+            if result_index < len(detection_box_counts):
+                try:
+                    detection_box_counts[result_index] = len(boxes)
+                except TypeError:
+                    detection_box_counts[result_index] = 0
             for index, text in enumerate(texts):
                 if not isinstance(text, str) or not text.strip():
                     continue
@@ -292,6 +359,7 @@ class PaddleOcrProvider:
                         variant_index=result_index,
                     )
                 )
+        self.last_detection_box_counts = tuple(detection_box_counts)
         return segments
 
 
@@ -2130,46 +2198,74 @@ class PlateRecognitionProcessor:
             (time.monotonic() - job.queued_at) * 1000.0,
         )
         ocr_started_at = time.perf_counter()
-        preprocess_started_at = ocr_started_at
-        variants: list[np.ndarray] = []
-        variant_detections: dict[int, PlateDetection] = {}
-        for crop_index, ocr_crop in enumerate(job.ocr_crops):
-            brightness = roi_mean_brightness(ocr_crop)
-            if job.job_type is OcrJobType.DETECTOR_CROP:
-                crop_variants = preprocess_variants(ocr_crop, brightness=brightness)
-            else:
-                crop_variants = preprocess_roi_fallback_variants(
-                    ocr_crop,
-                    brightness=brightness,
-                )
-            detection = (
-                job.ocr_crop_detections[crop_index]
-                if crop_index < len(job.ocr_crop_detections)
-                else None
-            )
-            for variant in crop_variants:
-                if detection is not None:
-                    variant_detections[len(variants)] = detection
-                variants.append(variant)
-        inference_started_at = time.perf_counter()
-        preprocess_ms = (inference_started_at - preprocess_started_at) * 1000.0
         segments: list[OcrSegment] = []
         candidate: PlateCandidate | None = None
         attempted_variants: list[np.ndarray] = []
+        variant_names: list[str] = []
+        crop_metrics: list[CropQualityMetrics] = []
+        profiles: list[OcrImageProfile] = []
+        text_detection_box_counts: list[int | None] = []
+        current_variant_count = 0
+        shadow_variant_count = 0
+        inference_calls = 0
+        shadow_preprocess_ms = 0.0
+        shadow_inference_ms = 0.0
         if job.job_type is OcrJobType.DETECTOR_CROP:
-            attempted_variants = variants
-            segments = self.provider.recognize(variants)
-            candidate = select_best_candidate(
-                segments,
+            detector_ocr = recognize_detector_crops(
+                self.provider,
+                job.ocr_crops,
                 job.camera_id,
-                variant_detections=variant_detections,
+                self.config.min_confidence,
+                crop_detections=job.ocr_crop_detections,
             )
+            attempted_variants = list(detector_ocr.variants)
+            variant_names = list(detector_ocr.variant_names)
+            segments = list(detector_ocr.segments)
+            candidate = detector_ocr.candidate
+            crop_metrics = list(detector_ocr.quality_metrics)
+            profiles = list(detector_ocr.profiles)
+            text_detection_box_counts = list(
+                detector_ocr.text_detection_box_counts
+            )
+            current_variant_count = detector_ocr.current_variant_count
+            shadow_variant_count = detector_ocr.shadow_variant_count
+            inference_calls = detector_ocr.inference_calls
+            preprocess_ms = (
+                detector_ocr.current_preprocess_ms
+                + detector_ocr.shadow_preprocess_ms
+            )
+            inference_ms = (
+                detector_ocr.current_inference_ms
+                + detector_ocr.shadow_inference_ms
+            )
+            shadow_preprocess_ms = detector_ocr.shadow_preprocess_ms
+            shadow_inference_ms = detector_ocr.shadow_inference_ms
         else:
             # Full ROI detection is the expensive safety path. Try the compact
             # color image first and only pay for enhanced contrast when needed.
+            crop_metrics = [measure_crop_quality(crop) for crop in job.ocr_crops]
+            profiles = [classify_crop_quality(item) for item in crop_metrics]
+            preprocess_started_at = time.perf_counter()
+            variants: list[np.ndarray] = []
+            for crop in job.ocr_crops:
+                variants.extend(
+                    preprocess_roi_fallback_variants(
+                        crop,
+                        brightness=roi_mean_brightness(crop),
+                    )
+                )
+            preprocess_ms = (
+                time.perf_counter() - preprocess_started_at
+            ) * 1000.0
+            inference_started_at = time.perf_counter()
             for variant_index, variant in enumerate(variants):
                 attempted_variants.append(variant)
+                variant_names.append(f"roi-fallback-{variant_index}")
                 batch = self.provider.recognize([variant])
+                inference_calls += 1
+                text_detection_box_counts.extend(
+                    _provider_detection_box_counts(self.provider, 1, batch)
+                )
                 segments.extend(
                     OcrSegment(
                         text=segment.text,
@@ -2185,13 +2281,15 @@ class PlateRecognitionProcessor:
                     and candidate.confidence >= self.config.min_confidence
                 ):
                     break
+            inference_ms = (
+                time.perf_counter() - inference_started_at
+            ) * 1000.0
+            current_variant_count = len(attempted_variants)
         ocr_finished_at = time.perf_counter()
-        inference_ms = (ocr_finished_at - inference_started_at) * 1000.0
         if candidate is None:
             candidate = select_best_candidate(
                 segments,
                 job.camera_id,
-                variant_detections=variant_detections,
             )
         outcome = self._complete_observation(
             camera_id=job.camera_id,
@@ -2218,6 +2316,15 @@ class PlateRecognitionProcessor:
             queue_wait_ms=queue_wait_ms,
             candidate=candidate,
             outcome=outcome,
+            variant_names=variant_names,
+            crop_metrics=crop_metrics,
+            profiles=profiles,
+            text_detection_box_counts=text_detection_box_counts,
+            current_variant_count=current_variant_count,
+            shadow_variant_count=shadow_variant_count,
+            inference_calls=inference_calls,
+            shadow_preprocess_ms=shadow_preprocess_ms,
+            shadow_inference_ms=shadow_inference_ms,
         )
         return outcome
 
@@ -3050,6 +3157,15 @@ class PlateRecognitionProcessor:
         queue_wait_ms: float,
         candidate: PlateCandidate | None,
         outcome: RecognitionOutcome,
+        variant_names: Sequence[str],
+        crop_metrics: Sequence[CropQualityMetrics],
+        profiles: Sequence[OcrImageProfile],
+        text_detection_box_counts: Sequence[int | None],
+        current_variant_count: int,
+        shadow_variant_count: int,
+        inference_calls: int,
+        shadow_preprocess_ms: float,
+        shadow_inference_ms: float,
     ) -> None:
         if not LOGGER.isEnabledFor(logging.DEBUG):
             return
@@ -3077,21 +3193,36 @@ class PlateRecognitionProcessor:
             )
         LOGGER.debug(
             "OCR worker diagnostics camera_id=%s direction=%s brightness=%.1f "
-            "low_light=%s variants=%s queue_depth=%s queue_wait_ms=%.1f "
+            "low_light=%s profiles=%s crop_quality=%s variants=%s "
+            "current_variants=%s shadow_variants=%s inference_calls=%s "
+            "queue_depth=%s queue_wait_ms=%.1f "
             "preprocess_ms=%.1f inference_ms=%.1f end_to_end_ms=%.1f "
+            "shadow_preprocess_ms=%.1f shadow_inference_ms=%.1f "
             "job_type=%s priority=%s source=%s frame_id=%s fallback_reason=%s "
             "candidate=%s recognition_state=%s candidate_rejection_reason=%s "
-            "confirmation=%s/%s raw_ocr_segments=%s",
+            "confirmation=%s/%s detector_bboxes=%s text_detection_boxes=%s "
+            "raw_ocr_segments=%s variant_trace=%s",
             job.camera_id,
             job.direction.value,
             brightness,
-            "yes" if brightness < LOW_LIGHT_THRESHOLD else "no",
+            (
+                "yes"
+                if OcrImageProfile.LOW_LIGHT in profiles
+                else "no"
+            ),
+            ",".join(profile.value for profile in profiles) or "none",
+            _format_crop_quality_metrics(crop_metrics),
             len(variants),
+            current_variant_count,
+            shadow_variant_count,
+            inference_calls,
             queue_depth,
             queue_wait_ms,
             preprocess_ms,
             inference_ms,
             end_to_end_ms,
+            shadow_preprocess_ms,
+            shadow_inference_ms,
             job.job_type.value,
             job.job_type.priority,
             job.detector_source,
@@ -3102,7 +3233,18 @@ class PlateRecognitionProcessor:
             candidate_rejection_reason,
             outcome.confirmation_count,
             outcome.confirmation_required,
+            _format_detector_bboxes(job.ocr_crop_detections),
+            _format_detection_box_counts(
+                variant_names,
+                text_detection_box_counts,
+            ),
             _format_raw_ocr_segments(segments),
+            _format_variant_ocr_trace(
+                variant_names,
+                segments,
+                self.config.min_confidence,
+                text_detection_box_counts,
+            ),
         )
 
     def _log_detector_error(
@@ -4023,6 +4165,108 @@ def roi_mean_brightness(crop: np.ndarray) -> float:
     return float(np.mean(gray))
 
 
+def measure_crop_quality(crop: np.ndarray) -> CropQualityMetrics:
+    """Measure cheap plate-crop luminance, contrast, sharpness and clipping."""
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    luma_p10, luma_p90 = np.percentile(gray, (10, 90))
+    gray_float = gray.astype(np.float32)
+    local_background = cv2.GaussianBlur(gray_float, (0, 0), sigmaX=3.0)
+    return CropQualityMetrics(
+        width=int(crop.shape[1]),
+        height=int(crop.shape[0]),
+        luma_mean=float(np.mean(gray)),
+        luma_median=float(np.median(gray)),
+        luma_p10=float(luma_p10),
+        luma_p90=float(luma_p90),
+        dynamic_range=float(luma_p90 - luma_p10),
+        grayscale_stddev=float(np.std(gray)),
+        local_contrast=float(np.mean(np.abs(gray_float - local_background))),
+        laplacian_sharpness=float(cv2.Laplacian(gray, cv2.CV_64F).var()),
+        saturated_black_ratio=float(np.mean(gray <= SATURATED_BLACK_MAX_VALUE)),
+        saturated_white_ratio=float(np.mean(gray >= SATURATED_WHITE_MIN_VALUE)),
+    )
+
+
+def classify_crop_quality(metrics: CropQualityMetrics) -> OcrImageProfile:
+    if metrics.luma_mean < LOW_LIGHT_THRESHOLD:
+        return OcrImageProfile.LOW_LIGHT
+    if (
+        metrics.luma_p10 >= OVEREXPOSED_P10_THRESHOLD
+        and metrics.saturated_white_ratio >= OVEREXPOSED_WHITE_RATIO_THRESHOLD
+    ):
+        return OcrImageProfile.OVEREXPOSED
+    if (
+        metrics.luma_mean <= SHADOW_MAX_MEAN_LUMINANCE
+        and metrics.dynamic_range < SHADOW_DYNAMIC_RANGE_THRESHOLD
+        and (
+            metrics.grayscale_stddev < SHADOW_GRAYSCALE_STDDEV_THRESHOLD
+            or metrics.local_contrast < SHADOW_LOCAL_CONTRAST_THRESHOLD
+        )
+    ):
+        return OcrImageProfile.SHADOW_LOW_CONTRAST
+    return OcrImageProfile.NORMAL
+
+
+def preprocess_shadow_comparison_variants(crop: np.ndarray) -> list[np.ndarray]:
+    """Build the measured color/gray A-B pair used by the field CLI."""
+    gamma_lut = _shadow_gamma_lut()
+    return [
+        _shadow_gamma_color(crop, gamma_lut),
+        _shadow_gamma_gray(crop, gamma_lut),
+        _shadow_gamma_clahe_gray(crop, gamma_lut),
+    ]
+
+
+def preprocess_shadow_variants(
+    crop: np.ndarray,
+    *,
+    profile: OcrImageProfile | None = None,
+) -> list[np.ndarray]:
+    """Build the selected bounded recovery variant for difficult plate crops."""
+    gamma_lut = _shadow_gamma_lut()
+    return [_shadow_gamma_gray(crop, gamma_lut)]
+
+
+def _shadow_gamma_lut() -> np.ndarray:
+    gamma_lut = np.array(
+        [
+            ((value / 255.0) ** LOW_LIGHT_GAMMA) * 255.0
+            for value in range(256)
+        ],
+        dtype=np.uint8,
+    )
+    return gamma_lut
+
+
+def _shadow_gamma_color(crop: np.ndarray, gamma_lut: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    lightness, channel_a, channel_b = cv2.split(lab)
+    corrected_lightness = cv2.LUT(lightness, gamma_lut)
+    return cv2.cvtColor(
+        cv2.merge((corrected_lightness, channel_a, channel_b)),
+        cv2.COLOR_LAB2BGR,
+    )
+
+
+def _shadow_gamma_gray(crop: np.ndarray, gamma_lut: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(cv2.LUT(gray, gamma_lut), cv2.COLOR_GRAY2BGR)
+
+
+def _shadow_gamma_clahe_gray(
+    crop: np.ndarray,
+    gamma_lut: np.ndarray,
+) -> np.ndarray:
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    contrasted = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8),
+    ).apply(cv2.LUT(gray, gamma_lut))
+    softened = cv2.GaussianBlur(contrasted, (0, 0), sigmaX=1.0)
+    contrasted = cv2.addWeighted(contrasted, 1.10, softened, -0.10, 0)
+    return cv2.cvtColor(contrasted, cv2.COLOR_GRAY2BGR)
+
+
 def preprocess_roi_fallback_variants(
     crop: np.ndarray,
     *,
@@ -4138,6 +4382,187 @@ def preprocess_variants(
     return variants
 
 
+def recognize_detector_crops(
+    provider: OcrProvider,
+    crops: Sequence[np.ndarray],
+    camera_id: int,
+    min_confidence: float,
+    *,
+    crop_detections: Sequence[PlateDetection | None] = (),
+) -> DetectorCropOcrResult:
+    """Run the current crop OCR first, then a bounded shadow-only recovery."""
+    current_preprocess_started = time.perf_counter()
+    variants: list[np.ndarray] = []
+    variant_names: list[str] = []
+    variant_detections: dict[int, PlateDetection] = {}
+    metrics: list[CropQualityMetrics] = []
+    profiles: list[OcrImageProfile] = []
+    for crop_index, crop in enumerate(crops):
+        crop_metrics = measure_crop_quality(crop)
+        profile = classify_crop_quality(crop_metrics)
+        metrics.append(crop_metrics)
+        profiles.append(profile)
+        current_variants = preprocess_variants(
+            crop,
+            brightness=crop_metrics.luma_mean,
+        )
+        detection = (
+            crop_detections[crop_index]
+            if crop_index < len(crop_detections)
+            else None
+        )
+        for local_index, variant in enumerate(current_variants):
+            variant_index = len(variants)
+            variants.append(variant)
+            variant_names.append(
+                _crop_variant_name(
+                    OCR_VARIANT_NAMES[local_index],
+                    crop_index,
+                    len(crops),
+                )
+            )
+            if detection is not None:
+                variant_detections[variant_index] = detection
+    current_preprocess_ms = (
+        time.perf_counter() - current_preprocess_started
+    ) * 1000.0
+
+    current_inference_started = time.perf_counter()
+    current_segments = provider.recognize(variants)
+    current_inference_ms = (
+        time.perf_counter() - current_inference_started
+    ) * 1000.0
+    segments = list(current_segments)
+    detection_box_counts = list(
+        _provider_detection_box_counts(provider, len(variants), current_segments)
+    )
+    candidate = select_best_candidate(
+        segments,
+        camera_id,
+        variant_detections=variant_detections,
+    )
+    current_variant_count = len(variants)
+    shadow_variant_count = 0
+    shadow_preprocess_ms = 0.0
+    shadow_inference_ms = 0.0
+    inference_calls = 1 if variants else 0
+    needs_shadow_recovery = (
+        candidate is None or candidate.confidence < min_confidence
+    ) and any(
+        _is_shadow_recovery_eligible(profile, crop_metrics)
+        for profile, crop_metrics in zip(profiles, metrics)
+    )
+
+    if needs_shadow_recovery:
+        shadow_preprocess_started = time.perf_counter()
+        shadow_variants: list[np.ndarray] = []
+        for crop_index, (crop, profile) in enumerate(zip(crops, profiles)):
+            if not _is_shadow_recovery_eligible(profile, metrics[crop_index]):
+                continue
+            detection = (
+                crop_detections[crop_index]
+                if crop_index < len(crop_detections)
+                else None
+            )
+            for local_index, variant in enumerate(
+                preprocess_shadow_variants(crop, profile=profile)
+            ):
+                variant_index = len(variants) + len(shadow_variants)
+                shadow_variants.append(variant)
+                variant_names.append(
+                    _crop_variant_name(
+                        SHADOW_OCR_VARIANT_NAMES[local_index],
+                        crop_index,
+                        len(crops),
+                    )
+                )
+                if detection is not None:
+                    variant_detections[variant_index] = detection
+        shadow_preprocess_ms = (
+            time.perf_counter() - shadow_preprocess_started
+        ) * 1000.0
+        shadow_inference_started = time.perf_counter()
+        shadow_segments = provider.recognize(shadow_variants)
+        shadow_inference_ms = (
+            time.perf_counter() - shadow_inference_started
+        ) * 1000.0
+        inference_calls += 1 if shadow_variants else 0
+        offset = len(variants)
+        reindexed_shadow_segments = [
+            replace(segment, variant_index=segment.variant_index + offset)
+            for segment in shadow_segments
+        ]
+        segments.extend(reindexed_shadow_segments)
+        detection_box_counts.extend(
+            _provider_detection_box_counts(
+                provider,
+                len(shadow_variants),
+                shadow_segments,
+            )
+        )
+        variants.extend(shadow_variants)
+        shadow_variant_count = len(shadow_variants)
+        candidate = select_best_candidate(
+            segments,
+            camera_id,
+            variant_detections=variant_detections,
+        )
+
+    return DetectorCropOcrResult(
+        variants=tuple(variants),
+        variant_names=tuple(variant_names),
+        segments=tuple(segments),
+        candidate=candidate,
+        quality_metrics=tuple(metrics),
+        profiles=tuple(profiles),
+        current_variant_count=current_variant_count,
+        shadow_variant_count=shadow_variant_count,
+        inference_calls=inference_calls,
+        text_detection_box_counts=tuple(detection_box_counts),
+        current_preprocess_ms=current_preprocess_ms,
+        current_inference_ms=current_inference_ms,
+        shadow_preprocess_ms=shadow_preprocess_ms,
+        shadow_inference_ms=shadow_inference_ms,
+    )
+
+
+def _crop_variant_name(name: str, crop_index: int, crop_count: int) -> str:
+    return name if crop_count == 1 else f"crop-{crop_index}-{name}"
+
+
+def _is_shadow_recovery_eligible(
+    profile: OcrImageProfile,
+    metrics: CropQualityMetrics,
+) -> bool:
+    return profile in {
+        OcrImageProfile.LOW_LIGHT,
+        OcrImageProfile.SHADOW_LOW_CONTRAST,
+    } and (
+        metrics.dynamic_range >= SHADOW_MIN_RECOVERABLE_DYNAMIC_RANGE
+        or metrics.local_contrast >= SHADOW_MIN_RECOVERABLE_LOCAL_CONTRAST
+    )
+
+
+def _provider_detection_box_counts(
+    provider: OcrProvider,
+    variant_count: int,
+    segments: Sequence[OcrSegment],
+) -> tuple[int | None, ...]:
+    reported = getattr(provider, "last_detection_box_counts", None)
+    if (
+        isinstance(reported, tuple)
+        and len(reported) == variant_count
+        and all(isinstance(value, int) for value in reported)
+    ):
+        return reported
+    inferred: list[int | None] = [None] * variant_count
+    for segment in segments:
+        if 0 <= segment.variant_index < variant_count:
+            current = inferred[segment.variant_index]
+            inferred[segment.variant_index] = (current or 0) + 1
+    return tuple(inferred)
+
+
 def _image_resolution(image: object) -> str:
     if not isinstance(image, np.ndarray) or image.ndim < 2:
         return "unknown"
@@ -4157,6 +4582,113 @@ def _format_raw_ocr_segments(segments: Sequence[OcrSegment]) -> str:
         )
     if len(segments) > len(values):
         values.append(f"+{len(segments) - len(values)}-more")
+    return "|".join(values)
+
+
+def _format_crop_quality_metrics(
+    metrics: Sequence[CropQualityMetrics],
+) -> str:
+    if not metrics:
+        return "none"
+    return "|".join(
+        (
+            f"crop{index}={item.width}x{item.height},mean={item.luma_mean:.1f},"
+            f"median={item.luma_median:.1f},p10={item.luma_p10:.1f},"
+            f"p90={item.luma_p90:.1f},range={item.dynamic_range:.1f},"
+            f"stddev={item.grayscale_stddev:.1f},local={item.local_contrast:.1f},"
+            f"sharpness={item.laplacian_sharpness:.1f},"
+            f"black={item.saturated_black_ratio:.3f},"
+            f"white={item.saturated_white_ratio:.3f}"
+        )
+        for index, item in enumerate(metrics)
+    )
+
+
+def _format_detector_bboxes(
+    detections: Sequence[PlateDetection | None],
+) -> str:
+    values = [
+        f"{item.x},{item.y},{item.width},{item.height}"
+        for item in detections
+        if item is not None
+    ]
+    return "|".join(values) if values else "none"
+
+
+def _format_detection_box_counts(
+    variant_names: Sequence[str],
+    counts: Sequence[int | None],
+) -> str:
+    if not variant_names:
+        return "none"
+    return "|".join(
+        f"{name}:{'unknown' if index >= len(counts) or counts[index] is None else counts[index]}"
+        for index, name in enumerate(variant_names[:12])
+    )
+
+
+def _format_variant_ocr_trace(
+    variant_names: Sequence[str],
+    segments: Sequence[OcrSegment],
+    min_confidence: float,
+    detection_box_counts: Sequence[int | None],
+) -> str:
+    if not variant_names:
+        return "none"
+    grouped: dict[int, list[OcrSegment]] = defaultdict(list)
+    for segment in segments:
+        grouped[segment.variant_index].append(segment)
+    values: list[str] = []
+    for variant_index, name in enumerate(variant_names[:12]):
+        variant_segments = grouped.get(variant_index, [])[:2]
+        box_count = (
+            detection_box_counts[variant_index]
+            if variant_index < len(detection_box_counts)
+            else None
+        )
+        if not variant_segments:
+            rejection = (
+                "no-text-detected"
+                if box_count == 0
+                else "no-recognized-text"
+            )
+            values.append(
+                f"{name}:boxes={'unknown' if box_count is None else box_count}:"
+                f"raw=none:rejection={rejection}"
+            )
+            continue
+        for segment in variant_segments:
+            raw = segment.text.replace("|", "/").replace("\n", " ")[:48]
+            normalized = normalize_plate_text(segment.text)
+            corrected_with_cost = correct_plate_candidate_with_cost(segment.text)
+            corrected = (
+                corrected_with_cost[0]
+                if corrected_with_cost is not None
+                else None
+            )
+            correction_cost = (
+                corrected_with_cost[1]
+                if corrected_with_cost is not None
+                else None
+            )
+            valid = bool(
+                corrected is not None
+                and TurkishPlateValidator.is_valid(corrected)
+            )
+            rejection = "none"
+            if not normalized:
+                rejection = "empty-normalized-text"
+            elif not valid:
+                rejection = "invalid-turkish-plate"
+            elif segment.confidence < min_confidence:
+                rejection = "below-min-confidence"
+            values.append(
+                f"{name}:boxes={'unknown' if box_count is None else box_count}:"
+                f"raw={raw!r}:normalized={normalized!r}:corrected={corrected or 'none'}:"
+                f"correction_cost={'none' if correction_cost is None else correction_cost}:"
+                f"ocr_conf={segment.confidence:.3f}:valid={'yes' if valid else 'no'}:"
+                f"bbox={segment.box}:rejection={rejection}"
+            )
     return "|".join(values)
 
 

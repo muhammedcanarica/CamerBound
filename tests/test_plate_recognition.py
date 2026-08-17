@@ -29,6 +29,7 @@ from app.plate_recognition import (
     FrameSnapshot,
     LOW_LIGHT_THRESHOLD,
     MotionEvent,
+    OcrImageProfile,
     OcrModelNotFound,
     OcrSegment,
     OcrJob,
@@ -48,11 +49,15 @@ from app.plate_recognition import (
     TurkishPlateValidator,
     correct_plate_candidate,
     correct_plate_candidate_with_cost,
+    classify_crop_quality,
     normalize_plate_text,
     crop_roi,
+    measure_crop_quality,
+    preprocess_shadow_variants,
     preprocess_variants,
     preprocess_roi_fallback_variants,
     roi_mean_brightness,
+    recognize_detector_crops,
     select_replay_frames,
     select_best_candidate,
     plates_are_near_conflicts,
@@ -353,6 +358,156 @@ class PlateTextTests(unittest.TestCase):
 
 
 class PreprocessingTests(unittest.TestCase):
+    @staticmethod
+    def _plate_crop(background: int, foreground: int) -> np.ndarray:
+        crop = np.full((48, 160, 3), background, dtype=np.uint8)
+        cv2.putText(
+            crop,
+            "34ABC123",
+            (4, 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (foreground, foreground, foreground),
+            2,
+            cv2.LINE_AA,
+        )
+        return crop
+
+    def test_bright_plate_crop_selects_normal_profile(self) -> None:
+        metrics = measure_crop_quality(self._plate_crop(190, 25))
+
+        self.assertIs(classify_crop_quality(metrics), OcrImageProfile.NORMAL)
+
+    def test_dark_plate_crop_selects_low_light_profile(self) -> None:
+        metrics = measure_crop_quality(self._plate_crop(65, 20))
+
+        self.assertIs(classify_crop_quality(metrics), OcrImageProfile.LOW_LIGHT)
+
+    def test_normal_mean_low_local_contrast_selects_shadow_profile(self) -> None:
+        metrics = measure_crop_quality(self._plate_crop(130, 116))
+
+        self.assertGreaterEqual(metrics.luma_mean, LOW_LIGHT_THRESHOLD)
+        self.assertIs(
+            classify_crop_quality(metrics),
+            OcrImageProfile.SHADOW_LOW_CONTRAST,
+        )
+
+    def test_clipped_bright_crop_selects_overexposed_profile(self) -> None:
+        crop = np.full((48, 160, 3), 252, dtype=np.uint8)
+
+        profile = classify_crop_quality(measure_crop_quality(crop))
+
+        self.assertIs(profile, OcrImageProfile.OVEREXPOSED)
+
+    def test_shadow_preprocessing_preserves_shape_dtype_and_input(self) -> None:
+        crop = self._plate_crop(130, 116)
+        original = crop.copy()
+
+        variants = preprocess_shadow_variants(crop)
+
+        self.assertEqual(len(variants), 1)
+        self.assertTrue(all(item.shape == crop.shape for item in variants))
+        self.assertTrue(all(item.dtype == np.uint8 for item in variants))
+        self.assertTrue(all(item.ndim == 3 and item.shape[2] == 3 for item in variants))
+        np.testing.assert_array_equal(crop, original)
+
+    def test_normal_crop_does_not_add_shadow_ocr_inference(self) -> None:
+        provider = SequencedOcrProvider([[]])
+
+        result = recognize_detector_crops(
+            provider,
+            [self._plate_crop(190, 25)],
+            camera_id=1,
+            min_confidence=0.65,
+        )
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(result.inference_calls, 1)
+        self.assertEqual(result.shadow_variant_count, 0)
+
+    def test_high_confidence_current_candidate_skips_shadow_variants(self) -> None:
+        provider = SequencedOcrProvider(
+            [[OcrSegment("34ABC123", 0.97, (0.0, 0.0, 100.0, 30.0))]]
+        )
+
+        result = recognize_detector_crops(
+            provider,
+            [self._plate_crop(130, 116)],
+            camera_id=1,
+            min_confidence=0.65,
+        )
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(result.shadow_variant_count, 0)
+        self.assertEqual(result.candidate.plate, "34ABC123")
+
+    def test_shadow_variants_run_after_current_miss_and_recover_candidate(self) -> None:
+        provider = SequencedOcrProvider(
+            [
+                [],
+                [OcrSegment("O6 GG 9B6", 0.91, (0.0, 0.0, 100.0, 30.0))],
+            ]
+        )
+
+        result = recognize_detector_crops(
+            provider,
+            [self._plate_crop(130, 116)],
+            camera_id=1,
+            min_confidence=0.65,
+        )
+
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(result.shadow_variant_count, 1)
+        self.assertEqual(result.candidate.plate, "06GG986")
+        self.assertEqual(result.candidate.correction_cost, 2)
+
+    def test_low_light_recovery_adds_only_distinct_gamma_gray_variant(self) -> None:
+        provider = SequencedOcrProvider([[], []])
+
+        result = recognize_detector_crops(
+            provider,
+            [self._plate_crop(65, 20)],
+            camera_id=1,
+            min_confidence=0.65,
+        )
+
+        self.assertEqual(result.profiles, (OcrImageProfile.LOW_LIGHT,))
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(result.current_variant_count, 4)
+        self.assertEqual(result.shadow_variant_count, 1)
+        self.assertEqual(len(provider.calls[1]), 1)
+
+    def test_shadow_variants_run_after_below_threshold_current_candidate(self) -> None:
+        provider = SequencedOcrProvider(
+            [
+                [OcrSegment("34ABC123", 0.60, (0.0, 0.0, 100.0, 30.0))],
+                [OcrSegment("34ABC123", 0.93, (0.0, 0.0, 100.0, 30.0))],
+            ]
+        )
+
+        result = recognize_detector_crops(
+            provider,
+            [self._plate_crop(130, 116)],
+            camera_id=1,
+            min_confidence=0.65,
+        )
+
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(result.shadow_variant_count, 1)
+        self.assertEqual(result.candidate.plate, "34ABC123")
+        self.assertEqual(result.candidate.confidence, 0.93)
+
+    def test_ocr_job_priority_contract_is_unchanged(self) -> None:
+        self.assertEqual(
+            [
+                OcrJobType.DETECTOR_CROP.priority,
+                OcrJobType.DETECTOR_ERROR_FALLBACK.priority,
+                OcrJobType.ZERO_DETECTION_FALLBACK.priority,
+                OcrJobType.STATIC_ZERO_DETECTION_RESCUE.priority,
+            ],
+            [3, 2, 1, 0],
+        )
+
     def test_dark_roi_is_detected_as_low_light(self) -> None:
         crop = np.full((40, 120, 3), 40, dtype=np.uint8)
 
@@ -2316,6 +2471,13 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIn("candidate_rejection_reason=none", diagnostic)
         self.assertIn("confirmation=1/2", diagnostic)
         self.assertIn("raw_ocr_segments=v0:'34 ABC 123':0.970:34ABC123", diagnostic)
+        self.assertIn("crop_quality=crop0=120x40", diagnostic)
+        self.assertIn("profiles=LOW_LIGHT", diagnostic)
+        self.assertIn("current_variants=4", diagnostic)
+        self.assertIn("shadow_variants=0", diagnostic)
+        self.assertIn("inference_calls=1", diagnostic)
+        self.assertIn("text_detection_boxes=", diagnostic)
+        self.assertIn("variant_trace=adaptive-color", diagnostic)
 
     def test_ocr_worker_diagnostics_include_candidate_rejection_reason(self) -> None:
         processor = PlateRecognitionProcessor(
@@ -2376,6 +2538,43 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIs(outcome.state, RecognitionState.AWAITING_CONFIRMATION)
         self.assertEqual(len(provider.calls), 2)
         self.assertTrue(all(len(batch) == 1 for batch in provider.calls))
+
+    def test_detector_crop_normal_profile_has_no_shadow_retry(self) -> None:
+        provider = SequencedOcrProvider([[]])
+        processor = PlateRecognitionProcessor(provider, self.plate_service, self.config)
+        crop = PreprocessingTests._plate_crop(190, 25)
+        job = replace(
+            self._make_ocr_job(frame_id=63, job_type=OcrJobType.DETECTOR_CROP),
+            roi_crop=crop,
+            ocr_crops=(crop.copy(),),
+        )
+
+        outcome = processor.process_ocr_job(job, queue_depth=0)
+
+        self.assertIs(outcome.state, RecognitionState.NO_OCR_TEXT)
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_detector_crop_shadow_retry_recovers_valid_candidate(self) -> None:
+        provider = SequencedOcrProvider(
+            [
+                [],
+                [OcrSegment("06 GG 986", 0.94, (0.0, 0.0, 100.0, 30.0))],
+            ]
+        )
+        processor = PlateRecognitionProcessor(provider, self.plate_service, self.config)
+        crop = PreprocessingTests._plate_crop(130, 116)
+        job = replace(
+            self._make_ocr_job(frame_id=64, job_type=OcrJobType.DETECTOR_CROP),
+            roi_crop=crop,
+            ocr_crops=(crop.copy(),),
+        )
+
+        outcome = processor.process_ocr_job(job, queue_depth=0)
+
+        self.assertIs(outcome.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertEqual(outcome.candidate.plate, "06GG986")
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(len(provider.calls[1]), 1)
 
     def test_detection_processor_queues_crop_and_preserves_full_frame(self) -> None:
         detection = PlateDetection(0.9, x=20, y=10, width=100, height=30)
