@@ -546,6 +546,20 @@ def _process_image(
         )
     elif mode in {"production", "detector-ocr"}:
         print("ocr_stage=detector-ocr skipped=no-usable-detector-crop")
+        if mode == "production":
+            print(
+                "production_fallback=roi offline_motion_proxy=yes "
+                "reason=no-usable-detector-crop"
+            )
+            runs.append(
+                _run_ocr(
+                    provider,
+                    [roi],
+                    label="roi-fallback-ocr",
+                    strategy="roi",
+                    min_confidence=config.min_confidence,
+                )
+            )
     if mode == "compare" and detector_crops:
         runs.extend(
             (

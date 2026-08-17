@@ -75,6 +75,17 @@ class OcrImageProfile(StrEnum):
     OVEREXPOSED = "OVEREXPOSED"
 
 
+def _mean_or_none(values: Sequence[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _p95_or_none(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, (95 * len(ordered) + 99) // 100 - 1)]
+
+
 LOGGER = logging.getLogger(__name__)
 PLATE_PRESENCE_RELEASE_SECONDS = 15
 OCR_DIAGNOSTIC_LOG_INTERVAL_SECONDS = 5.0
@@ -480,7 +491,7 @@ class ConfirmationTracker:
         for item in observations:
             if item.candidate.plate != candidate.plate and plates_are_near_conflicts(
                 candidate.plate, item.candidate.plate
-            ):
+            ) and candidates_share_spatial_session(candidate, item.candidate):
                 near_groups[item.candidate.plate].append(item)
         runner_up_votes = max((len(items) for items in near_groups.values()), default=0)
         correction_risk = any(item.candidate.correction_cost > 0 for item in exact)
@@ -539,7 +550,10 @@ class ConfirmationTracker:
             for item in observations
             if not (
                 item.candidate.plate == candidate.plate
-                or plates_are_near_conflicts(candidate.plate, item.candidate.plate)
+                or (
+                    plates_are_near_conflicts(candidate.plate, item.candidate.plate)
+                    and candidates_share_spatial_session(candidate, item.candidate)
+                )
             )
         ]
         observations.clear()
@@ -700,6 +714,21 @@ class RecognitionOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class CameraBufferHealth:
+    camera_id: int
+    direction: Direction | None
+    ring_depth: int
+    frame_cap: int
+    configured_duration_ms: int
+    oldest_frame_age_ms: float | None
+    newest_frame_age_ms: float | None
+    effective_ring_duration_ms: float
+    recognition_ingest_fps: float
+    estimated_ring_memory_mb: float
+    active_event_frames: int
+
+
+@dataclass(frozen=True, slots=True)
 class RecognitionRuntimeHealth:
     frames_ingested: int = 0
     detector_frames_processed: int = 0
@@ -718,6 +747,15 @@ class RecognitionRuntimeHealth:
     last_inference_ok: bool | None = None
     last_candidate: str | None = None
     last_state: RecognitionState | None = None
+    buffers: tuple[CameraBufferHealth, ...] = ()
+    detector_mean_ms: float | None = None
+    detector_p95_ms: float | None = None
+    ocr_mean_ms: float | None = None
+    ocr_p95_ms: float | None = None
+    queue_wait_mean_ms: float | None = None
+    queue_wait_p95_ms: float | None = None
+    end_to_end_mean_ms: float | None = None
+    end_to_end_p95_ms: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -837,7 +875,7 @@ class PreDetectionFrameBuffer:
                     self.config.pre_detection_buffer_max_frames_per_camera
                 )
                 while len(active.frames) > maximum_event_frames:
-                    active.frames.popleft()
+                    self._remove_densest_event_frame(active.frames)
                 quiet_seconds = max(
                     self.config.motion_quiet_ms,
                     self.config.motion_post_roll_ms,
@@ -873,6 +911,50 @@ class PreDetectionFrameBuffer:
         with self._lock:
             return len(self._rings.get(camera_id, ()))
 
+    def health(self, camera_id: int, now: float | None = None) -> CameraBufferHealth:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            snapshots = tuple(self._rings.get(camera_id, ()))
+            active = self._events.get(camera_id)
+        oldest_age_ms = (
+            max(0.0, (now - snapshots[0].observed_at) * 1000.0)
+            if snapshots
+            else None
+        )
+        newest_age_ms = (
+            max(0.0, (now - snapshots[-1].observed_at) * 1000.0)
+            if snapshots
+            else None
+        )
+        effective_duration_ms = (
+            max(0.0, snapshots[-1].observed_at - snapshots[0].observed_at) * 1000.0
+            if len(snapshots) >= 2
+            else 0.0
+        )
+        ingest_fps = (
+            (len(snapshots) - 1) / max(effective_duration_ms / 1000.0, 0.001)
+            if len(snapshots) >= 2
+            else 0.0
+        )
+        unique_frames: dict[int, np.ndarray] = {}
+        for snapshot in snapshots:
+            if isinstance(snapshot.full_frame, np.ndarray):
+                unique_frames.setdefault(id(snapshot.full_frame), snapshot.full_frame)
+        memory_mb = sum(frame.nbytes for frame in unique_frames.values()) / (1024**2)
+        return CameraBufferHealth(
+            camera_id=camera_id,
+            direction=snapshots[-1].direction if snapshots else None,
+            ring_depth=len(snapshots),
+            frame_cap=self.config.pre_detection_buffer_max_frames_per_camera,
+            configured_duration_ms=self.config.pre_detection_buffer_duration_ms,
+            oldest_frame_age_ms=oldest_age_ms,
+            newest_frame_age_ms=newest_age_ms,
+            effective_ring_duration_ms=effective_duration_ms,
+            recognition_ingest_fps=ingest_fps,
+            estimated_ring_memory_mb=memory_mb,
+            active_event_frames=len(active.frames) if active is not None else 0,
+        )
+
     def clear(self) -> None:
         with self._lock:
             self._rings.clear()
@@ -905,6 +987,23 @@ class PreDetectionFrameBuffer:
             ring.popleft()
         while len(ring) > self.config.pre_detection_buffer_max_frames_per_camera:
             ring.popleft()
+
+    @staticmethod
+    def _remove_densest_event_frame(frames: deque[FrameSnapshot]) -> None:
+        """Keep event endpoints and spread a bounded set across its timeline."""
+        if len(frames) <= 2:
+            frames.popleft()
+            return
+        values = tuple(frames)
+        remove_index = min(
+            range(1, len(values) - 1),
+            key=lambda index: (
+                values[index + 1].observed_at - values[index - 1].observed_at,
+                values[index].motion_score,
+                index,
+            ),
+        )
+        del frames[remove_index]
 
     @staticmethod
     def _finish_event(active: _ActiveMotionEvent, ended_at: float) -> MotionEvent:
@@ -2779,10 +2878,23 @@ class PlateRecognitionProcessor:
             counts[item.candidate.plate] += 1
             groups[item.candidate.plate].append(item)
         anchor = provisional or max(counts, key=lambda plate: (counts[plate], plate))
+        anchor_representative = decision.representatives.get(anchor)
+        anchor_candidate = (
+            anchor_representative.candidate
+            if anchor_representative is not None
+            else groups[anchor][-1].candidate
+        )
         cluster = {
             plate: items
             for plate, items in groups.items()
-            if plate == anchor or plates_are_near_conflicts(anchor, plate)
+            if plate == anchor
+            or (
+                plates_are_near_conflicts(anchor, plate)
+                and any(
+                    candidates_share_spatial_session(anchor_candidate, item.candidate)
+                    for item in items
+                )
+            )
         }
         winner_plate = max(
             cluster,
@@ -3406,7 +3518,9 @@ class PlateOcrWorker:
         stop_event: threading.Event,
         on_outcome: Callable[[int, RecognitionOutcome], None],
         on_status: Callable[[RecognitionStatus, str], None],
-        on_job_processed: Callable[[OcrJob, RecognitionOutcome], None] | None = None,
+        on_job_processed: (
+            Callable[[OcrJob, RecognitionOutcome, float, float, float], None] | None
+        ) = None,
         on_inference_error: Callable[[], None] | None = None,
     ) -> None:
         self.plate_service = plate_service
@@ -3483,6 +3597,8 @@ class PlateOcrWorker:
                     if self.stop_event.is_set():
                         return
                     continue
+                processing_started = time.monotonic()
+                queue_wait_ms = max(0.0, processing_started - job.queued_at) * 1000.0
                 try:
                     outcome = processor.process_ocr_job(
                         job,
@@ -3504,7 +3620,14 @@ class PlateOcrWorker:
                     self.on_status(RecognitionStatus.ACTIVE, "OCR yeniden aktif.")
                     recovering_from_error = False
                 if self.on_job_processed is not None:
-                    self.on_job_processed(job, outcome)
+                    processing_finished = time.monotonic()
+                    self.on_job_processed(
+                        job,
+                        outcome,
+                        max(0.0, processing_finished - processing_started) * 1000.0,
+                        queue_wait_ms,
+                        max(0.0, processing_finished - job.received_at) * 1000.0,
+                    )
                 self.on_outcome(job.camera_id, outcome)
                 if not emit_due_outcomes():
                     recovering_from_error = True
@@ -3576,6 +3699,10 @@ class PlateRecognitionWorker(QObject):
         self._last_inference_ok: bool | None = None
         self._last_candidate: str | None = None
         self._last_state: RecognitionState | None = None
+        self._detector_latency_ms: deque[float] = deque(maxlen=128)
+        self._ocr_latency_ms: deque[float] = deque(maxlen=128)
+        self._queue_wait_ms: deque[float] = deque(maxlen=128)
+        self._end_to_end_ms: deque[float] = deque(maxlen=128)
 
     def arm_raw_capture(self, direction: Direction | None = None) -> bool:
         processor = self._detector_processor
@@ -3805,7 +3932,7 @@ class PlateRecognitionWorker(QObject):
                     continue
                 if source == "live":
                     self.detections_changed.emit(camera_id, result.detections)
-                self._record_detector_result(bool(result.detections))
+                self._record_detector_result(bool(result.detections), result.detector_ms)
                 if result.job is None:
                     if source == "live":
                         self.outcome_changed.emit(
@@ -3854,6 +3981,7 @@ class PlateRecognitionWorker(QObject):
     def runtime_health(self) -> RecognitionRuntimeHealth:
         now = time.monotonic()
         with self._lock:
+            camera_ids = tuple(sorted(self._known_camera_ids))
             values = {
                 "frames_ingested": self._frames_ingested,
                 "detector_frames_processed": self._detector_frames_processed,
@@ -3877,17 +4005,29 @@ class PlateRecognitionWorker(QObject):
                 "last_inference_ok": self._last_inference_ok,
                 "last_candidate": self._last_candidate,
                 "last_state": self._last_state,
+                "detector_mean_ms": _mean_or_none(self._detector_latency_ms),
+                "detector_p95_ms": _p95_or_none(self._detector_latency_ms),
+                "ocr_mean_ms": _mean_or_none(self._ocr_latency_ms),
+                "ocr_p95_ms": _p95_or_none(self._ocr_latency_ms),
+                "queue_wait_mean_ms": _mean_or_none(self._queue_wait_ms),
+                "queue_wait_p95_ms": _p95_or_none(self._queue_wait_ms),
+                "end_to_end_mean_ms": _mean_or_none(self._end_to_end_ms),
+                "end_to_end_p95_ms": _p95_or_none(self._end_to_end_ms),
             }
         return RecognitionRuntimeHealth(
             **values,
             queue_depth=self._job_buffer.pending_count(),
             dropped_jobs=self._job_buffer.dropped_count,
             stale_jobs=self._job_buffer.stale_count,
+            buffers=tuple(
+                self._frame_buffer.health(camera_id, now) for camera_id in camera_ids
+            ),
         )
 
-    def _record_detector_result(self, detected: bool) -> None:
+    def _record_detector_result(self, detected: bool, detector_ms: float) -> None:
         with self._lock:
             self._detector_frames_processed += 1
+            self._detector_latency_ms.append(max(0.0, detector_ms))
             if detected:
                 self._detector_hits += 1
             else:
@@ -3901,9 +4041,15 @@ class PlateRecognitionWorker(QObject):
         self,
         _job: OcrJob,
         outcome: RecognitionOutcome,
+        ocr_ms: float,
+        queue_wait_ms: float,
+        end_to_end_ms: float,
     ) -> None:
         with self._lock:
             self._ocr_jobs_processed += 1
+            self._ocr_latency_ms.append(max(0.0, ocr_ms))
+            self._queue_wait_ms.append(max(0.0, queue_wait_ms))
+            self._end_to_end_ms.append(max(0.0, end_to_end_ms))
             self._last_ocr_job_at = time.monotonic()
             self._last_inference_ok = True
             self._last_state = outcome.state
@@ -4077,26 +4223,20 @@ class PlateRecognitionWorker(QObject):
         ):
             return
         self._last_ring_diagnostic_at[camera_id] = now
-        snapshots = self._frame_buffer.snapshots(camera_id)
-        oldest_age_ms = (
-            0.0
-            if not snapshots
-            else max(0.0, (now - snapshots[0].observed_at) * 1000.0)
-        )
-        newest_age_ms = (
-            0.0
-            if not snapshots
-            else max(0.0, (now - snapshots[-1].observed_at) * 1000.0)
-        )
+        health = self._frame_buffer.health(camera_id, now)
         LOGGER.debug(
             "Pre-detection ring camera_id=%s ring_depth=%s ring_unique_frames=%s "
-            "oldest_age_ms=%.1f newest_age_ms=%.1f replay_queue_depth=%s "
-            "motion_active=%s",
+            "oldest_age_ms=%.1f newest_age_ms=%.1f effective_ring_duration_ms=%.1f "
+            "recognition_ingest_fps=%.2f estimated_ring_memory_mb=%.2f "
+            "replay_queue_depth=%s motion_active=%s",
             camera_id,
-            len(snapshots),
-            len({snapshot.frame_id for snapshot in snapshots}),
-            oldest_age_ms,
-            newest_age_ms,
+            health.ring_depth,
+            health.ring_depth,
+            health.oldest_frame_age_ms or 0.0,
+            health.newest_frame_age_ms or 0.0,
+            health.effective_ring_duration_ms,
+            health.recognition_ingest_fps,
+            health.estimated_ring_memory_mb,
             self._replay_buffer.pending_event_count(camera_id),
             "yes" if self._frame_buffer.active_event_id(camera_id) is not None else "no",
         )
@@ -4669,24 +4809,31 @@ def recognize_detector_crops(
         _is_shadow_recovery_eligible(profile, crop_metrics)
         for profile, crop_metrics in zip(profiles, metrics)
     )
+    variant_conflict = bool(
+        candidate is not None
+        and _has_disjoint_variant_consensus_conflict(
+            segments,
+            candidate,
+            camera_id,
+        )
+    )
     shadow_retry_reason: str | None = None
-    if shadow_recovery_eligible:
+    if variant_conflict:
+        shadow_retry_reason = "variant-consensus-conflict"
+    elif shadow_recovery_eligible:
         if candidate is None:
             shadow_retry_reason = "missing-candidate"
         elif candidate.confidence < min_confidence:
             shadow_retry_reason = "low-confidence"
-        elif _has_disjoint_variant_consensus_conflict(
-            segments,
-            candidate,
-            camera_id,
-        ):
-            shadow_retry_reason = "variant-consensus-conflict"
 
     if shadow_retry_reason is not None:
         shadow_preprocess_started = time.perf_counter()
         shadow_variants: list[np.ndarray] = []
         for crop_index, (crop, profile) in enumerate(zip(crops, profiles)):
-            if not _is_shadow_recovery_eligible(profile, metrics[crop_index]):
+            if (
+                shadow_retry_reason != "variant-consensus-conflict"
+                and not _is_shadow_recovery_eligible(profile, metrics[crop_index])
+            ):
                 continue
             detection = (
                 crop_detections[crop_index]
@@ -4778,7 +4925,14 @@ def _has_disjoint_variant_consensus_conflict(
     return bool(
         rival is not None
         and rival.plate != candidate.plate
-        and rival.variant_support >= candidate.variant_support
+        and (
+            rival.variant_support >= candidate.variant_support
+            or (
+                plates_are_near_conflicts(candidate.plate, rival.plate)
+                and rival.variant_support + 1 == candidate.variant_support
+                and rival.confidence > candidate.confidence
+            )
+        )
     )
 
 
@@ -5079,6 +5233,16 @@ def plate_boxes_match(
         (first_width + first_height + second_width + second_height) / 4.0,
     )
     return center_distance <= reference_size * 0.50
+
+
+def candidates_share_spatial_session(
+    first: PlateCandidate,
+    second: PlateCandidate,
+) -> bool:
+    """Conservatively associate candidates; fallback evidence has no location."""
+    if first.detector_bbox is None or second.detector_bbox is None:
+        return True
+    return plate_boxes_match(first.detector_bbox, second.detector_bbox)
 
 
 def _translate(

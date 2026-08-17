@@ -225,6 +225,8 @@ def _converter_dependencies_ready(converter_python: Path) -> bool:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except OSError:
         return False
@@ -276,6 +278,8 @@ def _resolve_model_optimizer(converter_python: Path) -> Path:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except OSError as exc:
         raise PreparationError("Model Optimizer yolu belirlenemedi") from exc

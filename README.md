@@ -185,7 +185,7 @@ OCR worker diagnostics camera_id=1 direction=ENTRY profiles=LOW_LIGHT crop_quali
 
 DEBUG kaydı variant adı, Paddle text-box sayısı, raw/normalized/corrected text, correction cost, OCR confidence, bbox, validator sonucu ve rejection reason alanlarını bounded olarak içerir. Böylece `text_detection_boxes=0` ile text box üretildiği halde geçerli Türk plakası çıkmaması birbirinden ayrılır. Log camera başına throttle edilir ve INFO seviyesini doldurmaz.
 
-Admin OCR Tanılama ekranı model dosyaları ve servis durumuna ek olarak çalışma süresindeki frame ingest, detector hit/miss, queued/processed OCR işi, inference hatası, kayıt, son OCR aktivitesi ve bounded queue drop/stale sayaçlarını gösterir. Böylece `ACTIVE` yalnız initialization başarısı olarak kalırken gerçek frame/inference aktivitesi ayrıca görülebilir.
+Admin OCR Tanılama ekranı model dosyaları ve servis durumuna ek olarak çalışma süresindeki frame ingest, detector hit/miss, queued/processed OCR işi, inference hatası, kayıt, son OCR aktivitesi ve bounded queue drop/stale sayaçlarını gösterir. Kamera başına ring depth/cap, effective history, ingest FPS, tahmini ring RAM ve active-event frame sayısı; son 128 detector/OCR/queue-wait/end-to-end işlemin mean/p95 süreleri de raporlanır. Böylece `ACTIVE` yalnız initialization başarısı olarak kalırken gerçek frame/inference aktivitesi ayrıca görülebilir.
 
 Aynı saha frame'inde gerçek OpenVINO/PaddleOCR aşamalarını karşılaştırma:
 
@@ -196,7 +196,16 @@ Aynı saha frame'inde gerçek OpenVINO/PaddleOCR aşamalarını karşılaştırm
 .\.venv\Scripts\python.exe scripts\test_plate_ocr.py frame.jpg --direction EXIT --mode compare --save-debug debug\compare
 ```
 
-`compare`, doğrudan resize, aspect-preserving letterbox ve bounded tile detector sonuçlarını; ardından current detector-crop, ayrı shadow-color baseline, production için seçilmiş shadow grayscale ve full-ROI OCR ham segmentlerini raporlar. Crop metrikleri, profile, preprocessing/inference süresi, inference çağrı sayısı, text-box sayısı ve en iyi aday ayrı satırlardadır. `--save-debug` source, ROI, detector overlay, original detector crop, adlandırılmış current/shadow variantları ve OCR result kutularını yazar. Normal UI'yi veya production ayarlarını değiştirmez.
+`compare`, doğrudan resize, aspect-preserving letterbox ve bounded tile detector sonuçlarını; ardından current detector-crop, ayrı shadow-color baseline, production için seçilmiş shadow grayscale ve full-ROI OCR ham segmentlerini raporlar. `production` modu detector crop yoksa live motion fallback'in offline proxy'sini ayrıca ve açıkça işaretleyerek dener. Crop metrikleri, profile, preprocessing/inference süresi, inference çağrı sayısı, text-box sayısı ve en iyi aday ayrı satırlardadır. `--save-debug` source, ROI, detector overlay, original detector crop, adlandırılmış current/shadow variantları ve OCR result kutularını yazar. Normal UI'yi veya production ayarlarını değiştirmez.
+
+Birden çok gerçek saha frame'i için developer-local manifest `debug/field_dataset/manifest.json` altında tutulabilir. `debug/` Git tarafından yok sayıldığı için gerçek plaka görüntüleri ve benchmark raporları repository'ye eklenmez. OpenVINO ve PaddleOCR modellerini tek runtime içinde tekrar kullanan benchmark:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\benchmark_field_alpr.py debug\field_dataset\manifest.json --label before --recognition-only-ab --output debug\field_dataset\before.json
+.\.venv\Scripts\python.exe scripts\benchmark_field_alpr.py debug\field_dataset\manifest.json --label after --baseline debug\field_dataset\before.json --output debug\field_dataset\after.json
+```
+
+Rapor primary/tiled detector recall, fallback kullanımı, exact ve character accuracy, confusion çiftleri, false/no-read oranı, detector/OCR/end-to-end mean-p50-p95 ve CPU inference çağrılarını içerir. Tek JPEG benchmark'ı multi-frame `SAVED` kararı üretmediği için save precision veya ambiguous-discard metriğini uydurmaz; bunları candidate metriğinden açıkça ayırır. `--recognition-only-ab` yalnız development A/B ölçümüdür ve production davranışını değiştirmez.
 
 Aynı kamera/açıdan gölge ve güneş frame'lerini tek komutta karşılaştırmak için:
 
@@ -240,7 +249,7 @@ Model zaten hazırsa aynı komut pip, download veya conversion çalıştırmadan
 
 Yerel bir Open Model Zoo checkout'u kullanmak isteyen geliştiriciler için `--omz-tools-dir C:\path\to\open_model_zoo\tools\model_tools` desteği korunur. Bütün pip/download/conversion işlemleri yalnızca bu hazırlama scripti açıkça çalıştırıldığında yapılır; `main.py` ve `run.bat` tamamen offline kalır. Model binary dosyaları Git'e eklenmez. Model kaynağı ve lisans notu [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) dosyasındadır.
 
-Minimum OCR kalite filtresini geçen tüm geçerli ve normalize edilmiş plakalar, confidence değeri ne olursa olsun iki tutarlı observation ile doğrulanır. Provisional doğrulamadan sonra yapılandırılmış stabilizasyon penceresi bütünüyle beklenir; aynı frame'deki preprocessing variantları tek bağımsız observation sayılır. Pencere içinde oluşan tek karakterlik iki geçerli plaka çatışması bağımsız frame oylarıyla çözülür, yeterli üstünlük yoksa kayıt oluşturulmaz. D/O gibi karakterler plaka değerine özel bir kuralla birbirine dönüştürülmez. OCR confidence değeri yalnızca dahili filtreleme, sıralama ve DEBUG diagnostics için kullanılır; kullanıcı arayüzünde doğruluk yüzdesi olarak gösterilmez.
+Minimum OCR kalite filtresini geçen tüm geçerli ve normalize edilmiş plakalar, confidence değeri ne olursa olsun iki tutarlı observation ile doğrulanır. Provisional doğrulamadan sonra yapılandırılmış stabilizasyon penceresi bütünüyle beklenir; aynı frame'deki preprocessing variantları tek bağımsız observation sayılır. Normal crop variantları iki yakın geçerli aday arasında yalnız tek-vote margin ile çatışır ve tekil rakip daha güçlü OCR confidence taşırsa mevcut tek shadow-gray variantı bounded tie-breaker olarak bir kez çalışır; temiz normal crop ek inference almaz. Pencere içinde kalan tek karakterlik çatışma bağımsız frame oylarıyla çözülür, yeterli üstünlük yoksa kayıt oluşturulmaz. Detector bbox'ları belirgin biçimde farklıysa iki aracın near-conflict oyları aynı spatial session'a karıştırılmaz; bbox'sız fallback evidence konservatif kalır. D/O gibi karakterler plaka değerine özel bir kuralla birbirine dönüştürülmez. OCR confidence değeri yalnızca dahili filtreleme, sıralama ve DEBUG diagnostics için kullanılır; kullanıcı arayüzünde doğruluk yüzdesi olarak gösterilmez.
 
 Plate presence kontrolüne ek olarak, aynı kamera ve aynı normalize plaka için son DB kaydı transaction içinde kontrol edilir. İlk kayıttan sonraki 120 saniye boyunca ikinci DB satırı veya JPEG oluşturulmaz. ENTRY ve EXIT kameraları birbirinden bağımsızdır ve kontrol SQLite kayıtlarından yapıldığı için uygulama yeniden başlatıldığında da devam eder.
 

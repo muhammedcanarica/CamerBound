@@ -806,6 +806,31 @@ class CameraSettingsWidget(QWidget):
                 f"Queue: {health.queue_depth}, drop={health.dropped_jobs}, "
                 f"stale={health.stale_jobs}"
             )
+            if health.detector_mean_ms is not None:
+                def latency_pair(mean: float | None, p95: float | None) -> str:
+                    if mean is None or p95 is None:
+                        return "yok"
+                    return f"{mean:.1f}/{p95:.1f} ms"
+
+                lines.append(
+                    "Latency (son 128): "
+                    f"detector={latency_pair(health.detector_mean_ms, health.detector_p95_ms)}, "
+                    f"OCR={latency_pair(health.ocr_mean_ms, health.ocr_p95_ms)}, "
+                    f"queue={latency_pair(health.queue_wait_mean_ms, health.queue_wait_p95_ms)}, "
+                    f"e2e={latency_pair(health.end_to_end_mean_ms, health.end_to_end_p95_ms)} "
+                    "(mean/p95)"
+                )
+            for buffer in health.buffers:
+                direction = buffer.direction.value if buffer.direction is not None else "?"
+                lines.append(
+                    f"Buffer kamera={buffer.camera_id}/{direction}: "
+                    f"depth={buffer.ring_depth}/{buffer.frame_cap}, "
+                    f"history={buffer.effective_ring_duration_ms:.0f}/"
+                    f"{buffer.configured_duration_ms} ms, "
+                    f"ingest={buffer.recognition_ingest_fps:.2f} FPS, "
+                    f"ring={buffer.estimated_ring_memory_mb:.1f} MiB, "
+                    f"event={buffer.active_event_frames}"
+                )
             self.diagnostics_ready.emit("\n".join(lines))
 
         threading.Thread(target=check, name="ocr-diagnostics", daemon=True).start()

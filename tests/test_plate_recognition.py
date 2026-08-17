@@ -250,6 +250,31 @@ class PlateTextTests(unittest.TestCase):
         self.assertIsNone(outcomes[4].candidate)
         self.assertEqual(outcomes[4].runner_up_votes, 2)
 
+    def test_near_candidates_at_different_bboxes_do_not_share_votes(self) -> None:
+        tracker = ConfirmationTracker(required=2, window_seconds=3.0)
+        first_vehicle = PlateCandidate(
+            "34ORF848",
+            0.9,
+            "34ORF848",
+            1,
+            detector_bbox=(10.0, 10.0, 80.0, 20.0),
+        )
+        second_vehicle = PlateCandidate(
+            "34DRF848",
+            0.9,
+            "34DRF848",
+            1,
+            detector_bbox=(300.0, 10.0, 80.0, 20.0),
+        )
+
+        tracker.observe_progress(second_vehicle, 1.0, frame_id=1)
+        first = tracker.observe_progress(first_vehicle, 1.2, frame_id=2)
+        confirmed = tracker.observe_progress(first_vehicle, 1.4, frame_id=3)
+
+        self.assertEqual(first.near_conflicts, ())
+        self.assertEqual(first.required_count, 2)
+        self.assertEqual(confirmed.candidate.plate, "34ORF848")
+
     def test_corrected_candidate_requires_three_distinct_frames(self) -> None:
         tracker = ConfirmationTracker(required=2, window_seconds=3.0)
         corrected = PlateCandidate(
@@ -487,6 +512,31 @@ class PreprocessingTests(unittest.TestCase):
         self.assertEqual(result.shadow_retry_reason, "variant-consensus-conflict")
         self.assertEqual(result.candidate.plate, "01KAC53")
         self.assertEqual(result.candidate.variant_support, 3)
+
+    def test_normal_one_vote_margin_conflict_uses_bounded_shadow_tie_breaker(self) -> None:
+        provider = SequencedOcrProvider(
+            [
+                [
+                    OcrSegment("34 DRF 846", 0.818, (0.0, 0.0, 100.0, 30.0), 0),
+                    OcrSegment("34 DRF 848", 0.917, (0.0, 0.0, 100.0, 30.0), 1),
+                    OcrSegment("34 DRF 846", 0.817, (0.0, 0.0, 100.0, 30.0), 2),
+                ],
+                [OcrSegment("34 DRF 848", 0.950, (0.0, 0.0, 100.0, 30.0))],
+            ]
+        )
+
+        result = recognize_detector_crops(
+            provider,
+            [self._plate_crop(190, 25)],
+            camera_id=1,
+            min_confidence=0.65,
+        )
+
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(result.shadow_retry_reason, "variant-consensus-conflict")
+        self.assertEqual(result.shadow_variant_count, 1)
+        self.assertEqual(result.candidate.plate, "34DRF848")
+        self.assertEqual(result.candidate.variant_support, 2)
 
     def test_low_light_recovery_adds_only_distinct_gamma_gray_variant(self) -> None:
         provider = SequencedOcrProvider([[], []])
@@ -1693,6 +1743,32 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertLessEqual(buffer.ring_depth(1), 16)
         self.assertEqual(config.recognition_interval_ms, 250)
 
+    def test_ring_health_reports_effective_duration_fps_and_memory(self) -> None:
+        config = replace(
+            self.config,
+            pre_detection_buffer_duration_ms=5_000,
+            pre_detection_buffer_max_frames_per_camera=16,
+        )
+        buffer = PreDetectionFrameBuffer(config)
+        for index in range(4):
+            buffer.ingest(
+                self._make_snapshot(index + 1, index * 0.25),
+                motion_score=0.0,
+            )
+
+        health = buffer.health(1, now=1.0)
+
+        self.assertEqual(health.ring_depth, 4)
+        self.assertEqual(health.frame_cap, 16)
+        self.assertEqual(health.configured_duration_ms, 5_000)
+        self.assertAlmostEqual(health.oldest_frame_age_ms, 1_000.0)
+        self.assertAlmostEqual(health.newest_frame_age_ms, 250.0)
+        self.assertAlmostEqual(health.effective_ring_duration_ms, 750.0)
+        self.assertAlmostEqual(health.recognition_ingest_fps, 4.0)
+        expected_mb = 4 * 200 * 400 * 3 / (1024**2)
+        self.assertAlmostEqual(health.estimated_ring_memory_mb, expected_mb)
+        self.assertEqual(health.active_event_frames, 0)
+
     def test_motion_event_pins_pre_and_post_roll_and_closes_after_quiet(self) -> None:
         config = replace(
             self.config,
@@ -1723,6 +1799,36 @@ class RecognitionPipelineTests(unittest.TestCase):
             [item.frame_id for item in completed[0].frames],
             [1, 2, 3, 4, 5, 6, 7],
         )
+
+    def test_long_motion_event_retains_bounded_early_middle_and_late_frames(self) -> None:
+        config = replace(
+            self.config,
+            pre_detection_buffer_duration_ms=10_000,
+            pre_detection_buffer_max_frames_per_camera=8,
+            motion_pre_roll_ms=0,
+            motion_post_roll_ms=0,
+            motion_quiet_ms=0,
+            motion_event_max_duration_ms=10_000,
+        )
+        buffer = PreDetectionFrameBuffer(config)
+        for index in range(25):
+            buffer.ingest(
+                self._make_snapshot(index + 1, index * 0.25),
+                motion_score=0.1,
+            )
+        completed = buffer.ingest(
+            self._make_snapshot(26, 6.25),
+            motion_score=0.0,
+        )
+
+        self.assertEqual(len(completed), 1)
+        frame_ids = [item.frame_id for item in completed[0].frames]
+        self.assertLessEqual(len(frame_ids), 8)
+        self.assertEqual(frame_ids[0], 1)
+        self.assertEqual(frame_ids[-1], 26)
+        self.assertTrue(any(2 <= frame_id <= 9 for frame_id in frame_ids))
+        self.assertTrue(any(10 <= frame_id <= 17 for frame_id in frame_ids))
+        self.assertTrue(any(18 <= frame_id <= 25 for frame_id in frame_ids))
 
     def test_static_frames_do_not_create_motion_event(self) -> None:
         buffer = PreDetectionFrameBuffer(self.config)
@@ -4418,6 +4524,12 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(health.ocr_inference_errors, 1)
         self.assertGreaterEqual(health.ocr_jobs_processed, 1)
         self.assertIs(health.last_inference_ok, True)
+        self.assertIsNotNone(health.detector_mean_ms)
+        self.assertIsNotNone(health.detector_p95_ms)
+        self.assertIsNotNone(health.ocr_mean_ms)
+        self.assertIsNotNone(health.ocr_p95_ms)
+        self.assertIsNotNone(health.queue_wait_mean_ms)
+        self.assertIsNotNone(health.end_to_end_p95_ms)
 
     def test_debug_output_paths_are_created(self) -> None:
         output = Path(self.temp_directory.name) / "debug"
