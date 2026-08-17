@@ -2709,7 +2709,11 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
         processor._last_diagnostic_logged_at[1] = now
         job = replace(
-            self._make_ocr_job(observed_at=now, frame_id=88),
+            self._make_ocr_job(
+                observed_at=now,
+                frame_id=88,
+                detection=PlateDetection(0.80, 20, 10, 60, 18),
+            ),
             diagnostic_capture=True,
         )
         with self.assertLogs("app.plate_recognition", level="INFO") as ocr_logs:
@@ -2720,6 +2724,7 @@ class RecognitionPipelineTests(unittest.TestCase):
                 for line in ocr_logs.output
             )
         )
+        self.assertTrue(any("aspect=" in line for line in ocr_logs.output))
 
     def test_full_roi_fallback_uses_single_compact_variant_on_early_success(self) -> None:
         provider = RecordingOcrProvider(confidence=0.97)
@@ -2822,7 +2827,60 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIs(outcome.state, RecognitionState.NO_OCR_TEXT)
         self.assertEqual(len(provider.calls), 5)
 
-    def test_detector_crop_normal_profile_has_no_shadow_retry(self) -> None:
+    def test_invalid_detector_crop_runs_bounded_ocr_search_rescue(self) -> None:
+        provider = SequencedOcrProvider(
+            [
+                [OcrSegment("HEADLIGHT", 0.99, (0.0, 0.0, 20.0, 10.0))],
+                [OcrSegment("06 FUP 848", 0.96, (5.0, 6.0, 105.0, 36.0))],
+            ]
+        )
+        processor = PlateRecognitionProcessor(provider, self.plate_service, self.config)
+        roi = np.full((240, 960, 3), 120, dtype=np.uint8)
+        false_crop = np.full((30, 60, 3), 120, dtype=np.uint8)
+        job = replace(
+            self._make_ocr_job(
+                frame_id=623,
+                job_type=OcrJobType.DETECTOR_CROP,
+                detection=PlateDetection(0.80, 600, 120, 24, 18),
+            ),
+            roi_crop=roi,
+            ocr_crops=(false_crop,),
+        )
+
+        outcome = processor.process_ocr_job(job, queue_depth=0)
+
+        self.assertIs(outcome.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertEqual(outcome.candidate.plate, "06FUP848")
+        self.assertFalse(outcome.candidate.detector_crop_evidence)
+        self.assertTrue(outcome.used_roi_fallback)
+        self.assertEqual(len(provider.calls), 2)
+        self.assertLess(provider.calls[1][0].shape[1], roi.shape[1])
+
+    def test_valid_detector_crop_keeps_single_inference_fast_path(self) -> None:
+        provider = SequencedOcrProvider(
+            [[OcrSegment("06 FUP 848", 0.96, (0.0, 0.0, 100.0, 30.0))]]
+        )
+        processor = PlateRecognitionProcessor(provider, self.plate_service, self.config)
+        crop = np.full((30, 90, 3), 120, dtype=np.uint8)
+        job = replace(
+            self._make_ocr_job(
+                frame_id=624,
+                job_type=OcrJobType.DETECTOR_CROP,
+                detection=PlateDetection(0.90, 100, 50, 60, 18),
+            ),
+            roi_crop=np.full((240, 960, 3), 120, dtype=np.uint8),
+            ocr_crops=(crop,),
+        )
+
+        outcome = processor.process_ocr_job(job, queue_depth=0)
+
+        self.assertIs(outcome.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertEqual(outcome.candidate.plate, "06FUP848")
+        self.assertTrue(outcome.candidate.detector_crop_evidence)
+        self.assertFalse(outcome.used_roi_fallback)
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_detector_crop_normal_profile_uses_one_tile_after_no_text(self) -> None:
         provider = SequencedOcrProvider([[]])
         processor = PlateRecognitionProcessor(provider, self.plate_service, self.config)
         crop = PreprocessingTests._plate_crop(190, 25)
@@ -2835,7 +2893,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         outcome = processor.process_ocr_job(job, queue_depth=0)
 
         self.assertIs(outcome.state, RecognitionState.NO_OCR_TEXT)
-        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(len(provider.calls), 2)
 
     def test_detector_crop_shadow_retry_recovers_valid_candidate(self) -> None:
         provider = SequencedOcrProvider(

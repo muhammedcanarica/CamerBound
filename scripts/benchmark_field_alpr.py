@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
@@ -29,6 +29,8 @@ from app.plate_detector import (
     OpenVinoPlateDetector,
     PlateDetection,
     crop_padded_plate,
+    plate_detection_geometry_quality,
+    plate_detection_ranking_score,
     select_plate_detections,
 )
 from app.plate_recognition import (
@@ -91,6 +93,7 @@ class SampleResult:
     text_detection_box_counts: tuple[int | None, ...] = ()
     raw_ocr_segments: tuple[dict[str, object], ...] = ()
     rejection_reason: str = "none"
+    detector_crop_rescue_attempted: bool = False
 
 
 class RecognitionOnlyProvider:
@@ -292,7 +295,10 @@ def detector_crops(
     detections = detector.detect(roi)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     selected = select_plate_detections(
-        detections, config.plate_detector.max_plate_candidates_per_frame
+        detections,
+        config.plate_detector.max_plate_candidates_per_frame,
+        roi_width=roi.shape[1],
+        roi_height=roi.shape[0],
     )
     padding = (
         config.plate_detector.tiled_recovery_crop_padding_ratio
@@ -366,6 +372,7 @@ def run_sample(
     )
     diagnostics = detector.last_diagnostics
     used_roi_fallback = not crops
+    detector_crop_rescue_attempted = False
     if crops:
         ocr = recognize_detector_crops(
             provider,
@@ -379,14 +386,52 @@ def run_sample(
         inference_calls = ocr.inference_calls
         ocr_ms = ocr.current_inference_ms + ocr.shadow_inference_ms
         profiles = tuple(item.value for item in ocr.profiles)
-        variant_names = ocr.variant_names
-        variants = ocr.variants
-        detection_box_counts = (
+        variant_names = list(ocr.variant_names)
+        variants = list(ocr.variants)
+        detection_box_counts = list(
             tuple(None for _ in variants)
             if isinstance(provider, RecognitionOnlyProvider)
             else ocr.text_detection_box_counts
         )
         rescue_tiles = 0
+        if candidate is None or candidate.confidence < config.min_confidence:
+            detector_crop_rescue_attempted = True
+            search = recognize_ocr_search_tiles(
+                fallback_provider or provider,
+                roi,
+                0,
+                config.min_confidence,
+            )
+            rescue_offset = len(variants)
+            attempted_tiles = search.tiles[: search.inference_calls]
+            variants.extend(tile.image for tile in attempted_tiles)
+            variant_names.extend(
+                "detector-crop-rescue-tile-"
+                f"{index}[x={tile.roi_box[0]},w={tile.roi_box[2]}]"
+                for index, tile in enumerate(attempted_tiles)
+            )
+            rescue_segments = [
+                replace(
+                    segment,
+                    variant_index=segment.variant_index + rescue_offset,
+                )
+                for segment in search.segments
+            ]
+            segments.extend(rescue_segments)
+            detection_box_counts.extend(search.text_detection_box_counts)
+            rescue_candidate = select_best_candidate(rescue_segments, camera_id=0)
+            if (
+                rescue_candidate is not None
+                and rescue_candidate.confidence >= config.min_confidence
+            ):
+                candidate = rescue_candidate
+                used_roi_fallback = True
+            elif candidate is None and rescue_candidate is not None:
+                candidate = rescue_candidate
+                used_roi_fallback = True
+            rescue_tiles = search.inference_calls
+            inference_calls += search.inference_calls
+            ocr_ms += search.inference_ms
     else:
         (
             candidate,
@@ -444,6 +489,21 @@ def run_sample(
                 "width": detection.width,
                 "height": detection.height,
                 "confidence": detection.confidence,
+                "aspect_ratio": detection.width / max(1, detection.height),
+                "area": detection.area,
+                "roi_area_ratio": detection.area / max(1, roi.shape[1] * roi.shape[0]),
+                "relative_x": detection.x / max(1, roi.shape[1]),
+                "relative_y": detection.y / max(1, roi.shape[0]),
+                "geometry_quality": plate_detection_geometry_quality(
+                    detection,
+                    roi_width=roi.shape[1],
+                    roi_height=roi.shape[0],
+                ),
+                "ranking_score": plate_detection_ranking_score(
+                    detection,
+                    roi_width=roi.shape[1],
+                    roi_height=roi.shape[0],
+                ),
             }
             for detection in crop_detections
         ),
@@ -465,6 +525,7 @@ def run_sample(
             if candidate.confidence < config.min_confidence
             else "none"
         ),
+        detector_crop_rescue_attempted=detector_crop_rescue_attempted,
     )
 
 
@@ -706,6 +767,9 @@ def summarize(label: str, samples, results) -> dict[str, object]:
     ocr_times = [result.ocr_ms for result in results]
     total_times = [result.end_to_end_ms for result in results]
     rescue_results = [result for result in results if result.rescue_tiles > 0]
+    detector_crop_rescues = [
+        result for result in results if result.detector_crop_rescue_attempted
+    ]
 
     def ratio(value: int, denominator: int) -> float:
         return value / denominator if denominator else 0.0
@@ -767,6 +831,13 @@ def summarize(label: str, samples, results) -> dict[str, object]:
             "attempted_samples": len(rescue_results),
             "successful_exact_reads": sum(result.exact for result in rescue_results),
             "attempted_tiles": sum(result.rescue_tiles for result in rescue_results),
+            "detector_crop_invalid_samples": len(detector_crop_rescues),
+            "detector_crop_recovered_exact": sum(
+                result.exact for result in detector_crop_rescues
+            ),
+            "false_detection_suppressed_recovery_count": len(
+                detector_crop_rescues
+            ),
             "ocr_mean_ms": (
                 statistics.fmean(result.ocr_ms for result in rescue_results)
                 if rescue_results

@@ -28,6 +28,12 @@ SHADOW_CLAHE_GRID_SIZE = (8, 8)
 DETECTOR_RECOVERY_TILE_ASPECT_RATIO = 2.0
 DETECTOR_RECOVERY_TILE_MIN_WIDTH = 384
 DETECTOR_RECOVERY_MAX_TILES = 3
+# Soft single-line plate references measured from verified field detector boxes.
+# They affect ordering only: unusual/special-format candidates are never rejected.
+PLATE_GEOMETRY_REFERENCE_ASPECT = 3.2
+PLATE_GEOMETRY_MIN_USEFUL_WIDTH = 32
+PLATE_GEOMETRY_MIN_USEFUL_HEIGHT = 10
+PLATE_GEOMETRY_MIN_USEFUL_ROI_AREA_RATIO = 0.0025
 
 
 class PlateDetectorError(RuntimeError):
@@ -524,12 +530,72 @@ def _parse_ssd_plate_detections(
 def select_plate_detections(
     detections: Sequence[PlateDetection],
     maximum: int,
+    *,
+    roi_width: int | None = None,
+    roi_height: int | None = None,
 ) -> list[PlateDetection]:
     return sorted(
         detections,
-        key=lambda detection: (detection.confidence, detection.area),
+        key=lambda detection: (
+            plate_detection_ranking_score(
+                detection,
+                roi_width=roi_width,
+                roi_height=roi_height,
+            ),
+            plate_detection_geometry_quality(
+                detection,
+                roi_width=roi_width,
+                roi_height=roi_height,
+            ),
+            detection.confidence,
+            detection.area,
+        ),
         reverse=True,
     )[: max(0, maximum)]
+
+
+def plate_detection_geometry_quality(
+    detection: PlateDetection,
+    *,
+    roi_width: int | None = None,
+    roi_height: int | None = None,
+) -> float:
+    """Return a continuous geometry hint without rejecting detector evidence."""
+    aspect = detection.width / max(1, detection.height)
+    aspect_quality = math.exp(
+        -abs(math.log(max(aspect, 0.01) / PLATE_GEOMETRY_REFERENCE_ASPECT))
+    )
+    width_quality = min(1.0, detection.width / PLATE_GEOMETRY_MIN_USEFUL_WIDTH)
+    height_quality = min(1.0, detection.height / PLATE_GEOMETRY_MIN_USEFUL_HEIGHT)
+    scale_quality = math.sqrt(width_quality * height_quality)
+    if (
+        roi_width is not None
+        and roi_height is not None
+        and roi_width > 0
+        and roi_height > 0
+    ):
+        area_ratio = detection.area / (roi_width * roi_height)
+        area_quality = min(
+            1.0,
+            area_ratio / PLATE_GEOMETRY_MIN_USEFUL_ROI_AREA_RATIO,
+        )
+        scale_quality = math.sqrt(scale_quality * area_quality)
+    return math.sqrt(aspect_quality * scale_quality)
+
+
+def plate_detection_ranking_score(
+    detection: PlateDetection,
+    *,
+    roi_width: int | None = None,
+    roi_height: int | None = None,
+) -> float:
+    """Blend detector confidence with bounded geometry quality for selection."""
+    geometry = plate_detection_geometry_quality(
+        detection,
+        roi_width=roi_width,
+        roi_height=roi_height,
+    )
+    return detection.confidence * (0.5 + 0.5 * geometry)
 
 
 def crop_padded_plate(

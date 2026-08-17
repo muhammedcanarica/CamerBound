@@ -463,7 +463,7 @@ class PlateDetectorTests(unittest.TestCase):
         self.assertEqual(center_crop.shape, (26, 52, 3))
         self.assertEqual(edge_crop.shape, (12, 23, 3))
 
-    def test_candidate_limit_prefers_confidence_then_area(self) -> None:
+    def test_candidate_limit_blends_confidence_with_geometry(self) -> None:
         detections = [
             PlateDetection(0.8, 0, 0, 100, 20),
             PlateDetection(0.9, 0, 0, 20, 10),
@@ -473,6 +473,19 @@ class PlateDetectorTests(unittest.TestCase):
         selected = select_plate_detections(detections, maximum=2)
 
         self.assertEqual(selected, [detections[2], detections[1]])
+
+    def test_small_lamp_like_box_is_downranked_without_hard_rejection(self) -> None:
+        plate = PlateDetection(0.72, 120, 40, 64, 20)
+        lamp = PlateDetection(0.80, 240, 90, 12, 12)
+
+        selected = select_plate_detections(
+            [lamp, plate],
+            maximum=2,
+            roi_width=400,
+            roi_height=160,
+        )
+
+        self.assertEqual(selected, [plate, lamp])
 
 
 if __name__ == "__main__":

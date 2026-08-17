@@ -33,6 +33,8 @@ from app.plate_detector import (
     PlateDetector,
     PlateDetectorError,
     crop_padded_plate,
+    plate_detection_geometry_quality,
+    plate_detection_ranking_score,
     select_plate_detections,
 )
 from app.plate_service import (
@@ -1593,6 +1595,8 @@ class PlateDetectionProcessor:
                 selected = select_plate_detections(
                     detections,
                     detector_config.max_plate_candidates_per_frame,
+                    roi_width=roi_crop.shape[1],
+                    roi_height=roi_crop.shape[0],
                 )
                 for detection in selected:
                     plate_crop = crop_padded_plate(
@@ -2265,6 +2269,8 @@ class PlateRecognitionProcessor:
                 selected = select_plate_detections(
                     detections,
                     detector_config.max_plate_candidates_per_frame,
+                    roi_width=roi_crop.shape[1],
+                    roi_height=roi_crop.shape[0],
                 )
                 for detection in selected:
                     plate_crop = crop_padded_plate(
@@ -2423,6 +2429,9 @@ class PlateRecognitionProcessor:
         shadow_preprocess_ms = 0.0
         shadow_inference_ms = 0.0
         shadow_retry_reason: str | None = None
+        detector_crop_rescue_reason: str | None = None
+        candidate_from_detector_crop = job.job_type is OcrJobType.DETECTOR_CROP
+        effective_used_roi_fallback = job.used_roi_fallback
         if job.job_type is OcrJobType.DETECTOR_CROP:
             detector_ocr = recognize_detector_crops(
                 self.provider,
@@ -2454,6 +2463,62 @@ class PlateRecognitionProcessor:
             shadow_preprocess_ms = detector_ocr.shadow_preprocess_ms
             shadow_inference_ms = detector_ocr.shadow_inference_ms
             shadow_retry_reason = detector_ocr.shadow_retry_reason
+            detector_candidate = candidate
+            if (
+                detector_candidate is None
+                or detector_candidate.confidence < self.config.min_confidence
+            ):
+                detector_crop_rescue_reason = (
+                    "no-ocr-text"
+                    if not segments
+                    else "no-valid-plate"
+                    if detector_candidate is None
+                    else "low-confidence"
+                )
+                search_result = recognize_ocr_search_tiles(
+                    self.provider,
+                    job.roi_crop,
+                    job.camera_id,
+                    self.config.min_confidence,
+                )
+                rescue_offset = len(attempted_variants)
+                attempted_tiles = search_result.tiles[
+                    : search_result.inference_calls
+                ]
+                attempted_variants.extend(tile.image for tile in attempted_tiles)
+                variant_names.extend(
+                    "detector-crop-rescue-tile-"
+                    f"{index}[x={tile.roi_box[0]},w={tile.roi_box[2]}]"
+                    for index, tile in enumerate(attempted_tiles)
+                )
+                rescue_segments = [
+                    replace(
+                        segment,
+                        variant_index=segment.variant_index + rescue_offset,
+                    )
+                    for segment in search_result.segments
+                ]
+                segments.extend(rescue_segments)
+                text_detection_box_counts.extend(
+                    search_result.text_detection_box_counts
+                )
+                inference_calls += search_result.inference_calls
+                inference_ms += search_result.inference_ms
+                rescue_candidate = select_best_candidate(
+                    rescue_segments,
+                    job.camera_id,
+                )
+                if (
+                    rescue_candidate is not None
+                    and rescue_candidate.confidence >= self.config.min_confidence
+                ):
+                    candidate = rescue_candidate
+                    candidate_from_detector_crop = False
+                    effective_used_roi_fallback = True
+                elif detector_candidate is None and rescue_candidate is not None:
+                    candidate = rescue_candidate
+                    candidate_from_detector_crop = False
+                    effective_used_roi_fallback = True
         else:
             crop_metrics = [measure_crop_quality(crop) for crop in job.ocr_crops]
             profiles = [classify_crop_quality(item) for item in crop_metrics]
@@ -2466,11 +2531,14 @@ class PlateRecognitionProcessor:
                     job.camera_id,
                     self.config.min_confidence,
                 )
-                attempted_variants.extend(tile.image for tile in search_result.tiles)
+                attempted_tiles = search_result.tiles[
+                    : search_result.inference_calls
+                ]
+                attempted_variants.extend(tile.image for tile in attempted_tiles)
                 variant_names.extend(
                     "ocr-search-tile-"
                     f"{index}[x={tile.roi_box[0]},w={tile.roi_box[2]}]"
-                    for index, tile in enumerate(search_result.tiles)
+                    for index, tile in enumerate(attempted_tiles)
                 )
                 segments.extend(search_result.segments)
                 candidate = search_result.candidate
@@ -2544,10 +2612,11 @@ class PlateRecognitionProcessor:
             detected_at=job.captured_at,
             full_frame=job.full_frame,
             detections=job.detections,
-            used_roi_fallback=job.used_roi_fallback,
+            used_roi_fallback=effective_used_roi_fallback,
             frame_id=job.frame_id,
             job_type=job.job_type,
             quality_score=job.quality_score,
+            detector_crop_evidence=candidate_from_detector_crop,
         )
         self._log_queued_ocr_diagnostics(
             job=job,
@@ -2570,6 +2639,7 @@ class PlateRecognitionProcessor:
             shadow_preprocess_ms=shadow_preprocess_ms,
             shadow_inference_ms=shadow_inference_ms,
             shadow_retry_reason=shadow_retry_reason,
+            detector_crop_rescue_reason=detector_crop_rescue_reason,
         )
         return outcome
 
@@ -2588,6 +2658,7 @@ class PlateRecognitionProcessor:
         frame_id: int | None,
         job_type: OcrJobType,
         quality_score: float,
+        detector_crop_evidence: bool | None = None,
     ) -> RecognitionOutcome:
         detection_context = {
             "detections": detections,
@@ -2618,7 +2689,11 @@ class PlateRecognitionProcessor:
             frame_id=frame_id,
             observed_at=observed_at,
             job_type=job_type,
-            detector_crop_evidence=job_type is OcrJobType.DETECTOR_CROP,
+            detector_crop_evidence=(
+                job_type is OcrJobType.DETECTOR_CROP
+                if detector_crop_evidence is None
+                else detector_crop_evidence
+            ),
         )
 
         if frame_id is not None and not self._claim_observation_frame(
@@ -3441,6 +3516,7 @@ class PlateRecognitionProcessor:
         shadow_preprocess_ms: float,
         shadow_inference_ms: float,
         shadow_retry_reason: str | None,
+        detector_crop_rescue_reason: str | None,
     ) -> None:
         debug_enabled = LOGGER.isEnabledFor(logging.DEBUG)
         if not debug_enabled and not job.diagnostic_capture:
@@ -3477,6 +3553,7 @@ class PlateRecognitionProcessor:
             "preprocess_ms=%.1f inference_ms=%.1f end_to_end_ms=%.1f "
             "shadow_preprocess_ms=%.1f shadow_inference_ms=%.1f "
             "shadow_retry_reason=%s "
+            "detector_crop_rescue_reason=%s "
             "job_type=%s priority=%s source=%s frame_id=%s fallback_reason=%s "
             "candidate=%s recognition_state=%s candidate_rejection_reason=%s "
             "confirmation=%s/%s detector_bboxes=%s text_detection_boxes=%s "
@@ -3503,6 +3580,7 @@ class PlateRecognitionProcessor:
             shadow_preprocess_ms,
             shadow_inference_ms,
             shadow_retry_reason or "none",
+            detector_crop_rescue_reason or "none",
             job.job_type.value,
             job.job_type.priority,
             job.detector_source,
@@ -3513,7 +3591,10 @@ class PlateRecognitionProcessor:
             candidate_rejection_reason,
             outcome.confirmation_count,
             outcome.confirmation_required,
-            _format_detector_bboxes(job.ocr_crop_detections),
+            _format_detector_bboxes(
+                job.ocr_crop_detections,
+                roi=job.roi_crop,
+            ),
             _format_detection_box_counts(
                 variant_names,
                 text_detection_box_counts,
@@ -5163,9 +5244,22 @@ def _format_crop_quality_metrics(
 
 def _format_detector_bboxes(
     detections: Sequence[PlateDetection | None],
+    *,
+    roi: np.ndarray | None = None,
 ) -> str:
+    roi_height = roi.shape[0] if isinstance(roi, np.ndarray) else None
+    roi_width = roi.shape[1] if isinstance(roi, np.ndarray) else None
     values = [
-        f"{item.x},{item.y},{item.width},{item.height}"
+        (
+            f"x={item.x},y={item.y},w={item.width},h={item.height},"
+            f"conf={item.confidence:.3f},aspect={item.width / max(1, item.height):.2f},"
+            f"area={item.area},"
+            f"roi_area_ratio={item.area / max(1, (roi_width or 0) * (roi_height or 0)):.5f},"
+            f"rel_x={item.x / max(1, roi_width or 0):.3f},"
+            f"rel_y={item.y / max(1, roi_height or 0):.3f},"
+            f"geometry={plate_detection_geometry_quality(item, roi_width=roi_width, roi_height=roi_height):.3f},"
+            f"rank={plate_detection_ranking_score(item, roi_width=roi_width, roi_height=roi_height):.3f}"
+        )
         for item in detections
         if item is not None
     ]

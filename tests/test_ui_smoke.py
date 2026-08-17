@@ -936,6 +936,18 @@ class LoginFlowSmokeTest(unittest.TestCase):
 
         self.assertNotIn(Direction.ENTRY, home._plate_detections)
 
+    def test_debug_overlay_labels_unverified_bbox_as_detector_candidate(self) -> None:
+        admin = self.controller.auth_service.authenticate("admin", "admin123")
+        self.controller.show_dashboard(admin)
+        home = self.controller.dashboard_window.dashboard_home
+
+        label = home._detector_overlay_label(
+            PlateDetection(0.32, x=10, y=10, width=40, height=20)
+        )
+
+        self.assertEqual(label, "DET 32%")
+        self.assertNotIn("PLATE", label)
+
     def test_records_page_opens_detail_on_double_click(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")
         camera = self.controller.camera_service.list_cameras()[0]

@@ -99,6 +99,7 @@ class FieldBenchmarkTests(unittest.TestCase):
                 candidate="34ORF848",
                 detector_hit=True,
                 detector_variant="tiled",
+                detector_crop_rescue_attempted=True,
             ),
             self._result(
                 image="second.jpg",
@@ -121,6 +122,12 @@ class FieldBenchmarkTests(unittest.TestCase):
         self.assertEqual(report["ocr_rescue"]["attempted_samples"], 1)
         self.assertEqual(report["ocr_rescue"]["successful_exact_reads"], 1)
         self.assertEqual(report["ocr_rescue"]["attempted_tiles"], 3)
+        self.assertEqual(report["ocr_rescue"]["detector_crop_invalid_samples"], 1)
+        self.assertEqual(report["ocr_rescue"]["detector_crop_recovered_exact"], 0)
+        self.assertEqual(
+            report["ocr_rescue"]["false_detection_suppressed_recovery_count"],
+            1,
+        )
 
     @staticmethod
     def _result(
@@ -132,6 +139,7 @@ class FieldBenchmarkTests(unittest.TestCase):
         detector_variant: str,
         used_roi_fallback: bool = False,
         rescue_tiles: int = 0,
+        detector_crop_rescue_attempted: bool = False,
     ) -> SampleResult:
         return SampleResult(
             image=image,
@@ -155,6 +163,7 @@ class FieldBenchmarkTests(unittest.TestCase):
             crop_profiles=("NORMAL",),
             inference_calls=1,
             rescue_tiles=rescue_tiles,
+            detector_crop_rescue_attempted=detector_crop_rescue_attempted,
         )
 
     @staticmethod

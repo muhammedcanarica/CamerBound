@@ -544,9 +544,13 @@ class DashboardHome(QWidget):
             painter.drawText(
                 x,
                 max(14, y - 4),
-                f"PLATE {detection.confidence * 100:.0f}%",
+                self._detector_overlay_label(detection),
             )
         painter.end()
+
+    @staticmethod
+    def _detector_overlay_label(detection: PlateDetection) -> str:
+        return f"DET {detection.confidence * 100:.0f}%"
 
     def _clear_preview(self, direction: Direction, message: str) -> None:
         self._latest_images.pop(direction, None)

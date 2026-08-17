@@ -527,6 +527,8 @@ def _process_image(
     selected = select_plate_detections(
         detections,
         config.plate_detector.max_plate_candidates_per_frame,
+        roi_width=roi.shape[1],
+        roi_height=roi.shape[0],
     )
     detector_crops: list[np.ndarray] = []
     crop_detections: list[PlateDetection] = []
