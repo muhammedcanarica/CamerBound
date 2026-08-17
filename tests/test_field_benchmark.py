@@ -12,8 +12,10 @@ from scripts.benchmark_field_alpr import (
     confusion_pairs,
     load_manifest,
     percentile,
+    raw_ocr_trace,
     summarize,
 )
+from app.plate_recognition import OcrSegment
 
 
 class FieldBenchmarkTests(unittest.TestCase):
@@ -46,6 +48,19 @@ class FieldBenchmarkTests(unittest.TestCase):
     def test_percentile_uses_nearest_rank(self) -> None:
         self.assertEqual(percentile([1.0, 2.0, 3.0, 4.0], 0.95), 4.0)
         self.assertIsNone(percentile([], 0.95))
+
+    def test_raw_trace_distinguishes_no_text_from_valid_candidate(self) -> None:
+        trace = raw_ocr_trace(
+            [OcrSegment("23 AEP 256", 0.95, (0, 0, 20, 8), 1)],
+            ("color", "clahe"),
+            (0, 1),
+            0.65,
+        )
+
+        self.assertEqual(trace[0]["rejection_reason"], "no-text-detected")
+        self.assertEqual(trace[1]["normalized"], "23AEP256")
+        self.assertEqual(trace[1]["corrected"], "23AEP256")
+        self.assertEqual(trace[1]["rejection_reason"], "none")
 
     def test_comparison_reports_before_after_and_delta(self) -> None:
         baseline = self._summary_shape(correct=0.5, false=0.5)
@@ -92,6 +107,7 @@ class FieldBenchmarkTests(unittest.TestCase):
                 detector_hit=False,
                 detector_variant="tiled",
                 used_roi_fallback=True,
+                rescue_tiles=3,
             ),
         )
 
@@ -102,6 +118,9 @@ class FieldBenchmarkTests(unittest.TestCase):
         self.assertEqual(report["end_to_end"]["correct_read_rate"], 0.5)
         self.assertEqual(report["end_to_end"]["false_read_rate"], 0.5)
         self.assertEqual(report["ocr"]["confusions"], {"D/O": 1})
+        self.assertEqual(report["ocr_rescue"]["attempted_samples"], 1)
+        self.assertEqual(report["ocr_rescue"]["successful_exact_reads"], 1)
+        self.assertEqual(report["ocr_rescue"]["attempted_tiles"], 3)
 
     @staticmethod
     def _result(
@@ -112,6 +131,7 @@ class FieldBenchmarkTests(unittest.TestCase):
         detector_hit: bool,
         detector_variant: str,
         used_roi_fallback: bool = False,
+        rescue_tiles: int = 0,
     ) -> SampleResult:
         return SampleResult(
             image=image,
@@ -134,6 +154,7 @@ class FieldBenchmarkTests(unittest.TestCase):
             character_accuracy=character_accuracy(expected, candidate),
             crop_profiles=("NORMAL",),
             inference_calls=1,
+            rescue_tiles=rescue_tiles,
         )
 
     @staticmethod

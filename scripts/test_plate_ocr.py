@@ -46,6 +46,7 @@ from app.plate_recognition import (
     preprocess_shadow_variants,
     preprocess_variants,
     recognize_detector_crops,
+    recognize_ocr_search_tiles,
     roi_mean_brightness,
     select_best_candidate,
 )
@@ -316,6 +317,41 @@ def _run_ocr(
     )
 
 
+def _run_ocr_search_rescue(
+    provider: PaddleOcrProvider,
+    roi: np.ndarray,
+    *,
+    min_confidence: float,
+) -> OcrRun:
+    result = recognize_ocr_search_tiles(
+        provider,
+        roi,
+        camera_id=0,
+        min_confidence=min_confidence,
+    )
+    metrics = [measure_crop_quality(tile.image) for tile in result.tiles]
+    return OcrRun(
+        label="ocr-search-tile-rescue",
+        crops=[roi],
+        variants=[tile.image for tile in result.tiles],
+        segments=list(result.segments),
+        candidate=result.candidate,
+        preprocess_ms=0.0,
+        inference_ms=result.inference_ms,
+        variant_names=[
+            f"ocr-search-tile-{index}[x={tile.roi_box[0]},w={tile.roi_box[2]}]"
+            for index, tile in enumerate(result.tiles)
+        ],
+        metrics=metrics,
+        profiles=[classify_crop_quality(metric) for metric in metrics],
+        current_variant_count=result.inference_calls,
+        shadow_variant_count=0,
+        inference_calls=result.inference_calls,
+        text_detection_box_counts=list(result.text_detection_box_counts),
+        shadow_retry_reason=None,
+    )
+
+
 def _reported_box_counts(
     provider: PaddleOcrProvider,
     variant_count: int,
@@ -548,18 +584,29 @@ def _process_image(
         print("ocr_stage=detector-ocr skipped=no-usable-detector-crop")
         if mode == "production":
             print(
-                "production_fallback=roi offline_motion_proxy=yes "
+                "production_fallback=spatial-search offline_motion_proxy=yes "
                 "reason=no-usable-detector-crop"
             )
-            runs.append(
-                _run_ocr(
-                    provider,
-                    [roi],
-                    label="roi-fallback-ocr",
-                    strategy="roi",
-                    min_confidence=config.min_confidence,
-                )
+            search_run = _run_ocr_search_rescue(
+                provider,
+                roi,
+                min_confidence=config.min_confidence,
             )
+            runs.append(search_run)
+            if (
+                search_run.candidate is None
+                or search_run.candidate.confidence < config.min_confidence
+            ):
+                print("production_fallback=roi reason=spatial-search-miss")
+                runs.append(
+                    _run_ocr(
+                        provider,
+                        [roi],
+                        label="roi-fallback-ocr",
+                        strategy="roi",
+                        min_confidence=config.min_confidence,
+                    )
+                )
     if mode == "compare" and detector_crops:
         runs.extend(
             (

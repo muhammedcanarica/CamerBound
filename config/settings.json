@@ -13,7 +13,7 @@
     "detector_crop_ocr_job_max_age_ms": 12000,
     "ocr_cpu_threads": 4,
     "pre_detection_buffer_duration_ms": 5000,
-    "pre_detection_buffer_max_frames_per_camera": 16,
+    "pre_detection_buffer_max_frames_per_camera": 40,
     "motion_pre_roll_ms": 1500,
     "motion_post_roll_ms": 1500,
     "motion_quiet_ms": 1000,
@@ -47,9 +47,9 @@
     "roi": {
       "ENTRY": {
         "x": 0.004166666666666667,
-        "y": 0.37530864197530867,
+        "y": 0.4148148148148148,
         "width": 0.9958333333333333,
-        "height": 0.4469135802469136
+        "height": 0.4123456790123457
       },
       "EXIT": {
         "x": 0.0017857142857142857,

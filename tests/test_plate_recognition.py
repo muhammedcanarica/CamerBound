@@ -48,6 +48,7 @@ from app.plate_recognition import (
     ReplayEventBuffer,
     RecognitionState,
     TurkishPlateValidator,
+    build_ocr_search_tiles,
     correct_plate_candidate,
     correct_plate_candidate_with_cost,
     classify_crop_quality,
@@ -59,6 +60,7 @@ from app.plate_recognition import (
     preprocess_roi_fallback_variants,
     roi_mean_brightness,
     recognize_detector_crops,
+    recognize_ocr_search_tiles,
     select_replay_frames,
     select_best_candidate,
     plates_are_near_conflicts,
@@ -1518,8 +1520,8 @@ class RecognitionPipelineTests(unittest.TestCase):
                     self.camera_service._on_frame_ready(camera_id, frame)
 
             snapshots = worker._frame_buffer.snapshots(camera_id)
-            self.assertEqual(len(snapshots), 16)
-            self.assertEqual(len({snapshot.frame_id for snapshot in snapshots}), 16)
+            self.assertEqual(len(snapshots), 20)
+            self.assertEqual(len({snapshot.frame_id for snapshot in snapshots}), 20)
             self.assertEqual(preview_frames, [])
             self.assertIs(snapshots[-1].full_frame, frames[-1])
             self.assertFalse(snapshots[-1].full_frame.flags.writeable)
@@ -1808,16 +1810,16 @@ class RecognitionPipelineTests(unittest.TestCase):
             motion_pre_roll_ms=0,
             motion_post_roll_ms=0,
             motion_quiet_ms=0,
-            motion_event_max_duration_ms=10_000,
+            motion_event_max_duration_ms=30_000,
         )
         buffer = PreDetectionFrameBuffer(config)
-        for index in range(25):
+        for index in range(60):
             buffer.ingest(
                 self._make_snapshot(index + 1, index * 0.25),
                 motion_score=0.1,
             )
         completed = buffer.ingest(
-            self._make_snapshot(26, 6.25),
+            self._make_snapshot(61, 15.0),
             motion_score=0.0,
         )
 
@@ -1825,10 +1827,30 @@ class RecognitionPipelineTests(unittest.TestCase):
         frame_ids = [item.frame_id for item in completed[0].frames]
         self.assertLessEqual(len(frame_ids), 8)
         self.assertEqual(frame_ids[0], 1)
-        self.assertEqual(frame_ids[-1], 26)
-        self.assertTrue(any(2 <= frame_id <= 9 for frame_id in frame_ids))
-        self.assertTrue(any(10 <= frame_id <= 17 for frame_id in frame_ids))
-        self.assertTrue(any(18 <= frame_id <= 25 for frame_id in frame_ids))
+        self.assertEqual(frame_ids[-1], 61)
+        self.assertTrue(any(2 <= frame_id <= 20 for frame_id in frame_ids))
+        self.assertTrue(any(21 <= frame_id <= 40 for frame_id in frame_ids))
+        self.assertTrue(any(41 <= frame_id <= 60 for frame_id in frame_ids))
+
+    def test_forty_frame_cap_keeps_over_three_seconds_at_twelve_fps(self) -> None:
+        config = replace(
+            self.config,
+            pre_detection_buffer_duration_ms=5_000,
+            pre_detection_buffer_max_frames_per_camera=40,
+        )
+        buffer = PreDetectionFrameBuffer(config)
+        for index in range(72):
+            buffer.ingest(
+                self._make_snapshot(index + 1, index / 12.0),
+                motion_score=0.0,
+            )
+
+        health = buffer.health(1, now=72 / 12.0)
+
+        self.assertEqual(health.ring_depth, 40)
+        self.assertAlmostEqual(health.recognition_ingest_fps, 12.0)
+        self.assertGreaterEqual(health.effective_ring_duration_ms, 3_200.0)
+        self.assertLessEqual(health.effective_ring_duration_ms, 5_000.0)
 
     def test_static_frames_do_not_create_motion_event(self) -> None:
         buffer = PreDetectionFrameBuffer(self.config)
@@ -2641,7 +2663,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             diagnostic,
         )
 
-    def test_one_shot_capture_bypasses_detector_and_ocr_log_throttles(self) -> None:
+    def test_one_shot_capture_emits_info_trace_and_bypasses_throttles(self) -> None:
         now = time.monotonic()
         worker = PlateRecognitionWorker(
             self.plate_service,
@@ -2666,7 +2688,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             100.0,
             diagnostic_capture=True,
         )
-        with self.assertLogs("app.plate_recognition", level="DEBUG") as detector_logs:
+        with self.assertLogs("app.plate_recognition", level="INFO") as detector_logs:
             worker._log_detection_diagnostics(
                 1,
                 item,
@@ -2690,7 +2712,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             self._make_ocr_job(observed_at=now, frame_id=88),
             diagnostic_capture=True,
         )
-        with self.assertLogs("app.plate_recognition", level="DEBUG") as ocr_logs:
+        with self.assertLogs("app.plate_recognition", level="INFO") as ocr_logs:
             processor.process_ocr_job(job, queue_depth=0)
         self.assertTrue(
             any(
@@ -2734,6 +2756,71 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIs(outcome.state, RecognitionState.AWAITING_CONFIRMATION)
         self.assertEqual(len(provider.calls), 2)
         self.assertTrue(all(len(batch) == 1 for batch in provider.calls))
+
+    def test_ocr_search_tiles_are_bounded_overlapping_and_cover_roi(self) -> None:
+        roi = np.zeros((240, 960, 3), dtype=np.uint8)
+
+        tiles = build_ocr_search_tiles(roi)
+
+        self.assertEqual(len(tiles), 3)
+        self.assertEqual(tiles[0].roi_box[0], 0)
+        self.assertEqual(
+            tiles[-1].roi_box[0] + tiles[-1].roi_box[2],
+            roi.shape[1],
+        )
+        self.assertLess(tiles[1].roi_box[0], tiles[0].roi_box[2])
+        self.assertTrue(all(tile.roi_box[3] == roi.shape[0] for tile in tiles))
+
+    def test_ocr_search_tile_maps_box_and_early_exits_on_first_valid_plate(self) -> None:
+        provider = SequencedOcrProvider(
+            [
+                [],
+                [OcrSegment("23 AAY 264", 0.97, (5.0, 6.0, 105.0, 36.0))],
+                [OcrSegment("99ZZ999", 0.99, (0.0, 0.0, 1.0, 1.0))],
+            ]
+        )
+        roi = np.zeros((240, 960, 3), dtype=np.uint8)
+
+        result = recognize_ocr_search_tiles(provider, roi, 1, 0.65)
+
+        self.assertEqual(result.candidate.plate, "23AAY264")
+        self.assertEqual(result.inference_calls, 2)
+        self.assertEqual(len(provider.calls), 2)
+        second_x = result.tiles[1].roi_box[0]
+        self.assertEqual(result.segments[0].box[0], second_x + 5.0)
+
+    def test_spatial_rescue_skips_full_roi_after_tile_success(self) -> None:
+        provider = RecordingOcrProvider(confidence=0.97)
+        processor = PlateRecognitionProcessor(provider, self.plate_service, self.config)
+        roi = np.full((240, 960, 3), 100, dtype=np.uint8)
+        job = replace(
+            self._make_ocr_job(frame_id=621, fallback_reason="zero-detection"),
+            roi_crop=roi,
+            ocr_crops=(roi,),
+            spatial_search_rescue=True,
+        )
+
+        outcome = processor.process_ocr_job(job, queue_depth=0)
+
+        self.assertIs(outcome.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertEqual(provider.calls, 1)
+        self.assertLess(provider.images[0].shape[1], roi.shape[1])
+
+    def test_spatial_rescue_has_three_tile_plus_two_roi_call_ceiling(self) -> None:
+        provider = SequencedOcrProvider([[], [], [], [], []])
+        processor = PlateRecognitionProcessor(provider, self.plate_service, self.config)
+        roi = np.full((240, 960, 3), 100, dtype=np.uint8)
+        job = replace(
+            self._make_ocr_job(frame_id=622, fallback_reason="zero-detection"),
+            roi_crop=roi,
+            ocr_crops=(roi,),
+            spatial_search_rescue=True,
+        )
+
+        outcome = processor.process_ocr_job(job, queue_depth=0)
+
+        self.assertIs(outcome.state, RecognitionState.NO_OCR_TEXT)
+        self.assertEqual(len(provider.calls), 5)
 
     def test_detector_crop_normal_profile_has_no_shadow_retry(self) -> None:
         provider = SequencedOcrProvider([[]])
@@ -3242,6 +3329,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIsNotNone(final.job)
         self.assertEqual(final.job.frame_id, 303)
         self.assertEqual(final.job.detector_source, "event-end")
+        self.assertTrue(final.job.spatial_search_rescue)
         self.assertEqual(final.fallback_attempt, 2)
         self.assertEqual(final.event_frames, 3)
         self.assertEqual(final.ring_depth, 10)

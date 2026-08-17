@@ -143,7 +143,7 @@ Detector öncesindeki rolling ring her kamera için son 2000 ms ve en fazla 20 f
 
 Ring ve motion event frame'leri yalnızca RAM referanslarıdır; video yazılmaz ve uygulama kapanınca tamamı kaybolur. Aynı immutable snapshot ring, event ve replay tarafından paylaşılır. Historical replay `captured_at`/`observed_at` ve full frame'i değiştirmez; confirmation ve JPEG doğru original frame'e bağlı kalır. OCR queue staleness frame yaşından değil `queued_at` sonrasındaki gerçek queue bekleme süresinden hesaplanır. Aynı `camera_id + frame_id` live ve replay tarafından görülürse ikinci kez confirmation sayılmaz. Historical zero-detection replay frame'lerinde ROI fallback açılmaz; 750 ms throttled ROI safety fallback yalnızca live detector yolunda korunur. Replay bbox'ları canlı preview overlay'ine gönderilmez.
 
-Yaklaşık raw-frame maliyeti `genişlik × yükseklik × 3 bayt × tutulan benzersiz frame` hesabıdır. Örneğin 1920×1080 BGR frame yaklaşık 5,9 MiB'dir; 20-frame ring kamera başına yaklaşık 119 MiB üst sınırına sahiptir. Aktif/replay event'ler aynı ndarray referanslarını paylaşır ve replay kuyruğunda event başına yalnız seçilen en fazla 8 snapshot tutulur; yine de ring dışına taşan pinned event ve mevcut OCR job full-frame referansları nedeniyle gerçek toplam ring hesabından yüksek olabilir.
+Yaklaşık raw-frame maliyeti `genişlik × yükseklik × 3 bayt × tutulan benzersiz frame` hesabıdır. Örneğin 960×540 BGR frame yaklaşık 1,48 MiB, 1920×1080 frame yaklaşık 5,93 MiB'dir. 40-frame ring bu çözünürlüklerde kamera başına yaklaşık 59 MiB veya 237 MiB; iki kamera için yaklaşık 119 MiB veya 475 MiB üst sınırına sahiptir. Active motion event densest-temporal removal ile ayrıca en fazla 16 frame tutar; replay event başına seçim 10, pending replay event kamera başına 2 ve OCR queue kamera başına 3 ile sınırlıdır. Event/replay aynı immutable ndarray referanslarını mümkün olduğunda paylaşır; ring dışına taşan pinned event ve OCR job referansları nedeniyle gerçek toplam ring hesabından yüksek olabilir ama her katman bounded kalır.
 
 Varsayılan detector ayarları:
 
@@ -163,7 +163,7 @@ Varsayılan detector ayarları:
 }
 ```
 
-`plate_detection` seviyesindeki temel buffer/CPU ayarları `max_pending_ocr_jobs_per_camera=3`, `ocr_job_max_age_ms=2500`, `detector_crop_ocr_job_max_age_ms=12000`, `ocr_cpu_threads=4`, `pre_detection_buffer_duration_ms=2000`, `pre_detection_buffer_max_frames_per_camera=20`, `max_replay_frames_per_event=8`, `max_pending_replay_events_per_camera=2` ve `replay_event_max_age_ms=8000` değerleridir. Debug detector kutusu son live detection güncellemesinden 500 ms sonra preview üzerinde çizilmez; `debug_overlay=false` production davranışı değişmez.
+`plate_detection` seviyesindeki temel buffer/CPU ayarları `max_pending_ocr_jobs_per_camera=3`, `ocr_job_max_age_ms=2500`, `detector_crop_ocr_job_max_age_ms=12000`, `ocr_cpu_threads=4`, `pre_detection_buffer_duration_ms=5000`, `pre_detection_buffer_max_frames_per_camera=40`, `max_replay_frames_per_event=10`, `max_pending_replay_events_per_camera=2` ve `replay_event_max_age_ms=8000` değerleridir. 12 FPS analysis ingest'te 40 frame yaklaşık 3,25 saniyelik timestamp span sağlar; daha düşük ingest hızında duration limiti 5 saniyede devreye girer. Debug detector kutusu son live detection güncellemesinden 500 ms sonra preview üzerinde çizilmez; `debug_overlay=false` production davranışı değişmez.
 
 Beklenen offline model dizini:
 
@@ -196,7 +196,7 @@ Aynı saha frame'inde gerçek OpenVINO/PaddleOCR aşamalarını karşılaştırm
 .\.venv\Scripts\python.exe scripts\test_plate_ocr.py frame.jpg --direction EXIT --mode compare --save-debug debug\compare
 ```
 
-`compare`, doğrudan resize, aspect-preserving letterbox ve bounded tile detector sonuçlarını; ardından current detector-crop, ayrı shadow-color baseline, production için seçilmiş shadow grayscale ve full-ROI OCR ham segmentlerini raporlar. `production` modu detector crop yoksa live motion fallback'in offline proxy'sini ayrıca ve açıkça işaretleyerek dener. Crop metrikleri, profile, preprocessing/inference süresi, inference çağrı sayısı, text-box sayısı ve en iyi aday ayrı satırlardadır. `--save-debug` source, ROI, detector overlay, original detector crop, adlandırılmış current/shadow variantları ve OCR result kutularını yazar. Normal UI'yi veya production ayarlarını değiştirmez.
+`compare`, doğrudan resize, aspect-preserving letterbox ve bounded tile detector sonuçlarını; ardından current detector-crop, ayrı shadow-color baseline, production için seçilmiş shadow grayscale ve full-ROI OCR ham segmentlerini raporlar. `production` modu detector crop yoksa live motion fallback'in offline proxy'sinde production ile ortak bounded spatial-search helper'ını çalıştırır; üç tile da miss olursa full-ROI safety fallback'e geçer. Crop metrikleri, profile, preprocessing/inference süresi, inference çağrı sayısı, text-box sayısı ve en iyi aday ayrı satırlardadır. `--save-debug` source, ROI, detector overlay, original detector crop, adlandırılmış current/shadow variantları ve OCR result kutularını yazar. Normal UI'yi veya production ayarlarını değiştirmez.
 
 Birden çok gerçek saha frame'i için developer-local manifest `debug/field_dataset/manifest.json` altında tutulabilir. `debug/` Git tarafından yok sayıldığı için gerçek plaka görüntüleri ve benchmark raporları repository'ye eklenmez. OpenVINO ve PaddleOCR modellerini tek runtime içinde tekrar kullanan benchmark:
 
@@ -205,7 +205,7 @@ Birden çok gerçek saha frame'i için developer-local manifest `debug/field_dat
 .\.venv\Scripts\python.exe scripts\benchmark_field_alpr.py debug\field_dataset\manifest.json --label after --baseline debug\field_dataset\before.json --output debug\field_dataset\after.json
 ```
 
-Rapor primary/tiled detector recall, fallback kullanımı, exact ve character accuracy, confusion çiftleri, false/no-read oranı, detector/OCR/end-to-end mean-p50-p95 ve CPU inference çağrılarını içerir. Tek JPEG benchmark'ı multi-frame `SAVED` kararı üretmediği için save precision veya ambiguous-discard metriğini uydurmaz; bunları candidate metriğinden açıkça ayırır. `--recognition-only-ab` yalnız development A/B ölçümüdür ve production davranışını değiştirmez.
+Rapor primary/tiled detector recall, fallback kullanımı, spatial rescue tile sayısı, exact ve character accuracy, confusion çiftleri, false/no-read oranı, detector/OCR/end-to-end mean-p50-p95 ve CPU inference çağrılarını içerir. Detector-miss event sonunda cheap blur/contrast/exposure proxy ile seçilmiş historical frame'in geniş ROI'si en fazla üç örtüşen yatay Paddle text-search tile'ına ayrılır. İlk geçerli Türk plakası early-exit yapar; üç tile da miss olursa mevcut iki aşamalı compact full-ROI fallback güvenlik ağı kalır. Detector-crop job'ları bu düşük öncelikli bounded rescue'dan önce işlenir. Tek JPEG benchmark'ı multi-frame `SAVED` kararı üretmediği için save precision veya ambiguous-discard metriğini uydurmaz; bunları candidate metriğinden açıkça ayırır. `--recognition-only-ab` yalnız development A/B ölçümüdür ve production davranışını değiştirmez.
 
 Aynı kamera/açıdan gölge ve güneş frame'lerini tek komutta karşılaştırmak için:
 
@@ -222,7 +222,7 @@ $env:CAMERBOUND_CAPTURE_NEXT_RECOGNITION_FRAME="1"
 
 Yalnız ilk detector frame'inin eşleşen `-full.jpg` ve exact configured ROI `-roi.jpg` çifti `debug/recognition-frames/` altına yazılır; klasör Git tarafından yok sayılır ve özellik varsayılan olarak kapalıdır. DEBUG OCR diagnostics, worker aşaması, job türü, fallback nedeni, raw OCR segmenti, normalize/valid aday sonucu ve nihai rejection state'ini birlikte raporlar.
 
-Uygulama zaten çalışıyorsa ADMIN `OCR Tanılama` bölümündeki yön-hedefli `Sonraki ENTRY/EXIT Frame'ini Kaydet` düğmeleri aynı tek-shot kaydı runtime'da armar; diğer kameranın frame'i tetikleyiciyi tüketmez ve kamera/OCR worker yeniden başlatılmaz. Düğmeye hedef araç configured ROI içindeyken basın; dosya adı ve INFO capture satırındaki `frame_id`, aynı frame'in detector/queue/OCR DEBUG satırlarıyla kesin eşleşir. Capture edilen tek frame için detector ve OCR DEBUG diagnostic throttle'ı bypass edilir; normal frameler throttled kalır.
+Uygulama zaten çalışıyorsa ADMIN `OCR Tanılama` bölümündeki yön-hedefli `Sonraki ENTRY/EXIT Frame'ini Kaydet` düğmeleri aynı tek-shot kaydı runtime'da armar; diğer kameranın frame'i tetikleyiciyi tüketmez ve kamera/OCR worker yeniden başlatılmaz. Düğmeye hedef araç configured ROI içindeyken basın; dosya adı ve INFO capture satırındaki `frame_id`, aynı frame'in detector/queue/OCR satırlarıyla kesin eşleşir. Capture edilen tek frame için bu iki ayrıntılı satır INFO seviyesinde de üretilir ve diagnostic throttle bypass edilir; normal frameler yalnız throttled DEBUG olarak kalır.
 
 ### Detector modelini geliştirme ortamında hazırlama
 
@@ -253,7 +253,7 @@ Minimum OCR kalite filtresini geçen tüm geçerli ve normalize edilmiş plakala
 
 Plate presence kontrolüne ek olarak, aynı kamera ve aynı normalize plaka için son DB kaydı transaction içinde kontrol edilir. İlk kayıttan sonraki 120 saniye boyunca ikinci DB satırı veya JPEG oluşturulmaz. ENTRY ve EXIT kameraları birbirinden bağımsızdır ve kontrol SQLite kayıtlarından yapıldığı için uygulama yeniden başlatıldığında da devam eder.
 
-ENTRY ve EXIT için detector'ın live latest-frame slotunda yalnızca en güncel frame tutulur. Bundan bağımsız pre-detection analysis ring son 2 saniyenin en fazla 20 worker-throttled frame'ini tutar; ortak OCR worker uygun kameraları öncelik ve kamera adaletiyle işler.
+ENTRY ve EXIT için detector'ın live latest-frame slotunda yalnızca en güncel frame tutulur. Bundan bağımsız pre-detection analysis ring son 5 saniyenin en fazla 40 worker-throttled frame'ini tutar; ortak OCR worker uygun kameraları öncelik ve kamera adaletiyle işler.
 
 ## Dashboard OCR Durumları
 

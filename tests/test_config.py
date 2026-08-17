@@ -71,7 +71,7 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(config.detector_crop_ocr_job_max_age_ms, 12000)
         self.assertEqual(config.ocr_cpu_threads, 4)
         self.assertEqual(config.pre_detection_buffer_duration_ms, 5000)
-        self.assertEqual(config.pre_detection_buffer_max_frames_per_camera, 16)
+        self.assertEqual(config.pre_detection_buffer_max_frames_per_camera, 40)
         self.assertEqual(config.motion_pre_roll_ms, 1500)
         self.assertEqual(config.motion_post_roll_ms, 1500)
         self.assertEqual(config.motion_quiet_ms, 1000)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import os
 import logging
+import math
 import threading
 import time
 from collections import defaultdict, deque
@@ -135,6 +136,7 @@ ZERO_DETECTION_LIVE_FALLBACK_MAX_ATTEMPTS = 1
 ZERO_DETECTION_FALLBACK_MIN_SPACING_MS = 1_000
 ZERO_DETECTION_EVENT_STATE_LIMIT = 32
 COMPLETED_MOTION_EVENT_LIMIT = 32
+ACTIVE_MOTION_EVENT_MAX_FRAMES = 16
 RAW_RECOGNITION_CAPTURE_ENV = "CAMERBOUND_CAPTURE_NEXT_RECOGNITION_FRAME"
 
 
@@ -273,6 +275,22 @@ class DetectorCropOcrResult:
     shadow_preprocess_ms: float
     shadow_inference_ms: float
     shadow_retry_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OcrSearchTile:
+    image: np.ndarray
+    roi_box: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class OcrSearchResult:
+    tiles: tuple[OcrSearchTile, ...]
+    segments: tuple[OcrSegment, ...]
+    candidate: PlateCandidate | None
+    inference_calls: int
+    inference_ms: float
+    text_detection_box_counts: tuple[int | None, ...]
 
 
 class OcrProvider(Protocol):
@@ -872,7 +890,10 @@ class PreDetectionFrameBuffer:
 
             if active is not None:
                 maximum_event_frames = (
-                    self.config.pre_detection_buffer_max_frames_per_camera
+                    min(
+                        self.config.pre_detection_buffer_max_frames_per_camera,
+                        ACTIVE_MOTION_EVENT_MAX_FRAMES,
+                    )
                 )
                 while len(active.frames) > maximum_event_frames:
                     self._remove_densest_event_frame(active.frames)
@@ -1031,7 +1052,7 @@ def select_replay_frames(
     maximum: int,
     roi_for: Callable[[Direction], NormalizedRoi],
 ) -> tuple[FrameSnapshot, ...]:
-    """Select a sharp frame from each temporal bin for broad event coverage."""
+    """Select one cheap OCR-quality proxy winner per temporal coverage bin."""
     if maximum <= 0 or not frames:
         return ()
     ordered = sorted(frames, key=lambda item: (item.observed_at, item.frame_id))
@@ -1045,21 +1066,41 @@ def select_replay_frames(
         selected.append(
             max(
                 bucket,
-                key=lambda item: _snapshot_roi_sharpness(item, roi_for),
+                key=lambda item: _snapshot_roi_quality(item, roi_for),
             )
         )
     return tuple(sorted(selected, key=lambda item: item.observed_at))
 
 
-def _snapshot_roi_sharpness(
+def _snapshot_roi_quality(
     snapshot: FrameSnapshot,
     roi_for: Callable[[Direction], NormalizedRoi],
 ) -> float:
+    """Rank pre-detection frames without treating background sharpness as truth."""
     crop = crop_roi(snapshot.full_frame, roi_for(snapshot.direction))
     if crop is None:
         return 0.0
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    if gray.shape[1] > 320:
+        scale = 320 / gray.shape[1]
+        gray = cv2.resize(
+            gray,
+            (320, max(1, round(gray.shape[0] * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    p10, p90 = np.percentile(gray, (10, 90))
+    local_contrast = max(0.0, float(p90 - p10) / 255.0)
+    clipped_ratio = float(
+        np.count_nonzero((gray <= 8) | (gray >= 247)) / max(1, gray.size)
+    )
+    sharpness_score = min(1.0, math.log1p(sharpness) / math.log1p(1000.0))
+    exposure_score = max(0.0, 1.0 - clipped_ratio)
+    return (
+        0.55 * sharpness_score
+        + 0.30 * local_contrast
+        + 0.15 * exposure_score
+    )
 
 
 @dataclass(slots=True)
@@ -1194,6 +1235,7 @@ class OcrJob:
     detector_source: str = "live"
     ocr_crop_detections: tuple[PlateDetection | None, ...] = ()
     diagnostic_capture: bool = False
+    spatial_search_rescue: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -2004,7 +2046,7 @@ class PlateDetectionProcessor:
             selected = max(
                 candidates,
                 key=lambda snapshot: (
-                    _snapshot_roi_sharpness(snapshot, self.config.roi_for),
+                    _snapshot_roi_quality(snapshot, self.config.roi_for),
                     snapshot.observed_at,
                     snapshot.motion_score,
                     snapshot.frame_id,
@@ -2057,6 +2099,7 @@ class PlateDetectionProcessor:
                 frame_id=selected.frame_id,
                 detector_source="event-end",
                 ocr_crop_detections=(),
+                spatial_search_rescue=True,
             )
             LOGGER.debug(
                 "Zero-detection fallback camera_id=%s event_id=%s "
@@ -2412,26 +2455,56 @@ class PlateRecognitionProcessor:
             shadow_inference_ms = detector_ocr.shadow_inference_ms
             shadow_retry_reason = detector_ocr.shadow_retry_reason
         else:
-            # Full ROI detection is the expensive safety path. Try the compact
-            # color image first and only pay for enhanced contrast when needed.
             crop_metrics = [measure_crop_quality(crop) for crop in job.ocr_crops]
             profiles = [classify_crop_quality(item) for item in crop_metrics]
+            preprocess_ms = 0.0
+            inference_ms = 0.0
+            if job.spatial_search_rescue:
+                search_result = recognize_ocr_search_tiles(
+                    self.provider,
+                    job.roi_crop,
+                    job.camera_id,
+                    self.config.min_confidence,
+                )
+                attempted_variants.extend(tile.image for tile in search_result.tiles)
+                variant_names.extend(
+                    "ocr-search-tile-"
+                    f"{index}[x={tile.roi_box[0]},w={tile.roi_box[2]}]"
+                    for index, tile in enumerate(search_result.tiles)
+                )
+                segments.extend(search_result.segments)
+                candidate = search_result.candidate
+                inference_calls += search_result.inference_calls
+                inference_ms += search_result.inference_ms
+                text_detection_box_counts.extend(
+                    search_result.text_detection_box_counts
+                )
+
+            # Keep the compact full-ROI path as a bounded safety net when all
+            # search tiles miss; a valid tile candidate exits before this cost.
+            search_succeeded = (
+                candidate is not None
+                and candidate.confidence >= self.config.min_confidence
+            )
             preprocess_started_at = time.perf_counter()
             variants: list[np.ndarray] = []
-            for crop in job.ocr_crops:
-                variants.extend(
-                    preprocess_roi_fallback_variants(
-                        crop,
-                        brightness=roi_mean_brightness(crop),
+            if not search_succeeded:
+                for crop in job.ocr_crops:
+                    variants.extend(
+                        preprocess_roi_fallback_variants(
+                            crop,
+                            brightness=roi_mean_brightness(crop),
+                        )
                     )
-                )
-            preprocess_ms = (
+            preprocess_ms += (
                 time.perf_counter() - preprocess_started_at
             ) * 1000.0
             inference_started_at = time.perf_counter()
-            for variant_index, variant in enumerate(variants):
+            variant_offset = len(attempted_variants)
+            for fallback_index, variant in enumerate(variants):
+                variant_index = variant_offset + fallback_index
                 attempted_variants.append(variant)
-                variant_names.append(f"roi-fallback-{variant_index}")
+                variant_names.append(f"roi-fallback-{fallback_index}")
                 batch = self.provider.recognize([variant])
                 inference_calls += 1
                 text_detection_box_counts.extend(
@@ -2452,7 +2525,7 @@ class PlateRecognitionProcessor:
                     and candidate.confidence >= self.config.min_confidence
                 ):
                     break
-            inference_ms = (
+            inference_ms += (
                 time.perf_counter() - inference_started_at
             ) * 1000.0
             current_variant_count = len(attempted_variants)
@@ -3369,7 +3442,8 @@ class PlateRecognitionProcessor:
         shadow_inference_ms: float,
         shadow_retry_reason: str | None,
     ) -> None:
-        if not LOGGER.isEnabledFor(logging.DEBUG):
+        debug_enabled = LOGGER.isEnabledFor(logging.DEBUG)
+        if not debug_enabled and not job.diagnostic_capture:
             return
         last_logged_at = self._last_diagnostic_logged_at.get(job.camera_id)
         if (
@@ -3394,7 +3468,8 @@ class PlateRecognitionProcessor:
             candidate_rejection_reason = (
                 outcome.suppression_reason or outcome.state.value.lower()
             )
-        LOGGER.debug(
+        log_diagnostic = LOGGER.debug if debug_enabled else LOGGER.info
+        log_diagnostic(
             "OCR worker diagnostics camera_id=%s direction=%s brightness=%.1f "
             "low_light=%s profiles=%s crop_quality=%s variants=%s "
             "current_variants=%s shadow_variants=%s inference_calls=%s "
@@ -4093,7 +4168,8 @@ class PlateRecognitionWorker(QObject):
         buffer_result: OcrBufferAddResult | None,
         source: str = "live",
     ) -> None:
-        if not LOGGER.isEnabledFor(logging.DEBUG):
+        debug_enabled = LOGGER.isEnabledFor(logging.DEBUG)
+        if not debug_enabled and not result.diagnostic_capture:
             return
         now = time.monotonic()
         last_logged_at = self._last_detection_diagnostic_at.get(camera_id)
@@ -4104,7 +4180,8 @@ class PlateRecognitionWorker(QObject):
         ):
             return
         self._last_detection_diagnostic_at[camera_id] = now
-        LOGGER.debug(
+        log_diagnostic = LOGGER.debug if debug_enabled else LOGGER.info
+        log_diagnostic(
             "Detector worker diagnostics camera_id=%s direction=%s detector_ms=%.1f "
             "detector_frame_age_ms=%.1f detections=%s ocr_queue_depth=%s "
             "camera_queue_depth=%s dropped=%s replaced=%s stale_total=%s "
@@ -4624,6 +4701,80 @@ def _shadow_gamma_clahe_gray(
     softened = cv2.GaussianBlur(contrasted, (0, 0), sigmaX=1.0)
     contrasted = cv2.addWeighted(contrasted, 1.10, softened, -0.10, 0)
     return cv2.cvtColor(contrasted, cv2.COLOR_GRAY2BGR)
+
+
+def build_ocr_search_tiles(
+    roi: np.ndarray,
+    *,
+    maximum_tiles: int = 3,
+) -> tuple[OcrSearchTile, ...]:
+    """Split a wide ROI into at most three overlapping native-resolution tiles."""
+    if not isinstance(roi, np.ndarray) or roi.ndim < 2 or roi.size == 0:
+        return ()
+    height, width = roi.shape[:2]
+    maximum_tiles = max(1, min(3, int(maximum_tiles)))
+    if maximum_tiles == 1 or width < 240:
+        return (OcrSearchTile(roi, (0, 0, width, height)),)
+
+    tile_width = max(1, min(width, round(width * 0.58)))
+    maximum_offset = width - tile_width
+    offsets = [
+        round(index * maximum_offset / max(1, maximum_tiles - 1))
+        for index in range(maximum_tiles)
+    ]
+    tiles: list[OcrSearchTile] = []
+    for x in dict.fromkeys(offsets):
+        crop = roi[:, x : x + tile_width]
+        if crop.size:
+            tiles.append(OcrSearchTile(crop, (x, 0, crop.shape[1], crop.shape[0])))
+    return tuple(tiles)
+
+
+def recognize_ocr_search_tiles(
+    provider: OcrProvider,
+    roi: np.ndarray,
+    camera_id: int,
+    min_confidence: float,
+    *,
+    maximum_tiles: int = 3,
+) -> OcrSearchResult:
+    """Run bounded text detection/recognition over spatial tiles with early exit."""
+    tiles = build_ocr_search_tiles(roi, maximum_tiles=maximum_tiles)
+    segments: list[OcrSegment] = []
+    box_counts: list[int | None] = []
+    candidate: PlateCandidate | None = None
+    inference_calls = 0
+    started_at = time.perf_counter()
+    for tile_index, tile in enumerate(tiles):
+        batch = provider.recognize([tile.image])
+        inference_calls += 1
+        box_counts.extend(_provider_detection_box_counts(provider, 1, batch))
+        x_offset, y_offset, _width, _height = tile.roi_box
+        segments.extend(
+            OcrSegment(
+                text=segment.text,
+                confidence=segment.confidence,
+                box=(
+                    segment.box[0] + x_offset,
+                    segment.box[1] + y_offset,
+                    segment.box[2] + x_offset,
+                    segment.box[3] + y_offset,
+                ),
+                variant_index=tile_index,
+            )
+            for segment in batch
+        )
+        candidate = select_best_candidate(segments, camera_id)
+        if candidate is not None and candidate.confidence >= min_confidence:
+            break
+    return OcrSearchResult(
+        tiles=tiles,
+        segments=tuple(segments),
+        candidate=candidate,
+        inference_calls=inference_calls,
+        inference_ms=(time.perf_counter() - started_at) * 1000.0,
+        text_detection_box_counts=tuple(box_counts),
+    )
 
 
 def preprocess_roi_fallback_variants(

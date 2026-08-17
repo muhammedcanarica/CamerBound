@@ -5,9 +5,11 @@ import json
 import math
 import statistics
 import sys
+import tempfile
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -20,7 +22,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.camera import Direction
 from app.config import load_config
+from app.database import Database
 from app.ocr_models import read_model_name, select_ocr_backend
+from app.plate_capture import PlateCaptureService
 from app.plate_detector import (
     OpenVinoPlateDetector,
     PlateDetection,
@@ -31,14 +35,20 @@ from app.plate_recognition import (
     OcrImageProfile,
     OcrSegment,
     PaddleOcrProvider,
+    PlateDetectionProcessor,
     PlateCandidate,
+    PlateRecognitionProcessor,
     TurkishPlateValidator,
+    correct_plate_candidate_with_cost,
     crop_roi,
+    normalize_plate_text,
     preprocess_roi_fallback_variants,
     recognize_detector_crops,
+    recognize_ocr_search_tiles,
     roi_mean_brightness,
     select_best_candidate,
 )
+from app.plate_service import PlateService
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +82,15 @@ class SampleResult:
     character_accuracy: float
     crop_profiles: tuple[str, ...]
     inference_calls: int
+    rescue_tiles: int = 0
+    ocr_provider_mode: str = "text-detection-and-recognition"
+    crop_resolutions: tuple[str, ...] = ()
+    detector_bboxes: tuple[dict[str, object], ...] = ()
+    preprocessing_variants: tuple[str, ...] = ()
+    variant_resolutions: tuple[str, ...] = ()
+    text_detection_box_counts: tuple[int | None, ...] = ()
+    raw_ocr_segments: tuple[dict[str, object], ...] = ()
+    rejection_reason: str = "none"
 
 
 class RecognitionOnlyProvider:
@@ -120,6 +139,77 @@ class RecognitionOnlyProvider:
         return segments
 
 
+def image_resolution(image: np.ndarray) -> str:
+    return f"{image.shape[1]}x{image.shape[0]}"
+
+
+def raw_ocr_trace(
+    segments: Sequence[OcrSegment],
+    variant_names: Sequence[str],
+    detection_box_counts: Sequence[int | None],
+    min_confidence: float,
+) -> tuple[dict[str, object], ...]:
+    trace: list[dict[str, object]] = []
+    segments_by_variant: dict[int, list[OcrSegment]] = {}
+    for segment in segments:
+        segments_by_variant.setdefault(segment.variant_index, []).append(segment)
+    for variant_index, variant_name in enumerate(variant_names):
+        box_count = (
+            detection_box_counts[variant_index]
+            if variant_index < len(detection_box_counts)
+            else None
+        )
+        variant_segments = segments_by_variant.get(variant_index, [])
+        if not variant_segments:
+            trace.append(
+                {
+                    "variant": variant_name,
+                    "variant_index": variant_index,
+                    "text_detection_box_count": box_count,
+                    "raw_text": None,
+                    "confidence": None,
+                    "normalized": None,
+                    "corrected": None,
+                    "correction_cost": None,
+                    "valid": False,
+                    "rejection_reason": (
+                        "no-text-detected"
+                        if box_count == 0
+                        else "no-recognized-text"
+                    ),
+                }
+            )
+            continue
+        for segment in variant_segments:
+            corrected_with_cost = correct_plate_candidate_with_cost(segment.text)
+            corrected = corrected_with_cost[0] if corrected_with_cost else None
+            correction_cost = (
+                corrected_with_cost[1] if corrected_with_cost else None
+            )
+            valid = bool(corrected and TurkishPlateValidator.is_valid(corrected))
+            rejection_reason = "none"
+            if not valid:
+                rejection_reason = "invalid-turkish-plate"
+            elif segment.confidence < min_confidence:
+                rejection_reason = "below-min-confidence"
+            trace.append(
+                {
+                    "variant": variant_name,
+                    "variant_index": variant_index,
+                    "text_detection_box_count": box_count,
+                    "raw_text": segment.text,
+                    "confidence": segment.confidence,
+                    "normalized": normalize_plate_text(segment.text),
+                    "corrected": corrected,
+                    "correction_cost": correction_cost,
+                    "valid": valid,
+                    "rejection_reason": rejection_reason,
+                    "box": segment.box,
+                }
+            )
+    return tuple(trace)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Local, gitignored real-field OpenVINO + PaddleOCR benchmark."
@@ -136,6 +226,14 @@ def parse_args() -> argparse.Namespace:
         "--recognition-only-ab",
         action="store_true",
         help="Also benchmark direct recognition on the exact detector crops.",
+    )
+    parser.add_argument(
+        "--decision-trace",
+        action="store_true",
+        help=(
+            "Replay real OCR outputs from distinct samples through production "
+            "confirmation, stabilization and an isolated PlateService database."
+        ),
     )
     return parser.parse_args()
 
@@ -213,16 +311,20 @@ def detector_crops(
 
 
 def recognize_roi_fallback(provider, roi: np.ndarray, min_confidence: float):
-    segments: list[OcrSegment] = []
-    candidate = None
-    calls = 0
+    search = recognize_ocr_search_tiles(provider, roi, 0, min_confidence)
+    segments: list[OcrSegment] = list(search.segments)
+    candidate = search.candidate
+    calls = search.inference_calls
     started = time.perf_counter()
+    if candidate is not None and candidate.confidence >= min_confidence:
+        return candidate, segments, calls, search.inference_ms, calls
     variants = preprocess_roi_fallback_variants(
         roi, brightness=roi_mean_brightness(roi)
     )
-    for variant_index, variant in enumerate(variants):
+    for fallback_index, variant in enumerate(variants):
         calls += 1
         batch = provider.recognize([variant])
+        variant_index = len(search.tiles) + fallback_index
         segments.extend(
             OcrSegment(
                 item.text,
@@ -235,7 +337,13 @@ def recognize_roi_fallback(provider, roi: np.ndarray, min_confidence: float):
         candidate = select_best_candidate(segments, camera_id=0)
         if candidate is not None and candidate.confidence >= min_confidence:
             break
-    return candidate, segments, calls, (time.perf_counter() - started) * 1000.0
+    return (
+        candidate,
+        segments,
+        calls,
+        search.inference_ms + (time.perf_counter() - started) * 1000.0,
+        search.inference_calls,
+    )
 
 
 def run_sample(
@@ -271,11 +379,30 @@ def run_sample(
         inference_calls = ocr.inference_calls
         ocr_ms = ocr.current_inference_ms + ocr.shadow_inference_ms
         profiles = tuple(item.value for item in ocr.profiles)
+        variant_names = ocr.variant_names
+        variants = ocr.variants
+        detection_box_counts = (
+            tuple(None for _ in variants)
+            if isinstance(provider, RecognitionOnlyProvider)
+            else ocr.text_detection_box_counts
+        )
+        rescue_tiles = 0
     else:
-        candidate, segments, inference_calls, ocr_ms = recognize_roi_fallback(
-            fallback_provider or provider, roi, config.min_confidence
+        (
+            candidate,
+            segments,
+            inference_calls,
+            ocr_ms,
+            rescue_tiles,
+        ) = recognize_roi_fallback(
+            fallback_provider or provider,
+            roi,
+            config.min_confidence,
         )
         profiles = (OcrImageProfile.NORMAL.value,)
+        variant_names = ()
+        variants = ()
+        detection_box_counts = ()
     expected = sample.expected_plate
     actual = candidate.plate if candidate is not None else None
     return SampleResult(
@@ -303,7 +430,213 @@ def run_sample(
         character_accuracy=character_accuracy(expected, actual),
         crop_profiles=profiles,
         inference_calls=inference_calls,
+        rescue_tiles=rescue_tiles,
+        ocr_provider_mode=(
+            "recognition-only"
+            if isinstance(provider, RecognitionOnlyProvider) and crops
+            else "text-detection-and-recognition"
+        ),
+        crop_resolutions=tuple(image_resolution(crop) for crop in crops),
+        detector_bboxes=tuple(
+            {
+                "x": detection.x,
+                "y": detection.y,
+                "width": detection.width,
+                "height": detection.height,
+                "confidence": detection.confidence,
+            }
+            for detection in crop_detections
+        ),
+        preprocessing_variants=tuple(variant_names),
+        variant_resolutions=tuple(image_resolution(variant) for variant in variants),
+        text_detection_box_counts=tuple(detection_box_counts),
+        raw_ocr_segments=raw_ocr_trace(
+            segments,
+            variant_names,
+            detection_box_counts,
+            config.min_confidence,
+        ),
+        rejection_reason=(
+            "no-ocr-text"
+            if not segments
+            else "no-valid-plate"
+            if candidate is None
+            else "below-min-confidence"
+            if candidate.confidence < config.min_confidence
+            else "none"
+        ),
     )
+
+
+class RecordedOcrSequenceProvider:
+    """Replay real model segments once per distinct frame for downstream tracing."""
+
+    def __init__(self, results: Sequence[SampleResult]) -> None:
+        self._batches = [
+            [
+                OcrSegment(
+                    text=str(item["raw_text"]),
+                    confidence=float(item["confidence"]),
+                    box=tuple(item.get("box", (0.0, 0.0, 1.0, 1.0))),
+                    variant_index=int(item["variant_index"]),
+                )
+                for item in result.raw_ocr_segments
+                if item.get("raw_text") is not None
+            ]
+            for result in results
+        ]
+        self._box_counts = [result.text_detection_box_counts for result in results]
+        self.last_detection_box_counts: tuple[int, ...] = ()
+
+    def recognize(self, images: Sequence[np.ndarray]) -> list[OcrSegment]:
+        if not self._batches:
+            return []
+        batch = self._batches.pop(0)
+        counts = self._box_counts.pop(0)
+        if len(counts) == len(images) and all(value is not None for value in counts):
+            self.last_detection_box_counts = tuple(int(value) for value in counts)
+        else:
+            self.last_detection_box_counts = ()
+        return batch
+
+
+def production_decision_trace(
+    samples: Sequence[FieldSample],
+    results: Sequence[SampleResult],
+    manifest_path: Path,
+    detector: OpenVinoPlateDetector,
+    config,
+) -> dict[str, object]:
+    expected = {sample.expected_plate for sample in samples}
+    if len(samples) < 2 or None in expected or len(expected) != 1:
+        raise ValueError(
+            "--decision-trace requires at least two distinct samples with one "
+            "shared expected_plate."
+        )
+    if any(result.candidate is None for result in results):
+        raise ValueError("--decision-trace requires a candidate for every sample.")
+
+    debug_root = PROJECT_ROOT / ".test-tmp"
+    debug_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="field-decision-trace-", dir=debug_root
+    ) as temporary:
+        root = Path(temporary)
+        database = Database(root / "trace.db")
+        database.initialize()
+        direction = Direction(samples[0].direction)
+        with database.connection() as connection:
+            connection.execute(
+                """
+                UPDATE cameras
+                SET name = 'Field trace', direction = ?, enabled = 0
+                WHERE id = 1
+                """,
+                (direction.value,),
+            )
+        capture_service = PlateCaptureService(root / "captures", root)
+        plate_service = PlateService(
+            database,
+            duplicate_cooldown_seconds=120,
+            capture_service=capture_service,
+        )
+        processor = PlateRecognitionProcessor(
+            RecordedOcrSequenceProvider(results),
+            plate_service,
+            config,
+        )
+        detection_processor = PlateDetectionProcessor(config, detector)
+        base_observed_at = time.monotonic()
+        base_captured_at = datetime.now(timezone.utc)
+        frame_trace: list[dict[str, object]] = []
+        for index, (sample, result) in enumerate(zip(samples, results), 1):
+            image_path = resolve_image(sample.image, manifest_path)
+            frame = cv2.imread(str(image_path))
+            if frame is None:
+                raise FileNotFoundError(f"Field image could not be read: {image_path}")
+            observed_at = base_observed_at + index * 0.25
+            captured_at = base_captured_at + timedelta(milliseconds=index * 250)
+            detection = detection_processor.prepare_job(
+                1,
+                direction,
+                frame,
+                captured_at=captured_at,
+                observed_at=observed_at,
+                received_at=observed_at,
+                frame_id=index,
+                detector_source="field-decision-trace",
+                allow_zero_detection_fallback=False,
+            )
+            if detection.job is None:
+                raise RuntimeError(
+                    f"Distinct trace frame {index} did not produce an OCR job."
+                )
+            outcome = processor.process_ocr_job(detection.job, queue_depth=0)
+            frame_trace.append(
+                {
+                    "frame_id": index,
+                    "image": sample.image,
+                    "detector_hit": bool(detection.detections),
+                    "crop_resolutions": list(result.crop_resolutions),
+                    "ocr_provider": result.ocr_provider_mode,
+                    "raw_ocr_segments": list(result.raw_ocr_segments),
+                    "candidate": (
+                        outcome.candidate.plate
+                        if outcome.candidate is not None
+                        else None
+                    ),
+                    "confirmation": (
+                        f"{outcome.confirmation_count}/"
+                        f"{outcome.confirmation_required}"
+                    ),
+                    "state": outcome.state.value,
+                    "rejection_reason": outcome.suppression_reason or "none",
+                }
+            )
+        deadline = processor.next_pending_deadline()
+        finalized = processor.finalize_due(
+            None if deadline is None else deadline + 0.01
+        )
+        final_outcome = finalized[0][1] if finalized else None
+        with database.connection() as connection:
+            persisted = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT plate, direction, camera_id, confidence, timestamp, image_path
+                    FROM plate_records ORDER BY id
+                    """
+                ).fetchall()
+            ]
+        return {
+            "isolation": (
+                "Real detector jobs and recorded real Paddle outputs, replayed once "
+                "per distinct frame through production confirmation, stabilization "
+                "and an isolated real PlateService database."
+            ),
+            "frames": frame_trace,
+            "finalization": {
+                "state": final_outcome.state.value if final_outcome else "none",
+                "candidate": (
+                    final_outcome.candidate.plate
+                    if final_outcome is not None
+                    and final_outcome.candidate is not None
+                    else None
+                ),
+                "confirmation": (
+                    f"{final_outcome.confirmation_count}/"
+                    f"{final_outcome.confirmation_required}"
+                    if final_outcome is not None
+                    else "0/0"
+                ),
+                "rejection_reason": (
+                    final_outcome.suppression_reason or "none"
+                    if final_outcome is not None
+                    else "no-due-decision"
+                ),
+            },
+            "persisted_records": persisted,
+        }
 
 
 def character_accuracy(expected: str | None, actual: str | None) -> float:
@@ -372,6 +705,7 @@ def summarize(label: str, samples, results) -> dict[str, object]:
     detector_times = [result.detector_ms for result in results]
     ocr_times = [result.ocr_ms for result in results]
     total_times = [result.end_to_end_ms for result in results]
+    rescue_results = [result for result in results if result.rescue_tiles > 0]
 
     def ratio(value: int, denominator: int) -> float:
         return value / denominator if denominator else 0.0
@@ -425,6 +759,19 @@ def summarize(label: str, samples, results) -> dict[str, object]:
                 result.character_accuracy for result in positive_results
             ),
             "confusions": dict(sorted(confusions.items())),
+        },
+        "ocr_rescue": {
+            "detector_miss_samples": sum(
+                not result.detector_hit for result in positive_results
+            ),
+            "attempted_samples": len(rescue_results),
+            "successful_exact_reads": sum(result.exact for result in rescue_results),
+            "attempted_tiles": sum(result.rescue_tiles for result in rescue_results),
+            "ocr_mean_ms": (
+                statistics.fmean(result.ocr_ms for result in rescue_results)
+                if rescue_results
+                else None
+            ),
         },
         "end_to_end": {
             "correct_read_rate": ratio(exact, len(positives)),
@@ -493,6 +840,14 @@ def main() -> int:
         "pipeline": summarize(args.label, samples, results),
         "samples": [asdict(result) for result in results],
     }
+    if args.decision_trace:
+        report["production_decision_trace"] = production_decision_trace(
+            samples,
+            results,
+            manifest_path,
+            detector,
+            config,
+        )
     if args.baseline is not None:
         baseline_payload = json.loads(args.baseline.resolve().read_text(encoding="utf-8"))
         report["comparison"] = comparison(
