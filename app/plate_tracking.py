@@ -42,6 +42,7 @@ class PlateTrack:
     created_at: float
     first_seen_at: float
     last_seen_at: float
+    last_activity_at: float
     last_detection_confidence: float
     pending_ocr_count: int = 0
     last_ocr_at: float | None = None
@@ -110,9 +111,12 @@ class PlateTrackManager:
         camera_id: int,
         detections: Sequence[PlateDetection],
         observed_at: float,
+        *,
+        activity_at: float | None = None,
     ) -> PlateTrackingUpdate:
+        lifecycle_at = observed_at if activity_at is None else activity_at
         with self._lock:
-            self._expire_due_locked(observed_at)
+            self._expire_due_locked(lifecycle_at)
             active = self._active.setdefault(camera_id, {})
             tracks = tuple(active.values())
             pairs: list[tuple[tuple[int, float, float], int, int, float, float]] = []
@@ -149,7 +153,12 @@ class PlateTrackManager:
                     continue
                 detection = detections[detection_index]
                 track = active[track_id]
-                self._refresh_track(track, detection, observed_at)
+                self._refresh_track(
+                    track,
+                    detection,
+                    observed_at,
+                    lifecycle_at,
+                )
                 used_detections.add(detection_index)
                 used_tracks.add(track_id)
                 assignments.append(
@@ -173,7 +182,12 @@ class PlateTrackManager:
                     ignored.append(detection)
                     self._log_track_limit(camera_id)
                     continue
-                track = self._create_track(camera_id, detection, observed_at)
+                track = self._create_track(
+                    camera_id,
+                    detection,
+                    observed_at,
+                    lifecycle_at,
+                )
                 active[track.track_id] = track
                 self._tracks_by_id[track.track_id] = track
                 assignments.append(
@@ -208,7 +222,7 @@ class PlateTrackManager:
     def next_expiration(self) -> float | None:
         with self._lock:
             deadlines = [
-                track.last_seen_at + self.timeout_seconds
+                track.last_activity_at + self.timeout_seconds
                 for tracks in self._active.values()
                 for track in tracks.values()
             ]
@@ -328,16 +342,17 @@ class PlateTrackManager:
     def _expire_due_locked(self, now: float) -> None:
         for camera_id, tracks in tuple(self._active.items()):
             for track_id, track in tuple(tracks.items()):
-                if now - track.last_seen_at < self.timeout_seconds:
+                if now - track.last_activity_at < self.timeout_seconds:
                     continue
                 tracks.pop(track_id, None)
                 track.retired_at = now
                 self._retired[track_id] = track
                 LOGGER.debug(
-                    "Plate track expired camera_id=%s track_id=%s age_ms=%.1f "
-                    "pending_ocr=%s",
+                    "Plate track expired camera_id=%s track_id=%s inactive_ms=%.1f "
+                    "frame_age_ms=%.1f pending_ocr=%s",
                     camera_id,
                     track_id,
+                    max(0.0, now - track.last_activity_at) * 1000.0,
                     max(0.0, now - track.last_seen_at) * 1000.0,
                     track.pending_ocr_count,
                 )
@@ -366,6 +381,7 @@ class PlateTrackManager:
         camera_id: int,
         detection: PlateDetection,
         observed_at: float,
+        activity_at: float,
     ) -> PlateTrack:
         track = PlateTrack(
             track_id=self._next_track_id,
@@ -374,6 +390,7 @@ class PlateTrackManager:
             created_at=observed_at,
             first_seen_at=observed_at,
             last_seen_at=observed_at,
+            last_activity_at=activity_at,
             last_detection_confidence=detection.confidence,
         )
         self._next_track_id += 1
@@ -384,11 +401,13 @@ class PlateTrackManager:
         track: PlateTrack,
         detection: PlateDetection,
         observed_at: float,
+        activity_at: float,
     ) -> None:
         if observed_at >= track.last_seen_at:
             track.bbox = _detection_bbox(detection)
             track.last_detection_confidence = detection.confidence
         track.last_seen_at = max(track.last_seen_at, observed_at)
+        track.last_activity_at = max(track.last_activity_at, activity_at)
 
     def _camera_snapshots_locked(
         self,

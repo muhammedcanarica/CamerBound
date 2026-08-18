@@ -10,7 +10,7 @@
     "recognition_interval_ms": 200,
     "max_pending_ocr_jobs_per_camera": 5,
     "max_active_plate_tracks_per_camera": 2,
-    "plate_track_timeout_ms": 1200,
+    "plate_track_timeout_ms": 3000,
     "plate_track_iou_threshold": 0.25,
     "ocr_job_max_age_ms": 5000,
     "detector_crop_ocr_job_max_age_ms": 12000,

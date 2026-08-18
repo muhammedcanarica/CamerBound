@@ -225,6 +225,50 @@ class PlateTextTests(unittest.TestCase):
         self.assertIsNotNone(left_second.candidate)
         self.assertEqual(left_second.candidate.plate, "34ABC123")
 
+    def test_strong_detector_consensus_confirms_from_one_observation(self) -> None:
+        tracker = ConfirmationTracker(required=2, window_seconds=3.0)
+        candidate = PlateCandidate(
+            "23LR640",
+            0.992,
+            "23LR640",
+            1,
+            variant_support=3,
+            detector_crop_evidence=True,
+        )
+
+        outcome = tracker.observe_progress(candidate, 10.0, frame_id=1)
+
+        self.assertEqual(outcome.required_count, 1)
+        self.assertEqual(outcome.observed_count, 1)
+        self.assertEqual(outcome.candidate.plate, "23LR640")
+
+    def test_high_confidence_alone_does_not_confirm_from_one_observation(self) -> None:
+        tracker = ConfirmationTracker(required=2, window_seconds=3.0)
+        weak_candidate = PlateCandidate(
+            "23AGF47",
+            0.995,
+            "23AGF47",
+            1,
+            variant_support=1,
+            detector_crop_evidence=True,
+        )
+        fallback_candidate = replace(
+            weak_candidate,
+            plate="23LR640",
+            raw_text="23LR640",
+            variant_support=4,
+            detector_crop_evidence=False,
+            track_id=2,
+        )
+
+        weak = tracker.observe_progress(weak_candidate, 10.0, frame_id=1)
+        fallback = tracker.observe_progress(fallback_candidate, 10.0, frame_id=1)
+
+        self.assertIsNone(weak.candidate)
+        self.assertEqual(weak.required_count, 2)
+        self.assertIsNone(fallback.candidate)
+        self.assertEqual(fallback.required_count, 2)
+
     def test_correction_trims_single_leading_plate_border_letter(self) -> None:
         self.assertEqual(
             correct_plate_candidate_with_cost("L23 LN 466"),
@@ -312,6 +356,8 @@ class PlateTextTests(unittest.TestCase):
             "23ABCI23",
             1,
             correction_cost=1,
+            variant_support=3,
+            detector_crop_evidence=True,
         )
 
         first = tracker.observe_progress(corrected, 1.0, frame_id=1)
@@ -4047,6 +4093,47 @@ class RecognitionPipelineTests(unittest.TestCase):
             str(self.capture_service.resolve_reference(saved.record.image_path))
         )
         self.assertAlmostEqual(float(saved_image.mean()), 42.0, delta=3.0)
+
+    def test_strong_single_observation_saves_after_stabilization_window(self) -> None:
+        config = recognition_config(
+            Path(self.temp_directory.name),
+            stabilization_window_ms=2000,
+            stabilization_min_hold_ms=500,
+        )
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [
+                        OcrSegment("23LR640", 0.992, (0, 0, 10, 10), variant)
+                        for variant in range(3)
+                    ]
+                ]
+            ),
+            self.plate_service,
+            config,
+        )
+
+        provisional = processor.process_ocr_job(
+            self._make_ocr_job(
+                frame_id=103,
+                observed_at=10.4,
+                frame_value=63,
+            ),
+            queue_depth=0,
+        )
+
+        self.assertIs(provisional.state, RecognitionState.STABILIZING)
+        self.assertEqual(provisional.confirmation_required, 1)
+        self.assertEqual(self._record_count(), 0)
+
+        outcomes = processor.finalize_due(processor.next_pending_deadline() + 0.01)
+
+        self.assertEqual(len(outcomes), 1)
+        saved = outcomes[0][1]
+        self.assertIs(saved.state, RecognitionState.SAVED)
+        self.assertEqual(saved.record.plate, "23LR640")
+        self.assertEqual(saved.confirmation_required, 1)
+        self.assertEqual(self._record_count(), 1)
 
     def test_stabilization_replaces_early_wrong_consensus_with_trailing_correct_evidence(self) -> None:
         texts = (

@@ -129,6 +129,8 @@ SHADOW_COMPARISON_VARIANT_NAMES = (
     "shadow-gamma-clahe-gray",
 )
 ROI_FALLBACK_MAX_WIDTH = 960
+SINGLE_OBSERVATION_MIN_CONFIDENCE = 0.98
+SINGLE_OBSERVATION_MIN_VARIANT_SUPPORT = 3
 RISKY_CONFIRMATIONS_REQUIRED = 3
 POST_SAVE_CONFIRMATIONS_REQUIRED = 4
 POST_SAVE_NEAR_DUPLICATE_WINDOW_SECONDS = 45 * 60
@@ -484,6 +486,16 @@ def correct_plate_candidate_with_cost(raw_text: str) -> tuple[str, int] | None:
     return plate, cost
 
 
+def candidate_qualifies_for_single_observation(candidate: PlateCandidate) -> bool:
+    return (
+        candidate.detector_crop_evidence
+        and not candidate.spatial_alias_evidence
+        and candidate.correction_cost == 0
+        and candidate.variant_support >= SINGLE_OBSERVATION_MIN_VARIANT_SUPPORT
+        and candidate.confidence >= SINGLE_OBSERVATION_MIN_CONFIDENCE
+    )
+
+
 class ConfirmationTracker:
     def __init__(self, required: int, window_seconds: float) -> None:
         self.required = max(1, required)
@@ -543,6 +555,13 @@ class ConfirmationTracker:
         runner_up_votes = max((len(items) for items in near_groups.values()), default=0)
         correction_risk = any(item.candidate.correction_cost > 0 for item in exact)
         effective_required = self.required
+        if (
+            len(exact) == 1
+            and candidate_qualifies_for_single_observation(exact[0].candidate)
+            and not spatial_alias
+            and post_save_near_plate is None
+        ):
+            effective_required = 1
         if correction_risk or near_groups:
             effective_required = max(effective_required, RISKY_CONFIRMATIONS_REQUIRED)
         if post_save_near_plate is not None:
@@ -1702,6 +1721,7 @@ class PlateDetectionProcessor:
                         camera_id,
                         selected,
                         observed_at,
+                        activity_at=time.monotonic(),
                     )
                     active_tracks = tracking.active_tracks
                     ignored_track_detections = len(tracking.ignored_detections)
@@ -1797,7 +1817,12 @@ class PlateDetectionProcessor:
             ocr_crops = [roi_crop]
 
         if self.track_manager is not None and not selected:
-            tracking = self.track_manager.update(camera_id, (), observed_at)
+            tracking = self.track_manager.update(
+                camera_id,
+                (),
+                observed_at,
+                activity_at=time.monotonic(),
+            )
             active_tracks = tracking.active_tracks
 
         detector_ms = (time.perf_counter() - detector_started_at) * 1000.0
@@ -3341,6 +3366,12 @@ class PlateRecognitionProcessor:
         runner_up_votes = max((len(items) for items in competing.values()), default=0)
         correction_risk = any(item.candidate.correction_cost > 0 for item in winner_items)
         required_votes = self.config.confirmations_required
+        single_observation_fast_path = (
+            winner_votes == 1
+            and candidate_qualifies_for_single_observation(winner_items[0].candidate)
+        )
+        if single_observation_fast_path:
+            required_votes = 1
         if correction_risk or competing:
             required_votes = max(required_votes, RISKY_CONFIRMATIONS_REQUIRED)
 
@@ -3409,7 +3440,8 @@ class PlateRecognitionProcessor:
         LOGGER.debug(
             "Plate stabilization evaluation camera_id=%s track_id=%s provisional=%s "
             "candidates=%s winner=%s winner_votes=%s runner_up_votes=%s "
-            "required_votes=%s near_conflicts=%s reliable=%s "
+            "required_votes=%s single_observation_fast_path=%s "
+            "near_conflicts=%s reliable=%s "
             "finalization=window-deadline suppression_reason=%s",
             decision.camera_id,
             decision.track_id,
@@ -3419,6 +3451,7 @@ class PlateRecognitionProcessor:
             winner_votes,
             runner_up_votes,
             required_votes,
+            "yes" if single_observation_fast_path else "no",
             ",".join(near_conflicts) or "none",
             reliable,
             suppression_reason or "none",

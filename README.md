@@ -179,7 +179,7 @@ models/plate_detector/vehicle-license-plate-detection-barrier-0123/
   model.bin
 ```
 
-Runtime model indirmez ve internete bağlanmaz. Model bulunamazsa açık diagnostic üretilir; fallback açıksa uygulama mevcut ROI OCR hattıyla çalışmaya devam eder. `debug_overlay=true` olduğunda yalnızca ADMIN dashboard preview kopyasında `PLATE 87%` benzeri kutular çizilir. Kaydedilen araç JPEG'i orijinal full frame olmaya devam eder.
+Runtime model indirmez ve internete bağlanmaz. Model bulunamazsa açık diagnostic üretilir; fallback açıksa uygulama mevcut ROI OCR hattıyla çalışmaya devam eder. `debug_overlay=true` olduğunda yalnızca ADMIN dashboard preview kopyasında `T1` veya OCR kanıtı varsa `T1 | 34ABC123 | 0.88` benzeri track kutuları çizilir. Kaydedilen araç JPEG'i orijinal full frame olmaya devam eder.
 
 Bu Open Model Zoo modeli MobileNetV2 + SSD tabanlı generic/pretrained bir araç ve plaka detector'ıdır; Türk plakaları için özel eğitilmiş değildir. Resmî model açıklamasında doğrulama alanı Çin plakaları/önden görünen araçlar ve minimum 96 piksel plaka genişliği olarak belirtilir. Türk plaka performansı saha görüntülerinde ayrıca ölçülmelidir. Model değiştirilmemiştir; production offline model ve Apache-2.0 bildirim sınırı korunur.
 

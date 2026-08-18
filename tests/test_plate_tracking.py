@@ -122,6 +122,54 @@ class PlateTrackManagerTests(unittest.TestCase):
             tracker.record_ocr_result(track_id, "35XYZ789", 0.99, 11.0)
         )
 
+    def test_delayed_frame_uses_processing_activity_for_timeout(self) -> None:
+        tracker = manager(timeout_ms=1_200)
+        first = tracker.update(
+            1,
+            [detection(100)],
+            observed_at=10.0,
+            activity_at=100.0,
+        )
+        track_id = first.assignments[0].track_id
+
+        tracker.expire_due(100.8)
+        second = tracker.update(
+            1,
+            [detection(108)],
+            observed_at=10.2,
+            activity_at=101.0,
+        )
+
+        self.assertEqual(second.assignments[0].track_id, track_id)
+        self.assertEqual(len(second.active_tracks), 1)
+        tracker.expire_due(102.19)
+        self.assertEqual(len(tracker.active_snapshots(1)), 1)
+        tracker.expire_due(102.21)
+        self.assertEqual(len(tracker.active_snapshots(1)), 0)
+
+    def test_older_replay_frame_refreshes_activity_without_rolling_back_bbox(self) -> None:
+        tracker = manager(timeout_ms=1_200)
+        first = tracker.update(
+            1,
+            [detection(100)],
+            observed_at=20.0,
+            activity_at=100.0,
+        )
+        track_id = first.assignments[0].track_id
+
+        replay = tracker.update(
+            1,
+            [detection(105)],
+            observed_at=19.0,
+            activity_at=100.8,
+        )
+        snapshot = replay.active_tracks[0]
+
+        self.assertEqual(replay.assignments[0].track_id, track_id)
+        self.assertEqual(snapshot.bbox, (100, 20, 100, 30))
+        tracker.expire_due(101.9)
+        self.assertEqual(len(tracker.active_snapshots(1)), 1)
+
 
 class TrackAwareOcrSchedulingTests(unittest.TestCase):
     @staticmethod
