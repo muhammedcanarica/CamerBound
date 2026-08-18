@@ -20,6 +20,7 @@ from app.ocr_debug import save_debug_images
 from app.plate_detector import (
     OpenVinoPlateDetector,
     PlateDetection,
+    MIN_PLATE_CROP_ASPECT_RATIO,
     crop_padded_plate,
     detector_recovery_tiles,
     select_plate_detections,
@@ -542,6 +543,7 @@ def _process_image(
                 and detector.last_diagnostics.detector_variant == "tiled"
                 else config.plate_detector.crop_padding_ratio
             ),
+            minimum_aspect_ratio=MIN_PLATE_CROP_ASPECT_RATIO,
         )
         if crop is not None:
             detector_crops.append(crop)

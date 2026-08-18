@@ -255,10 +255,10 @@ class CameraSettingsWidget(QWidget):
         diagnostics_button.clicked.connect(self._run_diagnostics)
         capture_buttons = QHBoxLayout()
         self.capture_entry_recognition_frame_button = QPushButton(
-            "Sonraki ENTRY Frame'ini Kaydet"
+            "İlk ENTRY Detector Karesini Kaydet"
         )
         self.capture_exit_recognition_frame_button = QPushButton(
-            "Sonraki EXIT Frame'ini Kaydet"
+            "İlk EXIT Detector Karesini Kaydet"
         )
         self.capture_entry_recognition_frame_button.clicked.connect(
             partial(self._arm_recognition_frame_capture, Direction.ENTRY)
@@ -849,8 +849,9 @@ class CameraSettingsWidget(QWidget):
             )
             return
         self.diagnostics_label.setText(
-            f"Sonraki {direction.value} exact recognition frame için tek-shot kayıt hazır. "
-            "Full frame ve configured ROI debug/recognition-frames altında oluşturulacak."
+            f"İlk canlı {direction.value} detector hit'i için tek-shot kayıt hazır. "
+            "Araç gelene kadar bekleyecek; full frame ve configured ROI "
+            "debug/recognition-frames altında oluşturulacak."
         )
 
     @Slot(str)

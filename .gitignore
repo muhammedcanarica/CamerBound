@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .tools/
 .camera-test/
+.test-tmp-escalated/
 .pytest_cache/
 data/*.db
 data/*.db-shm

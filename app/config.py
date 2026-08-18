@@ -53,6 +53,9 @@ DEFAULT_MOTION_EVENT_MAX_DURATION_MS = 6_000
 DEFAULT_MAX_REPLAY_FRAMES_PER_EVENT = 10
 DEFAULT_MAX_PENDING_REPLAY_EVENTS_PER_CAMERA = 2
 DEFAULT_REPLAY_EVENT_MAX_AGE_MS = 8_000
+DEFAULT_MAX_ACTIVE_PLATE_TRACKS_PER_CAMERA = 2
+DEFAULT_PLATE_TRACK_TIMEOUT_MS = 1_200
+DEFAULT_PLATE_TRACK_IOU_THRESHOLD = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +139,11 @@ class PlateRecognitionConfig:
         DEFAULT_MAX_PENDING_REPLAY_EVENTS_PER_CAMERA
     )
     replay_event_max_age_ms: int = DEFAULT_REPLAY_EVENT_MAX_AGE_MS
+    max_active_plate_tracks_per_camera: int = (
+        DEFAULT_MAX_ACTIVE_PLATE_TRACKS_PER_CAMERA
+    )
+    plate_track_timeout_ms: int = DEFAULT_PLATE_TRACK_TIMEOUT_MS
+    plate_track_iou_threshold: float = DEFAULT_PLATE_TRACK_IOU_THRESHOLD
     warnings: tuple[str, ...] = ()
 
     def roi_for(self, direction: object) -> NormalizedRoi:
@@ -450,6 +458,33 @@ def _load_plate_recognition(
         "replay_event_max_age_ms",
         warnings,
     )
+    max_active_plate_tracks_per_camera = _bounded_number(
+        raw.get("max_active_plate_tracks_per_camera"),
+        DEFAULT_MAX_ACTIVE_PLATE_TRACKS_PER_CAMERA,
+        1,
+        8,
+        int,
+        "max_active_plate_tracks_per_camera",
+        warnings,
+    )
+    plate_track_timeout_ms = _bounded_number(
+        raw.get("plate_track_timeout_ms"),
+        DEFAULT_PLATE_TRACK_TIMEOUT_MS,
+        500,
+        10_000,
+        int,
+        "plate_track_timeout_ms",
+        warnings,
+    )
+    plate_track_iou_threshold = _bounded_number(
+        raw.get("plate_track_iou_threshold"),
+        DEFAULT_PLATE_TRACK_IOU_THRESHOLD,
+        0.0,
+        1.0,
+        float,
+        "plate_track_iou_threshold",
+        warnings,
+    )
     backend_value = raw.get("ocr_backend", "auto")
     if not isinstance(backend_value, str) or backend_value.lower() not in {
         "auto",
@@ -496,6 +531,9 @@ def _load_plate_recognition(
         max_replay_frames_per_event=max_replay_frames_per_event,
         max_pending_replay_events_per_camera=max_pending_replay_events_per_camera,
         replay_event_max_age_ms=replay_event_max_age_ms,
+        max_active_plate_tracks_per_camera=max_active_plate_tracks_per_camera,
+        plate_track_timeout_ms=plate_track_timeout_ms,
+        plate_track_iou_threshold=plate_track_iou_threshold,
         warnings=tuple(warnings),
     )
 

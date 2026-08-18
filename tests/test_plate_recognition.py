@@ -207,6 +207,33 @@ class PlateTextTests(unittest.TestCase):
         self.assertFalse(plates_are_near_conflicts("23ABC123", "34ABC128"))
         self.assertFalse(plates_are_near_conflicts("23ABC123", "23AB1234"))
 
+    def test_confirmation_observations_are_isolated_by_track(self) -> None:
+        tracker = ConfirmationTracker(required=2, window_seconds=3.0)
+        left = PlateCandidate(
+            "34ABC123", 0.90, "34ABC123", camera_id=1, track_id=11
+        )
+        right = PlateCandidate(
+            "35XYZ789", 0.91, "35XYZ789", camera_id=1, track_id=12
+        )
+
+        left_first = tracker.observe_progress(left, 10.0, frame_id=1)
+        right_first = tracker.observe_progress(right, 10.0, frame_id=1)
+        left_second = tracker.observe_progress(left, 10.2, frame_id=2)
+
+        self.assertEqual(left_first.observed_count, 1)
+        self.assertEqual(right_first.observed_count, 1)
+        self.assertIsNotNone(left_second.candidate)
+        self.assertEqual(left_second.candidate.plate, "34ABC123")
+
+    def test_correction_trims_single_leading_plate_border_letter(self) -> None:
+        self.assertEqual(
+            correct_plate_candidate_with_cost("L23 LN 466"),
+            ("23LN466", 1),
+        )
+
+    def test_correction_does_not_search_arbitrary_text_for_a_plate(self) -> None:
+        self.assertIsNone(correct_plate_candidate_with_cost("XX23 LN 466"))
+
     def test_variant_consensus_beats_isolated_high_confidence_typo(self) -> None:
         candidate = select_best_candidate(
             (
@@ -727,6 +754,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         detector_source: str = "live",
         captured_at: datetime | None = None,
         detection: PlateDetection | None = None,
+        track_id: int | None = None,
     ) -> OcrJob:
         now = time.monotonic() if observed_at is None else observed_at
         frame = np.full((200, 400, 3), frame_value, dtype=np.uint8)
@@ -762,6 +790,132 @@ class RecognitionPipelineTests(unittest.TestCase):
             frame_id=frame_id,
             detector_source=detector_source,
             ocr_crop_detections=(detection,) if detection is not None else (),
+            track_id=track_id,
+        )
+
+    def test_two_tracks_on_same_frames_persist_independent_plate_results(self) -> None:
+        from app.plate_tracking import PlateTrackManager
+
+        track_manager = PlateTrackManager(
+            max_active_tracks_per_camera=2,
+            timeout_ms=1_200,
+            iou_threshold=0.25,
+        )
+        detections = (
+            PlateDetection(0.90, 20, 10, 100, 30),
+            PlateDetection(0.90, 240, 10, 100, 30),
+        )
+        update = track_manager.update(1, detections, 10.0)
+        left_id, right_id = (item.track_id for item in update.assignments)
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("34ABC123", 0.95, (0, 0, 10, 10))],
+                    [OcrSegment("35XYZ789", 0.96, (0, 0, 10, 10))],
+                    [OcrSegment("34ABC123", 0.97, (0, 0, 10, 10))],
+                    [OcrSegment("35XYZ789", 0.98, (0, 0, 10, 10))],
+                ]
+            ),
+            self.plate_service,
+            self.config,
+            track_manager=track_manager,
+        )
+        outcomes = []
+        for frame_id, track_id, plate_detection in (
+            (1, left_id, detections[0]),
+            (1, right_id, detections[1]),
+            (2, left_id, detections[0]),
+            (2, right_id, detections[1]),
+        ):
+            self.assertTrue(track_manager.mark_ocr_scheduled(track_id))
+            try:
+                outcomes.append(
+                    processor.process_ocr_job(
+                        self._make_ocr_job(
+                            frame_id=frame_id,
+                            observed_at=10.0 + frame_id * 0.2,
+                            detection=plate_detection,
+                            track_id=track_id,
+                        ),
+                        queue_depth=0,
+                    )
+                )
+            finally:
+                track_manager.mark_ocr_finished(track_id)
+
+        self.assertEqual(
+            [outcome.state for outcome in outcomes],
+            [
+                RecognitionState.AWAITING_CONFIRMATION,
+                RecognitionState.AWAITING_CONFIRMATION,
+                RecognitionState.SAVED,
+                RecognitionState.SAVED,
+            ],
+        )
+        self.assertEqual(
+            {outcome.record.plate for outcome in outcomes if outcome.record},
+            {"34ABC123", "35XYZ789"},
+        )
+
+    def test_stabilization_keeps_two_track_decisions_independent(self) -> None:
+        from app.plate_tracking import PlateTrackManager
+
+        config = recognition_config(
+            self.config.model_root,
+            stabilization_window_ms=2_000,
+            stabilization_min_hold_ms=500,
+        )
+        track_manager = PlateTrackManager(
+            max_active_tracks_per_camera=2,
+            timeout_ms=1_200,
+            iou_threshold=0.25,
+        )
+        detections = (
+            PlateDetection(0.90, 20, 10, 100, 30),
+            PlateDetection(0.90, 240, 10, 100, 30),
+        )
+        update = track_manager.update(1, detections, 10.0)
+        left_id, right_id = (item.track_id for item in update.assignments)
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("34ABC123", 0.95, (0, 0, 10, 10))],
+                    [OcrSegment("35XYZ789", 0.96, (0, 0, 10, 10))],
+                    [OcrSegment("34ABC123", 0.97, (0, 0, 10, 10))],
+                    [OcrSegment("35XYZ789", 0.98, (0, 0, 10, 10))],
+                ]
+            ),
+            self.plate_service,
+            config,
+            track_manager=track_manager,
+        )
+        for frame_id, track_id, plate_detection in (
+            (1, left_id, detections[0]),
+            (1, right_id, detections[1]),
+            (2, left_id, detections[0]),
+            (2, right_id, detections[1]),
+        ):
+            track_manager.mark_ocr_scheduled(track_id)
+            try:
+                processor.process_ocr_job(
+                    self._make_ocr_job(
+                        frame_id=frame_id,
+                        observed_at=10.0 + frame_id * 0.2,
+                        detection=plate_detection,
+                        track_id=track_id,
+                    ),
+                    queue_depth=0,
+                )
+            finally:
+                track_manager.mark_ocr_finished(track_id)
+
+        self.assertEqual(processor.pending_decision_count, 2)
+        finalized = processor.finalize_due(time.monotonic() + 3.0)
+
+        self.assertEqual(len(finalized), 2)
+        self.assertEqual(
+            {outcome.record.plate for _, outcome in finalized if outcome.record},
+            {"34ABC123", "35XYZ789"},
         )
 
     def _make_snapshot(
@@ -959,7 +1113,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(detector.calls, 2)
         self.assertEqual(provider.calls, 2)
         self.assertEqual(len(provider.images), 4)
-        self.assertEqual(provider.images[2].shape, (60, 200, 3))
+        self.assertEqual(provider.images[2].shape, (60, 270, 3))
         self.assertNotEqual(provider.images[0].shape[:2], (110, 320))
         self.assertFalse(outcome.used_roi_fallback)
         self.assertEqual(outcome.detections, tuple(detector.detections))
@@ -1288,7 +1442,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIn("detector_ms=12.0", diagnostic)
         self.assertIn("plates=1", diagnostic)
         self.assertIn("det_conf=0.880", diagnostic)
-        self.assertIn("plate_crops=130x40", diagnostic)
+        self.assertIn("plate_crops=180x40", diagnostic)
         self.assertIn("ocr_ms=83.0", diagnostic)
         self.assertIn("total_recognition_ms=95.0", diagnostic)
         self.assertIn("candidate=yes", diagnostic)
@@ -2996,7 +3150,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             received_at=10.0,
         )
 
-        self.assertEqual(result.job.ocr_crops[0].shape, (55, 170, 3))
+        self.assertEqual(result.job.ocr_crops[0].shape, (55, 248, 3))
 
     def test_static_zero_detection_rescue_is_warmed_up_and_throttled(self) -> None:
         processor = PlateDetectionProcessor(self.config, FakePlateDetector([]))
@@ -3079,6 +3233,7 @@ class RecognitionPipelineTests(unittest.TestCase):
 
     def test_raw_recognition_capture_can_be_armed_after_initial_frame(self) -> None:
         frame = np.full((200, 400, 3), 71, dtype=np.uint8)
+        detection = PlateDetection(0.9, x=20, y=10, width=100, height=30)
         captured_at = datetime(2026, 8, 17, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as temp_directory, patch.dict(
             "os.environ",
@@ -3087,10 +3242,8 @@ class RecognitionPipelineTests(unittest.TestCase):
             "app.plate_recognition.application_root",
             return_value=Path(temp_directory),
         ):
-            processor = PlateDetectionProcessor(
-                self.config,
-                FakePlateDetector([]),
-            )
+            detector = FakePlateDetector([])
+            processor = PlateDetectionProcessor(self.config, detector)
             processor.prepare_job(
                 1,
                 Direction.ENTRY,
@@ -3116,6 +3269,7 @@ class RecognitionPipelineTests(unittest.TestCase):
                 observed_at=12.0,
                 received_at=12.0,
             )
+            detector.detections = [detection]
             processor.prepare_job(
                 1,
                 Direction.ENTRY,
@@ -3123,6 +3277,14 @@ class RecognitionPipelineTests(unittest.TestCase):
                 captured_at=captured_at,
                 observed_at=13.0,
                 received_at=13.0,
+            )
+            processor.prepare_job(
+                1,
+                Direction.ENTRY,
+                frame,
+                captured_at=captured_at,
+                observed_at=14.0,
+                received_at=14.0,
             )
             captures = list(
                 (Path(temp_directory) / "debug" / "recognition-frames").glob("*.jpg")
@@ -3137,6 +3299,49 @@ class RecognitionPipelineTests(unittest.TestCase):
             sum(path.name.endswith("-roi.jpg") for path in captures),
             1,
         )
+
+    def test_armed_capture_ignores_replay_detector_hit(self) -> None:
+        frame = np.full((200, 400, 3), 71, dtype=np.uint8)
+        detection = PlateDetection(0.9, x=20, y=10, width=100, height=30)
+        captured_at = datetime(2026, 8, 17, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp_directory, patch.dict(
+            "os.environ",
+            {"CAMERBOUND_CAPTURE_NEXT_RECOGNITION_FRAME": ""},
+        ), patch(
+            "app.plate_recognition.application_root",
+            return_value=Path(temp_directory),
+        ):
+            processor = PlateDetectionProcessor(
+                self.config,
+                FakePlateDetector([detection]),
+            )
+            processor.arm_raw_capture(Direction.ENTRY)
+            replay = processor.prepare_job(
+                1,
+                Direction.ENTRY,
+                frame,
+                captured_at=captured_at,
+                observed_at=10.0,
+                received_at=10.0,
+                detector_source="replay",
+            )
+            live = processor.prepare_job(
+                1,
+                Direction.ENTRY,
+                frame,
+                captured_at=captured_at,
+                observed_at=11.0,
+                received_at=11.0,
+                detector_source="live",
+            )
+
+            captures = list(
+                (Path(temp_directory) / "debug" / "recognition-frames").glob("*.jpg")
+            )
+
+        self.assertFalse(replay.diagnostic_capture)
+        self.assertTrue(live.diagnostic_capture)
+        self.assertEqual(len(captures), 2)
 
     def test_static_rescue_candidate_normalizes_expected_field_plate(self) -> None:
         config = recognition_config(self.config.model_root, confirmations=1)

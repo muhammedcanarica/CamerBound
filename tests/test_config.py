@@ -43,6 +43,9 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                                 "debug_detection_overlay_ttl_ms": 500,
                             },
                             "max_pending_ocr_jobs_per_camera": 3,
+                            "max_active_plate_tracks_per_camera": 2,
+                            "plate_track_timeout_ms": 1200,
+                            "plate_track_iou_threshold": 0.25,
                             "ocr_job_max_age_ms": 2500,
                         },
                     }
@@ -80,6 +83,9 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(config.max_replay_frames_per_event, 10)
         self.assertEqual(config.max_pending_replay_events_per_camera, 2)
         self.assertEqual(config.replay_event_max_age_ms, 8000)
+        self.assertEqual(config.max_active_plate_tracks_per_camera, 2)
+        self.assertEqual(config.plate_track_timeout_ms, 1200)
+        self.assertEqual(config.plate_track_iou_threshold, 0.25)
         self.assertEqual(detector.model_dir.name, PLATE_DETECTOR_MODEL_NAME)
         self.assertEqual(detector.model_xml.name, "model.xml")
         self.assertEqual(detector.model_bin.name, "model.bin")
@@ -96,6 +102,9 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                             "ocr_job_max_age_ms": 0,
                             "detector_crop_ocr_job_max_age_ms": 0,
                             "ocr_cpu_threads": 0,
+                            "max_active_plate_tracks_per_camera": 0,
+                            "plate_track_timeout_ms": 0,
+                            "plate_track_iou_threshold": 2,
                             "plate_detector": {
                                 "enabled": "yes",
                                 "backend": "unknown",
@@ -135,7 +144,10 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(config.ocr_job_max_age_ms, 2500)
         self.assertEqual(config.detector_crop_ocr_job_max_age_ms, 12000)
         self.assertEqual(config.ocr_cpu_threads, 4)
-        self.assertGreaterEqual(len(config.warnings), 13)
+        self.assertEqual(config.max_active_plate_tracks_per_camera, 2)
+        self.assertEqual(config.plate_track_timeout_ms, 1200)
+        self.assertEqual(config.plate_track_iou_threshold, 0.25)
+        self.assertGreaterEqual(len(config.warnings), 16)
 
     def test_ocr_sampling_interval_is_250_without_relaxing_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:

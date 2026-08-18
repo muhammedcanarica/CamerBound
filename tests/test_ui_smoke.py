@@ -318,7 +318,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
         self.assertEqual(len(camera_settings._camera_buttons), 2)
         self.assertEqual(
             camera_settings.capture_entry_recognition_frame_button.text(),
-            "Sonraki ENTRY Frame'ini Kaydet",
+            "İlk ENTRY Detector Karesini Kaydet",
         )
         with patch.object(
             self.controller.recognition_service,
@@ -330,7 +330,10 @@ class LoginFlowSmokeTest(unittest.TestCase):
                 Qt.MouseButton.LeftButton,
             )
         arm_raw_capture.assert_called_once_with(Direction.ENTRY)
-        self.assertIn("tek-shot kayıt hazır", camera_settings.diagnostics_label.text())
+        self.assertIn(
+            "detector hit'i için tek-shot kayıt hazır",
+            camera_settings.diagnostics_label.text(),
+        )
         for editor in camera_settings._editors.values():
             self.assertEqual(len(editor), 4)
         for camera in self.controller.camera_service.list_cameras():

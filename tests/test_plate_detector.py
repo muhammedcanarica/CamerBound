@@ -11,6 +11,7 @@ from app.plate_detector import (
     OpenVinoPlateDetector,
     PlateDetection,
     PlateDetectorModelNotFound,
+    MIN_PLATE_CROP_ASPECT_RATIO,
     crop_padded_plate,
     detector_recovery_tiles,
     enhance_shadowed_detector_image,
@@ -462,6 +463,21 @@ class PlateDetectorTests(unittest.TestCase):
 
         self.assertEqual(center_crop.shape, (26, 52, 3))
         self.assertEqual(edge_crop.shape, (12, 23, 3))
+
+    def test_detector_crop_adds_horizontal_context_for_partial_plate_box(self) -> None:
+        image = np.zeros((120, 400, 3), dtype=np.uint8)
+        image[:, 300, :] = 255
+        partial_plate = PlateDetection(0.25, 200, 50, 50, 20)
+
+        crop = crop_padded_plate(
+            image,
+            partial_plate,
+            0.5,
+            minimum_aspect_ratio=MIN_PLATE_CROP_ASPECT_RATIO,
+        )
+
+        self.assertEqual(crop.shape, (40, 180, 3))
+        self.assertEqual(int(crop.max()), 255)
 
     def test_candidate_limit_blends_confidence_with_geometry(self) -> None:
         detections = [

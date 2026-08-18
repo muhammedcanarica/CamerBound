@@ -34,6 +34,9 @@ PLATE_GEOMETRY_REFERENCE_ASPECT = 3.2
 PLATE_GEOMETRY_MIN_USEFUL_WIDTH = 32
 PLATE_GEOMETRY_MIN_USEFUL_HEIGHT = 10
 PLATE_GEOMETRY_MIN_USEFUL_ROI_AREA_RATIO = 0.0025
+# Detector boxes can cover only the recognized text prefix. Preserve enough
+# horizontal plate context so trailing characters still reach OCR.
+MIN_PLATE_CROP_ASPECT_RATIO = 4.5
 
 
 class PlateDetectorError(RuntimeError):
@@ -602,6 +605,8 @@ def crop_padded_plate(
     image: np.ndarray,
     detection: PlateDetection,
     padding_ratio: float,
+    *,
+    minimum_aspect_ratio: float | None = None,
 ) -> np.ndarray | None:
     image_height, image_width = image.shape[:2]
     pad_x = detection.width * padding_ratio
@@ -610,6 +615,18 @@ def crop_padded_plate(
     y1 = max(0, math.floor(detection.y - pad_y))
     x2 = min(image_width, math.ceil(detection.x + detection.width + pad_x))
     y2 = min(image_height, math.ceil(detection.y + detection.height + pad_y))
+    if minimum_aspect_ratio is not None and minimum_aspect_ratio > 0:
+        required_width = math.ceil((y2 - y1) * minimum_aspect_ratio)
+        if required_width > x2 - x1:
+            center_x = detection.x + (detection.width / 2.0)
+            x1 = math.floor(center_x - (required_width / 2.0))
+            x2 = x1 + required_width
+            if x1 < 0:
+                x1 = 0
+                x2 = min(image_width, required_width)
+            elif x2 > image_width:
+                x2 = image_width
+                x1 = max(0, image_width - required_width)
     if x2 - x1 < MIN_PLATE_CROP_WIDTH or y2 - y1 < MIN_PLATE_CROP_HEIGHT:
         return None
     crop = image[y1:y2, x1:x2]

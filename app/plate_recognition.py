@@ -32,6 +32,7 @@ from app.plate_detector import (
     PlateDetection,
     PlateDetector,
     PlateDetectorError,
+    MIN_PLATE_CROP_ASPECT_RATIO,
     crop_padded_plate,
     plate_detection_geometry_quality,
     plate_detection_ranking_score,
@@ -41,6 +42,10 @@ from app.plate_service import (
     DuplicatePlateDetection,
     PlateRecord,
     PlateService,
+)
+from app.plate_tracking import (
+    PlateTrackManager,
+    PlateTrackSnapshot,
 )
 from app.time_utils import as_utc, utc_now
 
@@ -258,6 +263,7 @@ class PlateCandidate:
     detector_bbox: tuple[float, float, float, float] | None = None
     detector_crop_evidence: bool = False
     spatial_alias_evidence: bool = False
+    track_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,29 +436,47 @@ def correct_plate_candidate(raw_text: str) -> str | None:
 
 def correct_plate_candidate_with_cost(raw_text: str) -> tuple[str, int] | None:
     normalized = normalize_plate_text(raw_text)
-    if len(normalized) < 5 or len(normalized) > 9:
-        return None
-
-    province, province_cost = _translate(normalized[:2], PROVINCE_DIGIT_CORRECTIONS, str.isdigit)
-    if province is None:
+    if len(normalized) < 5 or len(normalized) > 10:
         return None
 
     corrected: list[tuple[int, str]] = []
-    remainder = normalized[2:]
-    for letter_count in range(1, 4):
-        if len(remainder) - letter_count not in range(2, 5):
-            continue
-        letters, letter_cost = _translate(
-            remainder[:letter_count], LETTER_CORRECTIONS, _is_ascii_letter
+    normalized_options = [(normalized, 0)] if len(normalized) <= 9 else []
+    if (
+        len(normalized) >= 6
+        and _is_ascii_letter(normalized[0])
+        and normalized[1:3].isdigit()
+        and 1 <= int(normalized[1:3]) <= 81
+    ):
+        normalized_options.append((normalized[1:], 1))
+
+    for candidate_text, trim_cost in normalized_options:
+        province, province_cost = _translate(
+            candidate_text[:2],
+            PROVINCE_DIGIT_CORRECTIONS,
+            str.isdigit,
         )
-        suffix, suffix_cost = _translate(
-            remainder[letter_count:], SUFFIX_DIGIT_CORRECTIONS, str.isdigit
-        )
-        if letters is None or suffix is None:
+        if province is None:
             continue
-        plate = province + letters + suffix
-        if TurkishPlateValidator.is_valid(plate):
-            corrected.append((province_cost + letter_cost + suffix_cost, plate))
+        remainder = candidate_text[2:]
+        for letter_count in range(1, 4):
+            if len(remainder) - letter_count not in range(2, 5):
+                continue
+            letters, letter_cost = _translate(
+                remainder[:letter_count], LETTER_CORRECTIONS, _is_ascii_letter
+            )
+            suffix, suffix_cost = _translate(
+                remainder[letter_count:], SUFFIX_DIGIT_CORRECTIONS, str.isdigit
+            )
+            if letters is None or suffix is None:
+                continue
+            plate = province + letters + suffix
+            if TurkishPlateValidator.is_valid(plate):
+                corrected.append(
+                    (
+                        trim_cost + province_cost + letter_cost + suffix_cost,
+                        plate,
+                    )
+                )
     if not corrected:
         return None
     corrected.sort(key=lambda item: (item[0], item[1]))
@@ -464,8 +488,10 @@ class ConfirmationTracker:
     def __init__(self, required: int, window_seconds: float) -> None:
         self.required = max(1, required)
         self.window_seconds = max(0.1, window_seconds)
-        self._observations: dict[int, deque[_ConfirmationObservation]] = defaultdict(deque)
-        self._confirmed_until: dict[tuple[int, str], float] = {}
+        self._observations: dict[
+            tuple[int, int | None], deque[_ConfirmationObservation]
+        ] = defaultdict(deque)
+        self._confirmed_until: dict[tuple[int, int | None, str], float] = {}
         self._anonymous_frame_id = 0
 
     def observe(self, candidate: PlateCandidate, observed_at: float) -> PlateCandidate | None:
@@ -480,7 +506,8 @@ class ConfirmationTracker:
         post_save_near_plate: str | None = None,
         spatial_alias: bool = False,
     ) -> ConfirmationProgress:
-        key = (candidate.camera_id, candidate.plate)
+        scope = (candidate.camera_id, candidate.track_id)
+        key = (candidate.camera_id, candidate.track_id, candidate.plate)
         confirmed_until = self._confirmed_until.get(key, 0.0)
         if confirmed_until >= observed_at:
             return ConfirmationProgress(
@@ -493,7 +520,7 @@ class ConfirmationTracker:
         if frame_id is None:
             self._anonymous_frame_id -= 1
             frame_id = self._anonymous_frame_id
-        observations = self._observations[candidate.camera_id]
+        observations = self._observations[scope]
         if not any(item.frame_id == frame_id for item in observations):
             observations.append(
                 _ConfirmationObservation(observed_at, frame_id, candidate)
@@ -588,6 +615,12 @@ class ConfirmationTracker:
             near_conflicts=near_conflicts,
             runner_up_votes=runner_up_votes,
         )
+
+    def clear_track(self, camera_id: int, track_id: int) -> None:
+        self._observations.pop((camera_id, track_id), None)
+        for key in tuple(self._confirmed_until):
+            if key[:2] == (camera_id, track_id):
+                self._confirmed_until.pop(key, None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -687,6 +720,7 @@ class _RepresentativeFrame:
 @dataclass(slots=True)
 class PendingPlateDecision:
     camera_id: int
+    track_id: int | None
     direction: Direction
     last_updated_monotonic: float
     cleanup_deadline_monotonic: float
@@ -718,6 +752,7 @@ class RecognitionState(StrEnum):
     AMBIGUOUS_DISCARDED = "AMBIGUOUS_DISCARDED"
     SAVED = "SAVED"
     DUPLICATE_SUPPRESSED = "DUPLICATE_SUPPRESSED"
+    STALE_TRACK_DROPPED = "STALE_TRACK_DROPPED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1238,6 +1273,7 @@ class OcrJob:
     ocr_crop_detections: tuple[PlateDetection | None, ...] = ()
     diagnostic_capture: bool = False
     spatial_search_rescue: bool = False
+    track_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1256,6 +1292,15 @@ class DetectionJobResult:
     event_frames: int = 0
     ring_depth: int = 0
     diagnostic_capture: bool = False
+    additional_jobs: tuple[OcrJob, ...] = ()
+    active_tracks: tuple[PlateTrackSnapshot, ...] = ()
+    ignored_track_detections: int = 0
+
+    @property
+    def jobs(self) -> tuple[OcrJob, ...]:
+        if self.job is None:
+            return self.additional_jobs
+        return (self.job, *self.additional_jobs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1269,6 +1314,7 @@ class OcrBufferAddResult:
     drop_reason: str | None = None
     coalesced: bool = False
     stale_discarded: int = 0
+    replaced_track_id: int | None = None
 
 
 class OcrJobBuffer:
@@ -1279,6 +1325,7 @@ class OcrJobBuffer:
         max_per_camera: int,
         max_age_ms: int,
         detector_crop_max_age_ms: int | None = None,
+        on_job_discarded: Callable[[OcrJob], None] | None = None,
     ) -> None:
         self.max_per_camera = max(1, max_per_camera)
         self.max_age_seconds = max(0.1, max_age_ms / 1000.0)
@@ -1298,12 +1345,14 @@ class OcrJobBuffer:
         self.dropped_count = 0
         self.replaced_count = 0
         self.stale_count = 0
+        self._on_job_discarded = on_job_discarded
 
     def add(self, job: OcrJob) -> OcrBufferAddResult:
         replaced = 0
         dropped = 0
         accepted = True
         replaced_job_type: OcrJobType | None = None
+        replaced_track_id: int | None = None
         drop_reason: str | None = None
         coalesced = False
         with self._condition:
@@ -1322,7 +1371,34 @@ class OcrJobBuffer:
                 if job.job_type is OcrJobType.ZERO_DETECTION_FALLBACK
                 else 1
             )
-            if (
+            same_track_index = next(
+                (
+                    index
+                    for index, pending in enumerate(camera_jobs)
+                    if job.job_type is OcrJobType.DETECTOR_CROP
+                    and job.track_id is not None
+                    and pending.job_type is OcrJobType.DETECTOR_CROP
+                    and pending.track_id == job.track_id
+                ),
+                None,
+            )
+            if same_track_index is not None:
+                existing = camera_jobs[same_track_index]
+                if job.quality_score > existing.quality_score:
+                    replaced_job_type = existing.job_type
+                    replaced_track_id = existing.track_id
+                    del camera_jobs[same_track_index]
+                    camera_jobs.append(job)
+                    replaced = 1
+                    self.replaced_count += 1
+                    self._notify_discarded(existing)
+                else:
+                    accepted = False
+                    dropped = 1
+                    coalesced = True
+                    drop_reason = "track-pending"
+                    self.dropped_count += 1
+            elif (
                 job.job_type is not OcrJobType.DETECTOR_CROP
                 and same_type_pending >= pending_limit
             ):
@@ -1348,10 +1424,12 @@ class OcrJobBuffer:
                 )
                 if higher_priority or better_same_priority:
                     replaced_job_type = weakest.job_type
+                    replaced_track_id = weakest.track_id
                     del camera_jobs[weakest_index]
                     camera_jobs.append(job)
                     replaced = 1
                     self.replaced_count += 1
+                    self._notify_discarded(weakest)
                 else:
                     accepted = False
                     dropped = 1
@@ -1377,14 +1455,17 @@ class OcrJobBuffer:
             drop_reason=drop_reason,
             coalesced=coalesced,
             stale_discarded=stale_discarded,
+            replaced_track_id=replaced_track_id,
         )
 
         if LOGGER.isEnabledFor(logging.DEBUG) and (not accepted or replaced):
             LOGGER.debug(
-                "OCR buffer decision camera_id=%s job_type=%s source=%s frame_id=%s "
+                "OCR buffer decision camera_id=%s track_id=%s job_type=%s "
+                "source=%s frame_id=%s "
                 "priority=%s accepted=%s queue_depth=%s camera_depth=%s "
                 "replaced_job_type=%s drop_reason=%s coalesced=%s stale_count=%s",
                 job.camera_id,
+                job.track_id,
                 job.job_type.value,
                 job.detector_source,
                 job.frame_id,
@@ -1449,17 +1530,21 @@ class OcrJobBuffer:
         camera_jobs: deque[OcrJob],
         now: float,
     ) -> int:
-        kept = [
-            job
-            for job in camera_jobs
-            if now - job.queued_at <= self._max_age_seconds(job)
-        ]
+        kept: list[OcrJob] = []
+        discarded_jobs: list[OcrJob] = []
+        for job in camera_jobs:
+            if now - job.queued_at <= self._max_age_seconds(job):
+                kept.append(job)
+            else:
+                discarded_jobs.append(job)
         discarded = len(camera_jobs) - len(kept)
         if not discarded:
             return 0
         camera_jobs.clear()
         camera_jobs.extend(kept)
         self.stale_count += discarded
+        for job in discarded_jobs:
+            self._notify_discarded(job)
         return discarded
 
     def _max_age_seconds(self, job: OcrJob) -> float:
@@ -1473,16 +1558,30 @@ class OcrJobBuffer:
                 return len(self._jobs.get(camera_id, ()))
             return sum(len(items) for items in self._jobs.values())
 
+    def pending_track_count(self, camera_id: int, track_id: int) -> int:
+        with self._condition:
+            return sum(
+                item.track_id == track_id
+                for item in self._jobs.get(camera_id, ())
+            )
+
     def clear(self) -> None:
         with self._condition:
+            discarded = [job for jobs in self._jobs.values() for job in jobs]
             self._jobs.clear()
             self._camera_order.clear()
             self._known_camera_ids.clear()
             self._condition.notify_all()
+            for job in discarded:
+                self._notify_discarded(job)
 
     def wake_all(self) -> None:
         with self._condition:
             self._condition.notify_all()
+
+    def _notify_discarded(self, job: OcrJob) -> None:
+        if self._on_job_discarded is not None:
+            self._on_job_discarded(job)
 
 
 class PlateDetectionProcessor:
@@ -1492,9 +1591,11 @@ class PlateDetectionProcessor:
         self,
         config: PlateRecognitionConfig,
         detector: PlateDetector | None,
+        track_manager: PlateTrackManager | None = None,
     ) -> None:
         self.config = config
         self.detector = detector
+        self.track_manager = track_manager
         self._last_zero_detection_fallback_at: dict[int, float] = {}
         self._zero_detection_events: dict[
             tuple[int, int], _ZeroDetectionEventState
@@ -1514,7 +1615,7 @@ class PlateDetectionProcessor:
             self._raw_capture_pending.set()
 
     def arm_raw_capture(self, direction: Direction | None = None) -> None:
-        """Capture exactly one future CameraWorker recognition frame and ROI."""
+        """Capture the next live detector-hit frame and ROI for the direction."""
         with self._raw_capture_lock:
             self._raw_capture_direction = direction
             self._raw_capture_pending.set()
@@ -1539,19 +1640,16 @@ class PlateDetectionProcessor:
         roi_crop = crop_roi(frame, self.config.roi_for(direction))
         if roi_crop is None:
             return DetectionJobResult(None, (), False, None, 0.0, 0.0)
-        diagnostic_capture = self._capture_raw_frame_once(
-            camera_id,
-            direction,
-            frame,
-            roi_crop,
-            frame_id=frame_id,
-        )
+        diagnostic_capture = False
 
         detector_started_at = time.perf_counter()
         detector_config = self.config.plate_detector
         detections: list[PlateDetection] = []
         selected: list[PlateDetection] = []
         ocr_crop_detections: list[PlateDetection | None] = []
+        ocr_crop_track_ids: list[int | None] = []
+        active_tracks: tuple[PlateTrackSnapshot, ...] = ()
+        ignored_track_detections = 0
         used_roi_fallback = not detector_config.enabled
         fallback_reason = "detector-disabled" if used_roi_fallback else None
         ocr_crops: list[np.ndarray] = []
@@ -1598,7 +1696,25 @@ class PlateDetectionProcessor:
                     roi_width=roi_crop.shape[1],
                     roi_height=roi_crop.shape[0],
                 )
+                track_ids_by_detection: dict[int, int] = {}
+                if self.track_manager is not None:
+                    tracking = self.track_manager.update(
+                        camera_id,
+                        selected,
+                        observed_at,
+                    )
+                    active_tracks = tracking.active_tracks
+                    ignored_track_detections = len(tracking.ignored_detections)
+                    track_ids_by_detection = {
+                        id(item.detection): item.track_id
+                        for item in tracking.assignments
+                    }
                 for detection in selected:
+                    if (
+                        self.track_manager is not None
+                        and id(detection) not in track_ids_by_detection
+                    ):
+                        continue
                     plate_crop = crop_padded_plate(
                         roi_crop,
                         detection,
@@ -1607,10 +1723,14 @@ class PlateDetectionProcessor:
                             if tiled_recovery
                             else detector_config.crop_padding_ratio
                         ),
+                        minimum_aspect_ratio=MIN_PLATE_CROP_ASPECT_RATIO,
                     )
                     if plate_crop is not None:
                         ocr_crops.append(plate_crop)
                         ocr_crop_detections.append(detection)
+                        ocr_crop_track_ids.append(
+                            track_ids_by_detection.get(id(detection))
+                        )
                 if ocr_crops and zero_detection_fallback_event_id is not None:
                     self._event_state(
                         camera_id,
@@ -1621,25 +1741,29 @@ class PlateDetectionProcessor:
                 if ocr_crops:
                     self._first_static_miss_at.pop(camera_id, None)
                 if not ocr_crops:
-                    (
-                        should_fallback,
-                        fallback_skipped_reason,
-                        fallback_attempt,
-                        time_since_previous_attempt_ms,
-                    ) = (
-                        self._should_run_zero_detection_fallback(
-                            camera_id,
-                            observed_at,
-                            detector_config.zero_detection_roi_fallback_enabled,
-                            detector_config.zero_detection_roi_fallback_interval_ms,
-                            allow_zero_detection_fallback,
-                            zero_detection_fallback_event_id,
-                            frame_id,
-                            motion_score,
-                            event_frames,
-                            ring_depth,
+                    if ignored_track_detections:
+                        should_fallback = False
+                        fallback_skipped_reason = "track-limit"
+                    else:
+                        (
+                            should_fallback,
+                            fallback_skipped_reason,
+                            fallback_attempt,
+                            time_since_previous_attempt_ms,
+                        ) = (
+                            self._should_run_zero_detection_fallback(
+                                camera_id,
+                                observed_at,
+                                detector_config.zero_detection_roi_fallback_enabled,
+                                detector_config.zero_detection_roi_fallback_interval_ms,
+                                allow_zero_detection_fallback,
+                                zero_detection_fallback_event_id,
+                                frame_id,
+                                motion_score,
+                                event_frames,
+                                ring_depth,
+                            )
                         )
-                    )
                     if should_fallback:
                         used_roi_fallback = True
                         fallback_reason = "zero-detection"
@@ -1672,9 +1796,21 @@ class PlateDetectionProcessor:
         else:
             ocr_crops = [roi_crop]
 
+        if self.track_manager is not None and not selected:
+            tracking = self.track_manager.update(camera_id, (), observed_at)
+            active_tracks = tracking.active_tracks
+
         detector_ms = (time.perf_counter() - detector_started_at) * 1000.0
         detection_tuple = tuple(detections)
         brightness = roi_mean_brightness(roi_crop)
+        if selected and detector_source == "live":
+            diagnostic_capture = self._capture_raw_frame_once(
+                camera_id,
+                direction,
+                frame,
+                roi_crop,
+                frame_id=frame_id,
+            )
         if not ocr_crops:
             return DetectionJobResult(
                 None,
@@ -1691,6 +1827,8 @@ class PlateDetectionProcessor:
                 event_frames,
                 ring_depth,
                 diagnostic_capture,
+                active_tracks=active_tracks,
+                ignored_track_detections=ignored_track_detections,
             )
 
         full_frame = frame
@@ -1716,27 +1854,71 @@ class PlateDetectionProcessor:
             # Detector-disabled and detector-unavailable paths share the protected
             # detector-error fallback priority tier; fallback_reason stays explicit.
             job_type = OcrJobType.DETECTOR_ERROR_FALLBACK
-        job = OcrJob(
-            camera_id=camera_id,
-            direction=direction,
-            captured_at=captured_at,
-            observed_at=observed_at,
-            received_at=received_at,
-            queued_at=time.monotonic(),
-            full_frame=full_frame,
-            roi_crop=roi_crop,
-            ocr_crops=tuple(ocr_crops),
-            detections=detection_tuple,
-            used_roi_fallback=used_roi_fallback,
-            fallback_reason=fallback_reason,
-            detector_ms=detector_ms,
-            quality_score=ocr_job_quality_score(ocr_crops, selected),
-            job_type=job_type,
-            frame_id=frame_id,
-            detector_source=detector_source,
-            ocr_crop_detections=tuple(ocr_crop_detections),
-            diagnostic_capture=diagnostic_capture,
-        )
+        queued_at = time.monotonic()
+        jobs: list[OcrJob] = []
+        if job_type is OcrJobType.DETECTOR_CROP:
+            for crop_index, ocr_crop in enumerate(ocr_crops):
+                detection = (
+                    ocr_crop_detections[crop_index]
+                    if crop_index < len(ocr_crop_detections)
+                    else None
+                )
+                jobs.append(
+                    OcrJob(
+                        camera_id=camera_id,
+                        direction=direction,
+                        captured_at=captured_at,
+                        observed_at=observed_at,
+                        received_at=received_at,
+                        queued_at=queued_at,
+                        full_frame=full_frame,
+                        roi_crop=roi_crop,
+                        ocr_crops=(ocr_crop,),
+                        detections=detection_tuple,
+                        used_roi_fallback=used_roi_fallback,
+                        fallback_reason=fallback_reason,
+                        detector_ms=detector_ms,
+                        quality_score=ocr_job_quality_score(
+                            (ocr_crop,),
+                            (() if detection is None else (detection,)),
+                        ),
+                        job_type=job_type,
+                        frame_id=frame_id,
+                        detector_source=detector_source,
+                        ocr_crop_detections=(detection,),
+                        diagnostic_capture=diagnostic_capture,
+                        track_id=(
+                            ocr_crop_track_ids[crop_index]
+                            if crop_index < len(ocr_crop_track_ids)
+                            else None
+                        ),
+                    )
+                )
+        else:
+            jobs.append(
+                OcrJob(
+                    camera_id=camera_id,
+                    direction=direction,
+                    captured_at=captured_at,
+                    observed_at=observed_at,
+                    received_at=received_at,
+                    queued_at=queued_at,
+                    full_frame=full_frame,
+                    roi_crop=roi_crop,
+                    ocr_crops=tuple(ocr_crops),
+                    detections=detection_tuple,
+                    used_roi_fallback=used_roi_fallback,
+                    fallback_reason=fallback_reason,
+                    detector_ms=detector_ms,
+                    quality_score=ocr_job_quality_score(ocr_crops, selected),
+                    job_type=job_type,
+                    frame_id=frame_id,
+                    detector_source=detector_source,
+                    ocr_crop_detections=tuple(ocr_crop_detections),
+                    diagnostic_capture=diagnostic_capture,
+                )
+            )
+        job = jobs[0]
         return DetectionJobResult(
             job,
             detection_tuple,
@@ -1752,6 +1934,9 @@ class PlateDetectionProcessor:
             event_frames,
             ring_depth,
             diagnostic_capture,
+            additional_jobs=tuple(jobs[1:]),
+            active_tracks=active_tracks,
+            ignored_track_detections=ignored_track_detections,
         )
 
     def _should_run_static_zero_detection_rescue(
@@ -2180,11 +2365,13 @@ class PlateRecognitionProcessor:
         plate_service: PlateService,
         config: PlateRecognitionConfig,
         detector: PlateDetector | None = None,
+        track_manager: PlateTrackManager | None = None,
     ) -> None:
         self.provider = provider
         self.plate_service = plate_service
         self.config = config
         self.detector = detector
+        self.track_manager = track_manager
         self.confirmations = ConfirmationTracker(
             config.confirmations_required,
             config.confirmation_window_seconds,
@@ -2196,12 +2383,18 @@ class PlateRecognitionProcessor:
         self._last_detector_error_logged_at: dict[int, float] = {}
         self._last_detector_diagnostic_at: dict[tuple[int, str], float] = {}
         self._last_zero_detection_fallback_at: dict[int, float] = {}
-        self._observation_frame_ids: dict[int, deque[int]] = defaultdict(deque)
-        self._observation_frame_id_sets: dict[int, set[int]] = defaultdict(set)
+        self._observation_frame_ids: dict[
+            tuple[int, int | None], deque[int]
+        ] = defaultdict(deque)
+        self._observation_frame_id_sets: dict[
+            tuple[int, int | None], set[int]
+        ] = defaultdict(set)
         self._recent_saved_evidence: dict[int, deque[_SavedPlateEvidence]] = defaultdict(
             lambda: deque(maxlen=RECENT_SAVED_EVIDENCE_LIMIT)
         )
-        self._pending_decisions: dict[int, PendingPlateDecision] = {}
+        self._pending_decisions: dict[
+            tuple[int, int | None], PendingPlateDecision
+        ] = {}
         self._evidence_sequence = 0
 
     def process(
@@ -2281,6 +2474,7 @@ class PlateRecognitionProcessor:
                             if tiled_recovery
                             else detector_config.crop_padding_ratio
                         ),
+                        minimum_aspect_ratio=MIN_PLATE_CROP_ASPECT_RATIO,
                     )
                     if plate_crop is not None:
                         ocr_crops.append(plate_crop)
@@ -2411,6 +2605,25 @@ class PlateRecognitionProcessor:
         queue_depth: int,
     ) -> RecognitionOutcome:
         """Run preprocessing, OCR and persistence for an already detected frame."""
+        if (
+            self.track_manager is not None
+            and job.track_id is not None
+            and not self.track_manager.can_accept_ocr_result(job.track_id)
+        ):
+            LOGGER.debug(
+                "OCR result dropped because track is stale camera_id=%s "
+                "track_id=%s frame_id=%s",
+                job.camera_id,
+                job.track_id,
+                job.frame_id,
+            )
+            return self._outcome(
+                job.camera_id,
+                RecognitionState.STALE_TRACK_DROPPED,
+                suppression_reason="stale-track",
+                detections=job.detections,
+                used_roi_fallback=job.used_roi_fallback,
+            )
         queue_wait_ms = max(
             0.0,
             (time.monotonic() - job.queued_at) * 1000.0,
@@ -2617,6 +2830,7 @@ class PlateRecognitionProcessor:
             job_type=job.job_type,
             quality_score=job.quality_score,
             detector_crop_evidence=candidate_from_detector_crop,
+            track_id=job.track_id,
         )
         self._log_queued_ocr_diagnostics(
             job=job,
@@ -2659,6 +2873,7 @@ class PlateRecognitionProcessor:
         job_type: OcrJobType,
         quality_score: float,
         detector_crop_evidence: bool | None = None,
+        track_id: int | None = None,
     ) -> RecognitionOutcome:
         detection_context = {
             "detections": detections,
@@ -2694,10 +2909,36 @@ class PlateRecognitionProcessor:
                 if detector_crop_evidence is None
                 else detector_crop_evidence
             ),
+            track_id=track_id,
         )
 
+        if (
+            self.track_manager is not None
+            and track_id is not None
+            and not self.track_manager.record_ocr_result(
+                track_id,
+                candidate.plate,
+                candidate.confidence,
+                observed_at,
+            )
+        ):
+            LOGGER.debug(
+                "OCR result dropped because track is stale camera_id=%s "
+                "track_id=%s frame_id=%s",
+                camera_id,
+                track_id,
+                frame_id,
+            )
+            return self._outcome(
+                camera_id,
+                RecognitionState.STALE_TRACK_DROPPED,
+                candidate=candidate,
+                suppression_reason="stale-track",
+                **detection_context,
+            )
+
         if frame_id is not None and not self._claim_observation_frame(
-            camera_id, frame_id
+            camera_id, frame_id, track_id
         ):
             LOGGER.debug(
                 "Duplicate OCR observation skipped camera_id=%s frame_id=%s",
@@ -2869,10 +3110,10 @@ class PlateRecognitionProcessor:
     def finalize_due(self, now: float | None = None) -> list[tuple[int, RecognitionOutcome]]:
         current = time.monotonic() if now is None else now
         outcomes: list[tuple[int, RecognitionOutcome]] = []
-        for camera_id, decision in tuple(self._pending_decisions.items()):
+        for decision_key, decision in tuple(self._pending_decisions.items()):
             if decision.provisional_plate is None:
                 if current >= decision.cleanup_deadline_monotonic:
-                    self._pending_decisions.pop(camera_id, None)
+                    self._pending_decisions.pop(decision_key, None)
                 continue
             if (
                 decision.deadline_monotonic is not None
@@ -2880,11 +3121,43 @@ class PlateRecognitionProcessor:
             ):
                 outcomes.append(
                     (
-                        camera_id,
-                        self._finalize_pending_decision(camera_id),
+                        decision.camera_id,
+                        self._finalize_pending_decision(
+                            decision.camera_id,
+                            decision.track_id,
+                        ),
                     )
                 )
         return outcomes
+
+    def finalize_track(
+        self,
+        camera_id: int,
+        track_id: int,
+    ) -> RecognitionOutcome | None:
+        key = (camera_id, track_id)
+        decision = self._pending_decisions.get(key)
+        try:
+            if decision is None:
+                return None
+            if decision.provisional_plate is None:
+                self._pending_decisions.pop(key, None)
+                evaluation = self._evaluate_pending_decision(decision)
+                return self._outcome(
+                    camera_id,
+                    RecognitionState.AMBIGUOUS_DISCARDED,
+                    candidate=evaluation.winner,
+                    confirmation_count=evaluation.winner_votes,
+                    confirmation_required=evaluation.required_votes,
+                    suppression_reason=(
+                        evaluation.suppression_reason or "insufficient-evidence"
+                    ),
+                )
+            return self._finalize_pending_decision(camera_id, track_id)
+        finally:
+            self.confirmations.clear_track(camera_id, track_id)
+            self._observation_frame_ids.pop(key, None)
+            self._observation_frame_id_sets.pop(key, None)
 
     def clear_pending_decisions(self) -> None:
         self._pending_decisions.clear()
@@ -2904,34 +3177,38 @@ class PlateRecognitionProcessor:
         processing_now: float,
         base_confirmed_plate: str | None,
     ) -> PendingPlateDecision:
-        decision = self._pending_decisions.get(camera_id)
+        decision_key = (camera_id, candidate.track_id)
+        decision = self._pending_decisions.get(decision_key)
         if decision is not None and decision.direction is not direction:
             LOGGER.debug(
                 "Pending plate decision discarded camera_id=%s reason=direction-changed",
                 camera_id,
             )
-            self._pending_decisions.pop(camera_id, None)
+            self._pending_decisions.pop(decision_key, None)
             decision = None
         if decision is None:
             if len(self._pending_decisions) >= PENDING_DECISION_CAMERA_LIMIT:
-                oldest_camera = min(
+                oldest_key = min(
                     self._pending_decisions,
                     key=lambda key: self._pending_decisions[key].last_updated_monotonic,
                 )
-                self._pending_decisions.pop(oldest_camera, None)
+                self._pending_decisions.pop(oldest_key, None)
                 LOGGER.debug(
-                    "Pending plate decision evicted camera_id=%s reason=camera-limit",
-                    oldest_camera,
+                    "Pending plate decision evicted camera_id=%s track_id=%s "
+                    "reason=decision-limit",
+                    oldest_key[0],
+                    oldest_key[1],
                 )
             decision = PendingPlateDecision(
                 camera_id=camera_id,
+                track_id=candidate.track_id,
                 direction=direction,
                 last_updated_monotonic=processing_now,
                 cleanup_deadline_monotonic=(
                     processing_now + self.config.confirmation_window_seconds
                 ),
             )
-            self._pending_decisions[camera_id] = decision
+            self._pending_decisions[decision_key] = decision
 
         frame_key = candidate.frame_id
         if frame_key is None:
@@ -3003,9 +3280,10 @@ class PlateRecognitionProcessor:
             decision.deadline_monotonic = processing_now + window_seconds
             decision.min_hold_until_monotonic = processing_now + min_hold_seconds
             LOGGER.debug(
-                "Plate provisionally confirmed camera_id=%s candidate=%s "
+                "Plate provisionally confirmed camera_id=%s track_id=%s candidate=%s "
                 "deadline_ms=%s min_hold_ms=%s observations=%s",
                 camera_id,
+                candidate.track_id,
                 provisional,
                 self.config.plate_stabilization_window_ms,
                 self.config.plate_stabilization_min_hold_ms,
@@ -3129,11 +3407,12 @@ class PlateRecognitionProcessor:
             for plate, items in sorted(cluster.items())
         )
         LOGGER.debug(
-            "Plate stabilization evaluation camera_id=%s provisional=%s "
+            "Plate stabilization evaluation camera_id=%s track_id=%s provisional=%s "
             "candidates=%s winner=%s winner_votes=%s runner_up_votes=%s "
             "required_votes=%s near_conflicts=%s reliable=%s "
             "finalization=window-deadline suppression_reason=%s",
             decision.camera_id,
+            decision.track_id,
             provisional or "none",
             candidate_evidence or "none",
             winner.plate,
@@ -3157,12 +3436,14 @@ class PlateRecognitionProcessor:
     def _finalize_pending_decision(
         self,
         camera_id: int,
+        track_id: int | None = None,
     ) -> RecognitionOutcome:
-        decision = self._pending_decisions.get(camera_id)
+        decision_key = (camera_id, track_id)
+        decision = self._pending_decisions.get(decision_key)
         if decision is None:
             return self._outcome(camera_id, RecognitionState.AMBIGUOUS_DISCARDED)
         evaluation = self._evaluate_pending_decision(decision)
-        self._pending_decisions.pop(camera_id, None)
+        self._pending_decisions.pop(decision_key, None)
         winner = evaluation.winner
         if winner is None or not evaluation.reliable:
             LOGGER.debug(
@@ -3317,12 +3598,14 @@ class PlateRecognitionProcessor:
         spatial_match: bool,
     ) -> None:
         LOGGER.debug(
-            "OCR confirmation decision camera_id=%s frame_id=%s candidate=%s "
+            "OCR confirmation decision camera_id=%s track_id=%s frame_id=%s "
+            "candidate=%s "
             "raw_text=%s correction_cost=%s variant_support=%s base_required=%s "
             "effective_required=%s near_conflicts=%s candidate_votes=%s "
             "runner_up_votes=%s decision=%s suppression_reason=%s "
             "near_duplicate_match=%s spatial_match=%s job_type=%s",
             candidate.camera_id,
+            candidate.track_id,
             candidate.frame_id,
             candidate.plate,
             candidate.raw_text,
@@ -3340,11 +3623,17 @@ class PlateRecognitionProcessor:
             candidate.job_type.value if candidate.job_type is not None else "unknown",
         )
 
-    def _claim_observation_frame(self, camera_id: int, frame_id: int) -> bool:
-        recent_set = self._observation_frame_id_sets[camera_id]
+    def _claim_observation_frame(
+        self,
+        camera_id: int,
+        frame_id: int,
+        track_id: int | None = None,
+    ) -> bool:
+        scope = (camera_id, track_id)
+        recent_set = self._observation_frame_id_sets[scope]
         if frame_id in recent_set:
             return False
-        recent = self._observation_frame_ids[camera_id]
+        recent = self._observation_frame_ids[scope]
         recent.append(frame_id)
         recent_set.add(frame_id)
         while len(recent) > RECENT_PROCESSED_FRAME_ID_LIMIT:
@@ -3540,13 +3829,15 @@ class PlateRecognitionProcessor:
             RecognitionState.LOW_CONFIDENCE,
             RecognitionState.AMBIGUOUS_DISCARDED,
             RecognitionState.DUPLICATE_SUPPRESSED,
+            RecognitionState.STALE_TRACK_DROPPED,
         }:
             candidate_rejection_reason = (
                 outcome.suppression_reason or outcome.state.value.lower()
             )
         log_diagnostic = LOGGER.debug if debug_enabled else LOGGER.info
         log_diagnostic(
-            "OCR worker diagnostics camera_id=%s direction=%s brightness=%.1f "
+            "OCR worker diagnostics camera_id=%s track_id=%s direction=%s "
+            "brightness=%.1f "
             "low_light=%s profiles=%s crop_quality=%s variants=%s "
             "current_variants=%s shadow_variants=%s inference_calls=%s "
             "queue_depth=%s queue_wait_ms=%.1f "
@@ -3559,6 +3850,7 @@ class PlateRecognitionProcessor:
             "confirmation=%s/%s detector_bboxes=%s text_detection_boxes=%s "
             "raw_ocr_segments=%s variant_trace=%s",
             job.camera_id,
+            job.track_id,
             job.direction.value,
             brightness,
             (
@@ -3678,6 +3970,7 @@ class PlateOcrWorker:
             Callable[[OcrJob, RecognitionOutcome, float, float, float], None] | None
         ) = None,
         on_inference_error: Callable[[], None] | None = None,
+        track_manager: PlateTrackManager | None = None,
     ) -> None:
         self.plate_service = plate_service
         self.config = config
@@ -3688,6 +3981,7 @@ class PlateOcrWorker:
         self.on_status = on_status
         self.on_job_processed = on_job_processed
         self.on_inference_error = on_inference_error
+        self.track_manager = track_manager
         self.initialized = threading.Event()
         self.failed = threading.Event()
         self.initialization_error: Exception | None = None
@@ -3701,6 +3995,7 @@ class PlateOcrWorker:
                     provider,
                     self.plate_service,
                     self.config,
+                    track_manager=self.track_manager,
                 )
             except Exception as exc:
                 self.initialization_error = exc
@@ -3721,6 +4016,10 @@ class PlateOcrWorker:
             def emit_due_outcomes() -> bool:
                 try:
                     due_outcomes = processor.finalize_due()
+                    finalized_tracks: tuple[PlateTrackSnapshot, ...] = ()
+                    if self.track_manager is not None:
+                        self.track_manager.expire_due()
+                        finalized_tracks = self.track_manager.consume_finalized()
                 except Exception as exc:
                     LOGGER.exception("Pending OCR decision finalization failed")
                     self.on_status(
@@ -3730,6 +4029,13 @@ class PlateOcrWorker:
                     return False
                 for camera_id, due_outcome in due_outcomes:
                     self.on_outcome(camera_id, due_outcome)
+                for track in finalized_tracks:
+                    outcome = processor.finalize_track(
+                        track.camera_id,
+                        track.track_id,
+                    )
+                    if outcome is not None:
+                        self.on_outcome(track.camera_id, outcome)
                 return True
 
             recovering_from_error = False
@@ -3737,10 +4043,22 @@ class PlateOcrWorker:
                 if not emit_due_outcomes():
                     recovering_from_error = True
                 stale_before = self.job_buffer.stale_count
+                deadlines = tuple(
+                    value
+                    for value in (
+                        processor.next_pending_deadline(),
+                        (
+                            self.track_manager.next_expiration()
+                            if self.track_manager is not None
+                            else None
+                        ),
+                    )
+                    if value is not None
+                )
                 job = self.job_buffer.take(
                     self.stop_event,
                     wait=True,
-                    wake_at=processor.next_pending_deadline(),
+                    wake_at=min(deadlines, default=None),
                 )
                 stale_discarded = self.job_buffer.stale_count - stale_before
                 if stale_discarded and LOGGER.isEnabledFor(logging.DEBUG):
@@ -3772,6 +4090,9 @@ class PlateOcrWorker:
                         self.on_inference_error()
                     recovering_from_error = True
                     continue
+                finally:
+                    if self.track_manager is not None:
+                        self.track_manager.mark_ocr_finished(job.track_id)
                 if recovering_from_error:
                     self.on_status(RecognitionStatus.ACTIVE, "OCR yeniden aktif.")
                     recovering_from_error = False
@@ -3798,6 +4119,7 @@ class PlateRecognitionWorker(QObject):
     candidate_changed = Signal(int, object)
     outcome_changed = Signal(int, object)
     detections_changed = Signal(int, object)
+    tracks_changed = Signal(int, object)
     record_saved = Signal(object)
     finished = Signal()
 
@@ -3825,10 +4147,18 @@ class PlateRecognitionWorker(QObject):
         self._ingest_diagnostic_started_at: dict[int, float] = {}
         self._ingest_diagnostic_counts: dict[int, int] = {}
         self._next_frame_id = 1
+        self._track_manager = PlateTrackManager(
+            max_active_tracks_per_camera=(
+                config.max_active_plate_tracks_per_camera
+            ),
+            timeout_ms=config.plate_track_timeout_ms,
+            iou_threshold=config.plate_track_iou_threshold,
+        )
         self._job_buffer = OcrJobBuffer(
             config.max_pending_ocr_jobs_per_camera,
             config.ocr_job_max_age_ms,
             config.detector_crop_ocr_job_max_age_ms,
+            on_job_discarded=self._discard_track_job,
         )
         self._frame_buffer = PreDetectionFrameBuffer(config)
         self._replay_buffer = ReplayEventBuffer(config)
@@ -3949,6 +4279,26 @@ class PlateRecognitionWorker(QObject):
         self._wake_event.set()
         self._job_buffer.wake_all()
 
+    def _discard_track_job(self, job: OcrJob) -> None:
+        self._track_manager.mark_ocr_finished(job.track_id)
+
+    def _enqueue_ocr_job(self, job: OcrJob) -> OcrBufferAddResult | None:
+        if not self._track_manager.mark_ocr_scheduled(job.track_id):
+            LOGGER.debug(
+                "OCR job dropped because track is stale camera_id=%s "
+                "track_id=%s frame_id=%s",
+                job.camera_id,
+                job.track_id,
+                job.frame_id,
+            )
+            return None
+        result = self._job_buffer.add(job)
+        if not result.accepted:
+            self._track_manager.mark_ocr_finished(job.track_id)
+        elif result.accepted:
+            self._record_ocr_job_queued()
+        return result
+
     @Slot()
     def run(self) -> None:
         self.status_changed.emit(RecognitionStatus.INITIALIZING, "OCR başlatılıyor.")
@@ -3962,6 +4312,7 @@ class PlateRecognitionWorker(QObject):
             self.status_changed.emit,
             self._record_ocr_job_processed,
             self._record_ocr_inference_error,
+            self._track_manager,
         )
         ocr_thread = threading.Thread(
             target=ocr_worker.run,
@@ -4001,7 +4352,11 @@ class PlateRecognitionWorker(QObject):
                 self._stop_event.wait()
                 return
 
-            detector_processor = PlateDetectionProcessor(self.config, detector)
+            detector_processor = PlateDetectionProcessor(
+                self.config,
+                detector,
+                self._track_manager,
+            )
             self._detector_processor = detector_processor
             active_message = "OCR aktif."
             active_message += detector_message
@@ -4032,12 +4387,10 @@ class PlateRecognitionWorker(QObject):
                             ),
                         )
                         buffer_result = (
-                            self._job_buffer.add(result.job)
+                            self._enqueue_ocr_job(result.job)
                             if result.job is not None
                             else None
                         )
-                        if buffer_result is not None and buffer_result.accepted:
-                            self._record_ocr_job_queued()
                         self._log_event_end_fallback(
                             completed_event,
                             result,
@@ -4088,8 +4441,9 @@ class PlateRecognitionWorker(QObject):
                     continue
                 if source == "live":
                     self.detections_changed.emit(camera_id, result.detections)
+                    self.tracks_changed.emit(camera_id, result.active_tracks)
                 self._record_detector_result(bool(result.detections), result.detector_ms)
-                if result.job is None:
+                if not result.jobs:
                     if source == "live":
                         self.outcome_changed.emit(
                             camera_id,
@@ -4105,9 +4459,14 @@ class PlateRecognitionWorker(QObject):
                         camera_id, item, result, None, source
                     )
                     continue
-                buffer_result = self._job_buffer.add(result.job)
-                if buffer_result.accepted:
-                    self._record_ocr_job_queued()
+                buffer_results = [
+                    self._enqueue_ocr_job(job)
+                    for job in result.jobs
+                ]
+                buffer_result = next(
+                    (item for item in buffer_results if item is not None),
+                    None,
+                )
                 self._log_detection_diagnostics(
                     camera_id,
                     item,
@@ -4122,6 +4481,7 @@ class PlateRecognitionWorker(QObject):
             self._frame_buffer.clear()
             self._replay_buffer.clear()
             ocr_thread.join()
+            self._track_manager.clear()
             with self._lock:
                 self._latest_frames.clear()
                 self._camera_order.clear()
@@ -4228,7 +4588,10 @@ class PlateRecognitionWorker(QObject):
                 self._saved_records += 1
         if (
             outcome.candidate is not None
-            and outcome.state is not RecognitionState.LOW_CONFIDENCE
+            and outcome.state not in {
+                RecognitionState.LOW_CONFIDENCE,
+                RecognitionState.STALE_TRACK_DROPPED,
+            }
             and self._detector_processor is not None
         ):
             self._detector_processor.note_valid_candidate(
@@ -4264,7 +4627,9 @@ class PlateRecognitionWorker(QObject):
         log_diagnostic = LOGGER.debug if debug_enabled else LOGGER.info
         log_diagnostic(
             "Detector worker diagnostics camera_id=%s direction=%s detector_ms=%.1f "
-            "detector_frame_age_ms=%.1f detections=%s ocr_queue_depth=%s "
+            "detector_frame_age_ms=%.1f detections=%s active_tracks=%s "
+            "ignored_track_detections=%s ocr_jobs=%s track_ids=%s "
+            "ocr_queue_depth=%s "
             "camera_queue_depth=%s dropped=%s replaced=%s stale_total=%s "
             "fallback_reason=%s source=%s frame_id=%s original_frame_age_ms=%.1f "
             "replay_queue_depth=%s job_type=%s priority=%s detector_crop_count=%s "
@@ -4277,6 +4642,12 @@ class PlateRecognitionWorker(QObject):
             result.detector_ms,
             max(0.0, (now - item.observed_at) * 1000.0),
             len(result.detections),
+            len(result.active_tracks),
+            result.ignored_track_detections,
+            len(result.jobs),
+            ",".join(
+                str(job.track_id) for job in result.jobs if job.track_id is not None
+            ) or "none",
             self._job_buffer.pending_count(),
             0 if buffer_result is None else buffer_result.camera_depth,
             self._job_buffer.dropped_count,
@@ -4290,10 +4661,11 @@ class PlateRecognitionWorker(QObject):
             result.job.job_type.value if result.job is not None else "none",
             result.job.job_type.priority if result.job is not None else 0,
             (
-                len(result.job.ocr_crops)
-                if result.job is not None
-                and result.job.job_type is OcrJobType.DETECTOR_CROP
-                else 0
+                sum(
+                    len(job.ocr_crops)
+                    for job in result.jobs
+                    if job.job_type is OcrJobType.DETECTOR_CROP
+                )
             ),
             (
                 "no"
@@ -4521,6 +4893,7 @@ class PlateRecognitionService(QObject):
     candidate_changed = Signal(int, object)
     outcome_changed = Signal(int, object)
     detections_changed = Signal(int, object)
+    tracks_changed = Signal(int, object)
     record_saved = Signal(object)
     STOP_TIMEOUT_MS = 5_000
 
@@ -4577,6 +4950,7 @@ class PlateRecognitionService(QObject):
         worker.candidate_changed.connect(self.candidate_changed.emit)
         worker.outcome_changed.connect(self.outcome_changed.emit)
         worker.detections_changed.connect(self.detections_changed.emit)
+        worker.tracks_changed.connect(self.tracks_changed.emit)
         worker.record_saved.connect(self.record_saved.emit)
         worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.finished.connect(worker.deleteLater)

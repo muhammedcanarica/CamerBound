@@ -25,6 +25,7 @@ from app.audit import AuditService
 from app.auth import Role, SessionUser, ValidationError
 from app.camera import Camera, CameraService, CameraStatus, Direction
 from app.plate_detector import PlateDetection
+from app.plate_tracking import PlateTrackSnapshot
 from app.plate_recognition import (
     PlateCandidate,
     PlateRecognitionService,
@@ -89,6 +90,7 @@ class DashboardHome(QWidget):
         self.camera_directions: dict[int, Direction] = {}
         self._latest_images: dict[Direction, QImage] = {}
         self._plate_detections: dict[Direction, tuple[PlateDetection, ...]] = {}
+        self._plate_tracks: dict[Direction, tuple[PlateTrackSnapshot, ...]] = {}
         self._plate_detection_updated_at: dict[Direction, float] = {}
         self._ocr_display_states: dict[Direction, OcrDisplayState] = {}
         self._detector_display_states: dict[Direction, DetectorDisplayState] = {}
@@ -109,6 +111,9 @@ class DashboardHome(QWidget):
             )
             self.recognition_service.detections_changed.connect(
                 self._show_plate_detections
+            )
+            self.recognition_service.tracks_changed.connect(
+                self._show_plate_tracks
             )
             self.recognition_service.record_saved.connect(self._record_saved)
             QTimer.singleShot(0, self._sync_ocr_status)
@@ -510,6 +515,16 @@ class DashboardHome(QWidget):
             updated_at=updated_at,
         )
 
+    @Slot(int, object)
+    def _show_plate_tracks(self, camera_id: int, tracks: object) -> None:
+        direction = self.camera_directions.get(camera_id)
+        if direction is None:
+            return
+        self._plate_tracks[direction] = tuple(
+            item for item in tracks if isinstance(item, PlateTrackSnapshot)
+        )
+        self._plate_detection_updated_at[direction] = time.monotonic()
+
     def _draw_plate_detections(self, image: QImage, direction: Direction) -> None:
         if (
             self.recognition_service is None
@@ -517,18 +532,20 @@ class DashboardHome(QWidget):
             or not self.recognition_service.config.plate_detector.debug_overlay
         ):
             return
+        tracks = self._plate_tracks.get(direction, ())
         detections = self._plate_detections.get(direction, ())
-        if not detections:
+        if not tracks and not detections:
             return
         updated_at = self._plate_detection_updated_at.get(direction, 0.0)
-        # This TTL-bound ADMIN overlay is a live detector hint, not object tracking:
-        # detector results and preview frames do not share a frame_id at the UI boundary.
+        # This TTL-bound ADMIN overlay is an asynchronous live tracking hint:
+        # track snapshots and preview frames do not share a frame_id at the UI boundary.
         ttl_seconds = (
             self.recognition_service.config.plate_detector.debug_detection_overlay_ttl_ms
             / 1000.0
         )
         if time.monotonic() - updated_at > ttl_seconds:
             self._plate_detections.pop(direction, None)
+            self._plate_tracks.pop(direction, None)
             self._plate_detection_updated_at.pop(direction, None)
             return
 
@@ -537,20 +554,39 @@ class DashboardHome(QWidget):
         roi_y = round(roi.y * image.height())
         painter = QPainter(image)
         painter.setPen(QPen(QColor("#f97316"), 2))
-        for detection in detections:
-            x = roi_x + detection.x
-            y = roi_y + detection.y
-            painter.drawRect(x, y, detection.width, detection.height)
-            painter.drawText(
-                x,
-                max(14, y - 4),
-                self._detector_overlay_label(detection),
-            )
+        if tracks:
+            for track in tracks:
+                box_x, box_y, box_width, box_height = track.bbox
+                x = roi_x + box_x
+                y = roi_y + box_y
+                painter.drawRect(x, y, box_width, box_height)
+                painter.drawText(
+                    x,
+                    max(14, y - 4),
+                    self._track_overlay_label(track),
+                )
+        else:
+            for detection in detections:
+                x = roi_x + detection.x
+                y = roi_y + detection.y
+                painter.drawRect(x, y, detection.width, detection.height)
+                painter.drawText(
+                    x,
+                    max(14, y - 4),
+                    self._detector_overlay_label(detection),
+                )
         painter.end()
 
     @staticmethod
     def _detector_overlay_label(detection: PlateDetection) -> str:
         return f"DET {detection.confidence * 100:.0f}%"
+
+    @staticmethod
+    def _track_overlay_label(track: PlateTrackSnapshot) -> str:
+        label = f"T{track.track_id}"
+        if track.best_text:
+            label += f" | {track.best_text} | {track.best_confidence:.2f}"
+        return label
 
     def _clear_preview(self, direction: Direction, message: str) -> None:
         self._latest_images.pop(direction, None)

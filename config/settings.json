@@ -7,9 +7,12 @@
   },
   "plate_detection": {
     "ocr_backend": "auto",
-    "recognition_interval_ms": 250,
-    "max_pending_ocr_jobs_per_camera": 3,
-    "ocr_job_max_age_ms": 2500,
+    "recognition_interval_ms": 200,
+    "max_pending_ocr_jobs_per_camera": 5,
+    "max_active_plate_tracks_per_camera": 2,
+    "plate_track_timeout_ms": 1200,
+    "plate_track_iou_threshold": 0.25,
+    "ocr_job_max_age_ms": 5000,
     "detector_crop_ocr_job_max_age_ms": 12000,
     "ocr_cpu_threads": 4,
     "pre_detection_buffer_duration_ms": 5000,
@@ -22,7 +25,7 @@
     "max_replay_frames_per_event": 10,
     "max_pending_replay_events_per_camera": 2,
     "replay_event_max_age_ms": 8000,
-    "min_confidence": 0.65,
+    "min_confidence": 0.4,
     "confirmations_required": 2,
     "confirmation_window_seconds": 3,
     "plate_stabilization_window_ms": 2000,
@@ -47,9 +50,9 @@
     "roi": {
       "ENTRY": {
         "x": 0.004166666666666667,
-        "y": 0.4148148148148148,
+        "y": 0.4,
         "width": 0.9958333333333333,
-        "height": 0.4123456790123457
+        "height": 0.47160493827160493
       },
       "EXIT": {
         "x": 0.0017857142857142857,

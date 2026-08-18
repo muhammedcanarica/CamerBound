@@ -28,6 +28,7 @@ from app.plate_capture import PlateCaptureService
 from app.plate_detector import (
     OpenVinoPlateDetector,
     PlateDetection,
+    MIN_PLATE_CROP_ASPECT_RATIO,
     crop_padded_plate,
     plate_detection_geometry_quality,
     plate_detection_ranking_score,
@@ -300,16 +301,24 @@ def detector_crops(
         roi_width=roi.shape[1],
         roi_height=roi.shape[0],
     )
+    tiled_recovery = (
+        detector.last_diagnostics is not None
+        and detector.last_diagnostics.detector_variant == "tiled"
+    )
     padding = (
         config.plate_detector.tiled_recovery_crop_padding_ratio
-        if detector.last_diagnostics is not None
-        and detector.last_diagnostics.detector_variant == "tiled"
+        if tiled_recovery
         else config.plate_detector.crop_padding_ratio
     )
     crops: list[np.ndarray] = []
     crop_detections: list[PlateDetection] = []
     for detection in selected:
-        crop = crop_padded_plate(roi, detection, padding)
+        crop = crop_padded_plate(
+            roi,
+            detection,
+            padding,
+            minimum_aspect_ratio=MIN_PLATE_CROP_ASPECT_RATIO,
+        )
         if crop is not None:
             crops.append(crop)
             crop_detections.append(detection)
