@@ -46,6 +46,8 @@ from app.plate_service import (
 from app.plate_tracking import (
     PlateTrackManager,
     PlateTrackSnapshot,
+    bbox_iou,
+    normalized_center_distance,
 )
 from app.time_utils import as_utc, utc_now
 
@@ -3049,7 +3051,6 @@ class PlateRecognitionProcessor:
                     else None
                 ),
             )
-        if pending_decision is not None:
             evaluation = self._evaluate_pending_decision(pending_decision)
             # A missing rival before the deadline is not proof that a later frame
             # will not expose a one-character valid conflict. The configured
@@ -3071,6 +3072,20 @@ class PlateRecognitionProcessor:
             )
         confirmed = progress.candidate
         if confirmed is None:
+            if track_id is not None:
+                self._add_stabilization_evidence(
+                    candidate=candidate,
+                    camera_id=camera_id,
+                    direction=direction,
+                    observed_at=observed_at,
+                    captured_at=detection_time,
+                    full_frame=full_frame,
+                    quality_score=quality_score,
+                    detections=detections,
+                    used_roi_fallback=used_roi_fallback,
+                    processing_now=processing_now,
+                    base_confirmed_plate=None,
+                )
             state = (
                 RecognitionState.DUPLICATE_SUPPRESSED
                 if progress.suppress
@@ -3086,6 +3101,7 @@ class PlateRecognitionProcessor:
                 suppression_reason=progress.suppression_reason,
                 **detection_context,
             )
+        self._pending_decisions.pop((camera_id, track_id), None)
         if not self.presences.claim_record(confirmed):
             return self._outcome(
                 camera_id,
@@ -3645,6 +3661,16 @@ class PlateRecognitionProcessor:
                 suppression_reason = "near-conflict"
             elif correction_risk and winner_votes < RISKY_CONFIRMATIONS_REQUIRED:
                 suppression_reason = "corrected-candidate"
+            elif winner_votes == 1:
+                cand = winner_items[0].candidate
+                if not cand.detector_crop_evidence or cand.job_type is not OcrJobType.DETECTOR_CROP:
+                    suppression_reason = "fallback-only"
+                elif cand.variant_support < TRACK_END_RESCUE_MIN_VARIANT_SUPPORT:
+                    suppression_reason = "insufficient-variant-consensus"
+                elif cand.confidence < TRACK_END_RESCUE_MIN_CONFIDENCE:
+                    suppression_reason = "single-observation-low-confidence"
+                else:
+                    suppression_reason = suppression_reason or "insufficient-temporal-evidence"
             else:
                 suppression_reason = suppression_reason or "insufficient-temporal-evidence"
 
@@ -4305,7 +4331,7 @@ class PlateOcrWorker:
         on_inference_error: Callable[[], None] | None = None,
         track_manager: PlateTrackManager | None = None,
         frame_buffer: PreDetectionFrameBuffer | None = None,
-        detector_factory: Callable[[], PlateDetector] | None = None,
+        detector: PlateDetector | None = None,
     ) -> None:
         self.plate_service = plate_service
         self.config = config
@@ -4318,7 +4344,7 @@ class PlateOcrWorker:
         self.on_inference_error = on_inference_error
         self.track_manager = track_manager
         self.frame_buffer = frame_buffer
-        self.detector_factory = detector_factory
+        self.detector = detector
         self.initialized = threading.Event()
         self.failed = threading.Event()
         self.initialization_error: Exception | None = None
@@ -4328,23 +4354,11 @@ class PlateOcrWorker:
         try:
             try:
                 provider = self.provider_factory()
-                detector: PlateDetector | None = None
-                if (
-                    self.config.plate_detector.enabled
-                    and self.detector_factory is not None
-                ):
-                    try:
-                        detector = self.detector_factory()
-                    except Exception as exc:
-                        LOGGER.warning(
-                            "OCR worker detector initialization failed; falling back to ROI crops error_type=%s",
-                            type(exc).__name__,
-                        )
                 processor = PlateRecognitionProcessor(
                     provider,
                     self.plate_service,
                     self.config,
-                    detector=detector,
+                    detector=self.detector,
                     track_manager=self.track_manager,
                     frame_buffer=self.frame_buffer,
                 )
@@ -4679,7 +4693,6 @@ class PlateRecognitionWorker(QObject):
             self._record_ocr_inference_error,
             self._track_manager,
             frame_buffer=self._frame_buffer,
-            detector_factory=self.detector_factory,
         )
         ocr_thread = threading.Thread(
             target=ocr_worker.run,

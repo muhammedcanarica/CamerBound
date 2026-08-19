@@ -226,7 +226,7 @@ class PlateTextTests(unittest.TestCase):
         self.assertIsNotNone(left_second.candidate)
         self.assertEqual(left_second.candidate.plate, "34ABC123")
 
-    def test_strong_detector_consensus_confirms_from_one_observation(self) -> None:
+    def test_strong_detector_consensus_requires_two_observations(self) -> None:
         tracker = ConfirmationTracker(required=2, window_seconds=3.0)
         candidate = PlateCandidate(
             "23LR640",
@@ -239,9 +239,9 @@ class PlateTextTests(unittest.TestCase):
 
         outcome = tracker.observe_progress(candidate, 10.0, frame_id=1)
 
-        self.assertEqual(outcome.required_count, 1)
+        self.assertEqual(outcome.required_count, 2)
         self.assertEqual(outcome.observed_count, 1)
-        self.assertEqual(outcome.candidate.plate, "23LR640")
+        self.assertIsNone(outcome.candidate)
 
     def test_high_confidence_alone_does_not_confirm_from_one_observation(self) -> None:
         tracker = ConfirmationTracker(required=2, window_seconds=3.0)
@@ -842,11 +842,13 @@ class RecognitionPipelineTests(unittest.TestCase):
 
     def _run_single_observation_track_end(
         self,
-        segments: list[OcrSegment],
+        segments: list[OcrSegment] | None = None,
         *,
         frame_value: int = 37,
         fallback: bool = False,
         retire_before_result: bool = False,
+        frame_buffer: PreDetectionFrameBuffer | None = None,
+        ocr_sequences: list[list[OcrSegment]] | None = None,
     ) -> tuple[object, object, PlateRecognitionProcessor]:
         from app.plate_tracking import PlateTrackManager
 
@@ -862,14 +864,16 @@ class RecognitionPipelineTests(unittest.TestCase):
             observed_at=10.0,
             activity_at=100.0,
         ).assignments[0].track_id
+        provider_data = ocr_sequences if ocr_sequences is not None else [segments or []]
         processor = PlateRecognitionProcessor(
-            SequencedOcrProvider([segments]),
+            SequencedOcrProvider(provider_data),
             self.plate_service,
             recognition_config(
                 Path(self.temp_directory.name),
                 stabilization_window_ms=2_000,
             ),
             track_manager=track_manager,
+            frame_buffer=frame_buffer,
         )
         self.assertTrue(track_manager.mark_ocr_scheduled(track_id))
         if retire_before_result:
@@ -1072,8 +1076,18 @@ class RecognitionPipelineTests(unittest.TestCase):
             OcrSegment("30ABC130", 0.94, (0, 0, 10, 10), 0),
             OcrSegment("30 ABC 130", 0.93, (0, 0, 10, 10), 1),
         ]
-        _awaiting, first, _processor = self._run_single_observation_track_end(segments)
-        _awaiting, second, _processor = self._run_single_observation_track_end(segments)
+        buffer_1 = PreDetectionFrameBuffer(self.config)
+        buffer_1.ingest(self._make_snapshot(7990, 9.8), motion_score=0.0)
+        _awaiting, first, _processor = self._run_single_observation_track_end(
+            frame_buffer=buffer_1,
+            ocr_sequences=[segments, segments],
+        )
+        buffer_2 = PreDetectionFrameBuffer(self.config)
+        buffer_2.ingest(self._make_snapshot(7991, 9.8), motion_score=0.0)
+        _awaiting, second, _processor = self._run_single_observation_track_end(
+            frame_buffer=buffer_2,
+            ocr_sequences=[segments, segments],
+        )
 
         self.assertIs(first.state, RecognitionState.SAVED)
         self.assertIs(second.state, RecognitionState.DUPLICATE_SUPPRESSED)
@@ -5376,9 +5390,9 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(self._record_count(), 1)
 
     def test_buffered_confirmation_rescue_saves_when_second_evidence_found_in_buffer(self) -> None:
-        config = recognition_config(
-            Path(self.temp_directory.name),
-            stabilization_window_ms=2000,
+        config = replace(
+            self.config,
+            plate_stabilization_window_ms=2000,
             pre_detection_buffer_duration_ms=5000,
         )
         frame_buffer = PreDetectionFrameBuffer(config)
@@ -5520,7 +5534,7 @@ class RecognitionPipelineTests(unittest.TestCase):
                 PlateDetection(0.96, 240, 10, 80, 25),
             ),
             observed_at=10.0,
-            activity_at=100.0,
+            activity_at=10.0,
         )
         track_11, track_12 = (item.track_id for item in update.assignments)
 
@@ -5539,6 +5553,7 @@ class RecognitionPipelineTests(unittest.TestCase):
             frame_buffer=frame_buffer,
         )
         # Track 11: 1 live frame
+        track_manager.mark_ocr_scheduled(track_11)
         processor.process_ocr_job(
             self._make_ocr_job(
                 frame_id=100,
@@ -5548,7 +5563,10 @@ class RecognitionPipelineTests(unittest.TestCase):
             ),
             queue_depth=0,
         )
+        track_manager.mark_ocr_finished(track_11)
+
         # Track 12: 2 live frames
+        track_manager.mark_ocr_scheduled(track_12)
         processor.process_ocr_job(
             self._make_ocr_job(
                 frame_id=100,
@@ -5558,7 +5576,10 @@ class RecognitionPipelineTests(unittest.TestCase):
             ),
             queue_depth=1,
         )
-        processor.process_ocr_job(
+        track_manager.mark_ocr_finished(track_12)
+
+        track_manager.mark_ocr_scheduled(track_12)
+        outcome_12 = processor.process_ocr_job(
             self._make_ocr_job(
                 frame_id=102,
                 observed_at=10.2,
@@ -5567,12 +5588,17 @@ class RecognitionPipelineTests(unittest.TestCase):
             ),
             queue_depth=0,
         )
+        track_manager.mark_ocr_finished(track_12)
 
-        outcome_12 = processor.finalize_track(1, track_12)
         self.assertIsNotNone(outcome_12)
         self.assertIs(outcome_12.state, RecognitionState.SAVED)
         self.assertIs(outcome_12.finalization_source, FinalizationSource.NORMAL_CONFIRMATION)
         self.assertEqual(outcome_12.record.plate, "35XYZ789")
+
+        # Track 11 finalization without matching buffer frame discards
+        outcome_11 = processor.finalize_track(1, track_11)
+        self.assertIsNotNone(outcome_11)
+        self.assertIs(outcome_11.state, RecognitionState.AMBIGUOUS_DISCARDED)
 
     def test_pending_ocr_race_waits_for_live_ocr_before_rescue(self) -> None:
         from app.plate_tracking import PlateTrackManager
@@ -5584,7 +5610,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
         detection = PlateDetection(0.91, 20, 10, 100, 30)
         track_id = track_manager.update(
-            1, (detection,), 10.0, activity_at=100.0
+            1, (detection,), 10.0, activity_at=10.0
         ).assignments[0].track_id
         processor = PlateRecognitionProcessor(
             SequencedOcrProvider(
@@ -5598,8 +5624,9 @@ class RecognitionPipelineTests(unittest.TestCase):
             track_manager=track_manager,
         )
         track_manager.mark_ocr_scheduled(track_id)
-        track_manager.expire_due(102.0)
-        # Track is expired but has pending live OCR job
+        track_manager.mark_ocr_scheduled(track_id)
+        track_manager.expire_due(12.0)
+        # Track is expired but has 2 pending live OCR jobs
         self.assertEqual(track_manager.consume_finalized(), ())
 
         processor.process_ocr_job(
@@ -5611,7 +5638,9 @@ class RecognitionPipelineTests(unittest.TestCase):
             ),
             queue_depth=1,
         )
-        track_manager.mark_ocr_scheduled(track_id)
+        track_manager.mark_ocr_finished(track_id)
+        self.assertEqual(track_manager.consume_finalized(), ())
+
         processor.process_ocr_job(
             self._make_ocr_job(
                 frame_id=101,
@@ -5626,9 +5655,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(len(finalized_tracks), 1)
 
         outcome = processor.finalize_track(1, track_id)
-        self.assertIsNotNone(outcome)
-        self.assertIs(outcome.state, RecognitionState.SAVED)
-        self.assertIs(outcome.finalization_source, FinalizationSource.NORMAL_CONFIRMATION)
+        self.assertEqual(self._record_count(), 1)
 
     def test_double_finalization_is_idempotent(self) -> None:
         config = recognition_config(Path(self.temp_directory.name))
