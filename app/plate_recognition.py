@@ -1414,23 +1414,45 @@ class OcrJobBuffer:
                 if job.job_type is OcrJobType.ZERO_DETECTION_FALLBACK
                 else 1
             )
-            same_track_index = next(
-                (
-                    index
-                    for index, pending in enumerate(camera_jobs)
-                    if job.job_type is OcrJobType.DETECTOR_CROP
-                    and job.track_id is not None
-                    and pending.job_type is OcrJobType.DETECTOR_CROP
-                    and pending.track_id == job.track_id
-                ),
-                None,
+            same_track_indices = [
+                index
+                for index, pending in enumerate(camera_jobs)
+                if job.job_type is OcrJobType.DETECTOR_CROP
+                and job.track_id is not None
+                and pending.job_type is OcrJobType.DETECTOR_CROP
+                and pending.track_id == job.track_id
+            ]
+            same_frame_index = next(
+                (idx for idx in same_track_indices if camera_jobs[idx].frame_id == job.frame_id),
+                None
             )
-            if same_track_index is not None:
-                existing = camera_jobs[same_track_index]
+
+            if same_frame_index is not None:
+                existing = camera_jobs[same_frame_index]
                 if job.quality_score > existing.quality_score:
                     replaced_job_type = existing.job_type
                     replaced_track_id = existing.track_id
-                    del camera_jobs[same_track_index]
+                    del camera_jobs[same_frame_index]
+                    camera_jobs.append(job)
+                    replaced = 1
+                    self.replaced_count += 1
+                    self._notify_discarded(existing)
+                else:
+                    accepted = False
+                    dropped = 1
+                    coalesced = True
+                    drop_reason = "track-pending"
+                    self.dropped_count += 1
+            elif len(same_track_indices) >= 2:
+                weakest_index = min(
+                    same_track_indices,
+                    key=lambda idx: (camera_jobs[idx].quality_score, idx),
+                )
+                existing = camera_jobs[weakest_index]
+                if job.quality_score > existing.quality_score:
+                    replaced_job_type = existing.job_type
+                    replaced_track_id = existing.track_id
+                    del camera_jobs[weakest_index]
                     camera_jobs.append(job)
                     replaced = 1
                     self.replaced_count += 1

@@ -5760,6 +5760,108 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIsNone(finalized.record)
         self.assertEqual(self._record_count(), 0)
 
+
+    def test_regression_same_track_second_distinct_frame_is_accepted(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=5, max_age_ms=2_500)
+        job_a = self._make_ocr_job(camera_id=1, track_id=17, frame_id=100, quality_score=0.90)
+        job_b = self._make_ocr_job(camera_id=1, track_id=17, frame_id=102, quality_score=0.85)
+
+        res_a = buffer.add(job_a)
+        res_b = buffer.add(job_b)
+
+        self.assertTrue(res_a.accepted)
+        self.assertTrue(res_b.accepted)
+        self.assertEqual(buffer.pending_count(1), 2)
+
+    def test_regression_same_frame_is_deduplicated(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=5, max_age_ms=2_500)
+        job_a = self._make_ocr_job(camera_id=1, track_id=17, frame_id=100, quality_score=0.90)
+        job_b = self._make_ocr_job(camera_id=1, track_id=17, frame_id=100, quality_score=0.85)
+
+        res_a = buffer.add(job_a)
+        res_b = buffer.add(job_b)
+
+        self.assertTrue(res_a.accepted)
+        self.assertFalse(res_b.accepted)
+        self.assertEqual(buffer.pending_count(1), 1)
+
+    def test_regression_third_distinct_frame_coalesces_to_bounded_queue(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=5, max_age_ms=2_500)
+        job_a = self._make_ocr_job(camera_id=1, track_id=17, frame_id=100, quality_score=0.90)
+        job_b = self._make_ocr_job(camera_id=1, track_id=17, frame_id=102, quality_score=0.80)
+        job_c = self._make_ocr_job(camera_id=1, track_id=17, frame_id=104, quality_score=0.85)
+
+        buffer.add(job_a)
+        buffer.add(job_b)
+        res_c = buffer.add(job_c)
+
+        self.assertTrue(res_c.accepted)
+        self.assertEqual(buffer.pending_count(1), 2)
+        # It should replace the weakest one (job_b)
+        self.assertEqual(res_c.replaced, 1)
+
+    def test_regression_do_not_starve_second_vehicle(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=5, max_age_ms=2_500)
+        # Track A
+        buffer.add(self._make_ocr_job(camera_id=1, track_id=17, frame_id=100, quality_score=0.90))
+        buffer.add(self._make_ocr_job(camera_id=1, track_id=17, frame_id=102, quality_score=0.85))
+        # Track B
+        buffer.add(self._make_ocr_job(camera_id=1, track_id=18, frame_id=101, quality_score=0.91))
+        buffer.add(self._make_ocr_job(camera_id=1, track_id=18, frame_id=103, quality_score=0.86))
+        
+        self.assertEqual(buffer.pending_count(1), 4)
+
+
+    def test_e2e_confirmation_regression_with_live_detector_frames(self) -> None:
+        config = recognition_config(Path(self.temp_directory.name))
+        frame_buffer = PreDetectionFrameBuffer(config)
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("34ABC123", 0.95, (0, 0, 10, 10), 0)],
+                    [OcrSegment("34ABC123", 0.96, (0, 0, 10, 10), 0)],
+                ]
+            ),
+            self.plate_service,
+            config,
+            frame_buffer=frame_buffer,
+        )
+
+        track_id = 17
+        job_1 = self._make_ocr_job(frame_id=100, observed_at=10.0, track_id=track_id)
+        job_2 = self._make_ocr_job(frame_id=102, observed_at=10.1, track_id=track_id)
+
+        out_1 = processor.process_ocr_job(job_1, queue_depth=1)
+        self.assertEqual(out_1.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertEqual(out_1.confirmation_count, 1)
+
+        out_2 = processor.process_ocr_job(job_2, queue_depth=0)
+        self.assertIn(out_2.state, (RecognitionState.STABILIZING, RecognitionState.SAVED))
+        self.assertEqual(out_2.confirmation_count, 2)
+        
+        # stabilize
+        processor.finalize_track(1, track_id)
+        
+        self.assertEqual(self._record_count(), 1)
+
+    def test_e2e_failure_shape_detector_fast_producer(self) -> None:
+        buffer = OcrJobBuffer(max_per_camera=5, max_age_ms=2_500)
+        
+        track_id = 17
+        job_1 = self._make_ocr_job(frame_id=100, observed_at=10.0, track_id=track_id, quality_score=0.90)
+        job_2 = self._make_ocr_job(frame_id=102, observed_at=10.1, track_id=track_id, quality_score=0.88)
+        
+        buffer.add(job_1)
+        buffer.add(job_2)
+        
+        self.assertEqual(buffer.pending_count(1), 2)
+        taken_1 = buffer.take()
+        taken_2 = buffer.take()
+        
+        self.assertIsNotNone(taken_1)
+        self.assertIsNotNone(taken_2)
+        self.assertEqual({taken_1.frame_id, taken_2.frame_id}, {100, 102})
+
     def _record_count(self) -> int:
         with self.database.connection() as connection:
             row = connection.execute("SELECT COUNT(*) FROM plate_records").fetchone()
