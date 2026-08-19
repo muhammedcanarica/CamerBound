@@ -3241,8 +3241,7 @@ class PlateRecognitionProcessor:
         track_id: int,
         decision: PendingPlateDecision,
     ) -> bool:
-        if self.frame_buffer is None:
-            return False
+        return False
         track_key = (camera_id, track_id)
         if track_key in self._rescued_track_keys:
             return False

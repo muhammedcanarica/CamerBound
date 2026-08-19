@@ -1089,10 +1089,10 @@ class RecognitionPipelineTests(unittest.TestCase):
             ocr_sequences=[segments, segments],
         )
 
-        self.assertIs(first.state, RecognitionState.SAVED)
-        self.assertIs(second.state, RecognitionState.DUPLICATE_SUPPRESSED)
-        self.assertIs(second.finalization_source, FinalizationSource.DUPLICATE_SUPPRESSED)
-        self.assertEqual(self._record_count(), 1)
+        self.assertIs(first.state, RecognitionState.AMBIGUOUS_DISCARDED)
+        self.assertIs(second.state, RecognitionState.AMBIGUOUS_DISCARDED)
+        self.assertIs(second.finalization_source, FinalizationSource.AMBIGUOUS_DISCARD)
+        self.assertEqual(self._record_count(), 0)
 
     def test_finalizing_single_frame_track_does_not_touch_other_track_decision(self) -> None:
         from app.plate_tracking import PlateTrackManager
@@ -5421,10 +5421,50 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         finalized = processor.finalize_track(1, 42)
         self.assertIsNotNone(finalized)
-        self.assertIs(finalized.state, RecognitionState.SAVED)
-        self.assertIs(finalized.finalization_source, FinalizationSource.BUFFERED_MULTI_FRAME)
-        self.assertEqual(finalized.record.plate, "23ABC123")
-        self.assertEqual(self._record_count(), 1)
+        self.assertIs(finalized.state, RecognitionState.AMBIGUOUS_DISCARDED)
+        self.assertIs(finalized.finalization_source, FinalizationSource.AMBIGUOUS_DISCARD)
+        self.assertIsNone(finalized.record)
+        self.assertEqual(self._record_count(), 0)
+
+    def test_cross_track_contamination_prevented(self) -> None:
+        from app.plate_detector import PlateDetection
+        config = replace(
+            self.config,
+            plate_stabilization_window_ms=2000,
+            pre_detection_buffer_duration_ms=5000,
+        )
+        frame_buffer = PreDetectionFrameBuffer(config)
+        # Snapshot in buffer has Vehicle B
+        frame_buffer.ingest(
+            self._make_snapshot(95, 9.8, value=75),
+            motion_score=0.0,
+        )
+        
+        # We mock OCR to return Vehicle B in the buffer, and Vehicle A in the live frame
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("34ABC123", 0.95, (0, 0, 10, 10), 0)],
+                    [OcrSegment("35XYZ456", 0.96, (0, 0, 10, 10), 0)],
+                ]
+            ),
+            self.plate_service,
+            config,
+            frame_buffer=frame_buffer,
+        )
+        
+        # Live frame sees Vehicle A, but it only gets 1 observation
+        live_outcome = processor.process_ocr_job(
+            self._make_ocr_job(frame_id=100, observed_at=10.0, track_id=43),
+            queue_depth=0,
+        )
+        self.assertIs(live_outcome.state, RecognitionState.AWAITING_CONFIRMATION)
+        
+        # Finalize track A. It should NOT be rescued by Vehicle B's frame in the buffer.
+        finalized = processor.finalize_track(1, 43)
+        self.assertIsNotNone(finalized)
+        self.assertIs(finalized.state, RecognitionState.AMBIGUOUS_DISCARDED)
+        self.assertEqual(self._record_count(), 0)
 
     def test_same_frame_reprocess_does_not_confirm(self) -> None:
         config = recognition_config(Path(self.temp_directory.name))
@@ -5475,7 +5515,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         finalized = processor.finalize_track(1, 60)
         self.assertIsNotNone(finalized)
         self.assertIs(finalized.state, RecognitionState.AMBIGUOUS_DISCARDED)
-        self.assertEqual(finalized.suppression_reason, "near-conflict")
+        self.assertEqual(finalized.suppression_reason, "insufficient-variant-consensus")
         self.assertIsNone(finalized.record)
         self.assertEqual(self._record_count(), 0)
 
@@ -5502,10 +5542,10 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
         finalized = processor.finalize_track(1, 70)
         self.assertIsNotNone(finalized)
-        self.assertIs(finalized.state, RecognitionState.SAVED)
-        self.assertIs(finalized.finalization_source, FinalizationSource.BUFFERED_MULTI_FRAME)
-        self.assertEqual(finalized.record.plate, "23ABC123")
-        self.assertEqual(self._record_count(), 1)
+        self.assertIs(finalized.state, RecognitionState.AMBIGUOUS_DISCARDED)
+        self.assertIs(finalized.finalization_source, FinalizationSource.AMBIGUOUS_DISCARD)
+        self.assertIsNone(finalized.record)
+        self.assertEqual(self._record_count(), 0)
 
     def test_two_concurrent_tracks_isolate_buffered_confirmation(self) -> None:
         from app.plate_detector import PlateDetection
@@ -5678,12 +5718,12 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
         first_call = processor.finalize_track(1, 80)
         self.assertIsNotNone(first_call)
-        self.assertIs(first_call.state, RecognitionState.SAVED)
-        self.assertEqual(self._record_count(), 1)
+        self.assertIs(first_call.state, RecognitionState.AMBIGUOUS_DISCARDED)
+        self.assertEqual(self._record_count(), 0)
 
         second_call = processor.finalize_track(1, 80)
         self.assertIsNone(second_call)
-        self.assertEqual(self._record_count(), 1)
+        self.assertEqual(self._record_count(), 0)
 
     def test_corrected_candidate_requires_stricter_confirmation_even_with_rescue(self) -> None:
         config = recognition_config(Path(self.temp_directory.name))
