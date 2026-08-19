@@ -3873,39 +3873,27 @@ class PlateRecognitionProcessor:
     ) -> None:
         candidate = outcome.candidate if outcome is not None else None
         observations = 0
-        rivals: set[str] = set()
+        distinct_ocr_frames = 0
         if decision is not None and candidate is not None:
             observations = sum(
                 item.candidate.plate == candidate.plate for item in decision.observations
             )
-            rivals = {
-                item.candidate.plate
-                for item in decision.observations
-                if item.candidate.plate != candidate.plate
-            }
-        decision_str = "SAVED" if outcome is not None and outcome.record is not None else "DISCARDED"
-        source_str = (
-            outcome.finalization_source.value
-            if outcome is not None and outcome.finalization_source is not None
-            else "none"
-        )
-        reason_str = (
-            outcome.suppression_reason
-            if outcome is not None and outcome.suppression_reason is not None
-            else "none"
-        )
+            distinct_ocr_frames = len({item.candidate.frame_id for item in decision.observations if item.candidate.frame_id is not None})
+        
+        state_str = outcome.state.value if outcome else "UNSPECIFIED"
+        reason_str = outcome.suppression_reason if outcome else "none"
+        
         LOGGER.debug(
-            "Plate finalization camera_id=%s track_id=%s candidate=%s "
-            "matching_distinct_frames=%s conflicts=%s decision=%s "
-            "source=%s reason=%s",
+            "TRACK FINAL camera_id=%s track_id=%s best_text=%s best_confidence=%.3f "
+            "distinct_ocr_frames=%s confirmation_votes=%s final_state=%s suppression_reason=%s",
             camera_id,
             track_id,
-            candidate.plate if candidate is not None else "none",
+            candidate.plate if candidate else "none",
+            candidate.confidence if candidate else 0.0,
+            distinct_ocr_frames,
             observations,
-            ",".join(sorted(rivals)) or "none",
-            decision_str,
-            source_str,
-            reason_str,
+            state_str,
+            reason_str or "none",
         )
 
     @staticmethod

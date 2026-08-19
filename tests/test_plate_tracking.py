@@ -251,3 +251,91 @@ class TrackAwareOcrSchedulingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestEvictionAndStarvation(unittest.TestCase):
+    def test_starvation_eviction_of_unverified_track(self) -> None:
+        manager = PlateTrackManager(max_active_tracks_per_camera=2, timeout_ms=3000, iou_threshold=0.25)
+        res1 = manager.update(1, [
+            PlateDetection(confidence=0.9, x=220, y=100, width=105, height=30),
+            PlateDetection(confidence=0.5, x=40, y=95, width=55, height=24)
+        ], 10.0)
+        self.assertEqual(len(res1.active_tracks), 2)
+        
+        res2 = manager.update(1, [
+            PlateDetection(confidence=0.9, x=620, y=100, width=105, height=30)
+        ], 10.1)
+        
+        self.assertEqual(len(res2.ignored_detections), 0)
+        self.assertEqual(len(res2.active_tracks), 2)
+        
+    def test_verified_track_is_protected_from_eviction(self) -> None:
+        manager = PlateTrackManager(max_active_tracks_per_camera=2, timeout_ms=3000, iou_threshold=0.25)
+        res1 = manager.update(1, [
+            PlateDetection(confidence=0.9, x=220, y=100, width=105, height=30),
+            PlateDetection(confidence=0.5, x=40, y=95, width=55, height=24)
+        ], 10.0)
+        
+        t1_id = res1.assignments[0].track_id
+        t2_id = res1.assignments[1].track_id
+        
+        manager.mark_ocr_scheduled(t1_id)
+        manager.can_accept_ocr_result(t1_id)
+        manager.record_ocr_result(t1_id, '23AFP779', 0.95, 10.0)
+        
+        res2 = manager.update(1, [
+            PlateDetection(confidence=0.9, x=620, y=100, width=105, height=30)
+        ], 10.1)
+        
+        self.assertEqual(len(res2.ignored_detections), 0)
+        
+        active_ids = {t.track_id for t in res2.active_tracks}
+        self.assertIn(t1_id, active_ids)
+        self.assertNotIn(t2_id, active_ids)
+
+    def test_track_with_pending_ocr_is_protected_from_eviction(self) -> None:
+        manager = PlateTrackManager(max_active_tracks_per_camera=2, timeout_ms=3000, iou_threshold=0.25)
+        res1 = manager.update(1, [
+            PlateDetection(confidence=0.9, x=220, y=100, width=105, height=30),
+            PlateDetection(confidence=0.5, x=40, y=95, width=55, height=24)
+        ], 10.0)
+        
+        t1_id = res1.assignments[0].track_id
+        t2_id = res1.assignments[1].track_id
+        
+        manager.mark_ocr_scheduled(t1_id)
+        
+        res2 = manager.update(1, [
+            PlateDetection(confidence=0.9, x=620, y=100, width=105, height=30)
+        ], 10.1)
+        
+        self.assertEqual(len(res2.ignored_detections), 0)
+        active_ids = {t.track_id for t in res2.active_tracks}
+        self.assertIn(t1_id, active_ids)
+        self.assertNotIn(t2_id, active_ids)
+
+    def test_two_real_vehicles_supported(self) -> None:
+        manager = PlateTrackManager(max_active_tracks_per_camera=2, timeout_ms=3000, iou_threshold=0.25)
+        res1 = manager.update(1, [
+            PlateDetection(confidence=0.9, x=220, y=100, width=105, height=30),
+            PlateDetection(confidence=0.9, x=40, y=95, width=55, height=24)
+        ], 10.0)
+        
+        t1_id = res1.assignments[0].track_id
+        t2_id = res1.assignments[1].track_id
+        
+        manager.mark_ocr_scheduled(t1_id)
+        manager.can_accept_ocr_result(t1_id)
+        manager.record_ocr_result(t1_id, '34ABC123', 0.95, 10.0)
+        
+        manager.mark_ocr_scheduled(t2_id)
+        manager.can_accept_ocr_result(t2_id)
+        manager.record_ocr_result(t2_id, '35XYZ789', 0.95, 10.0)
+        
+        res2 = manager.update(1, [
+            PlateDetection(confidence=0.5, x=620, y=100, width=105, height=30)
+        ], 10.1)
+        
+        self.assertEqual(len(res2.ignored_detections), 1)
+        self.assertEqual(len(res2.active_tracks), 2)

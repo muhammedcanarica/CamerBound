@@ -165,13 +165,15 @@ class PlateTrackManager:
                     PlateTrackAssignment(detection, track_id, iou, distance)
                 )
                 LOGGER.debug(
-                    "Plate detection matched to track camera_id=%s track_id=%s "
-                    "iou=%.3f center_distance_ratio=%.3f bbox=%s",
+                    "Plate track assigned camera_id=%s track_id=%s type=existing "
+                    "iou=%.3f center_distance=%.3f bbox=%s best_text=%s pending_ocr=%s",
                     camera_id,
                     track_id,
                     iou,
                     distance,
                     _detection_bbox(detection),
+                    track.best_text or "none",
+                    track.pending_ocr_count,
                 )
 
             ignored: list[PlateDetection] = []
@@ -179,9 +181,34 @@ class PlateTrackManager:
                 if detection_index in used_detections:
                     continue
                 if len(active) >= self.max_active_tracks_per_camera:
-                    ignored.append(detection)
-                    self._log_track_limit(camera_id)
-                    continue
+                    evictable_tracks = []
+                    for t_id, t in active.items():
+                        if t_id in used_tracks:
+                            continue
+                        if t.best_text is not None or t.pending_ocr_count > 0:
+                            continue
+                        evictable_tracks.append(t)
+                    
+                    if evictable_tracks:
+                        evict_target = min(
+                            evictable_tracks,
+                            key=lambda t: (t.last_seen_at, t.last_detection_confidence)
+                        )
+                        active.pop(evict_target.track_id, None)
+                        evict_target.retired_at = lifecycle_at
+                        self._retired[evict_target.track_id] = evict_target
+                        self._queue_finalization_locked(evict_target)
+                        LOGGER.debug(
+                            "Plate track safely evicted to free slot for new detection "
+                            "camera_id=%s evicted_track_id=%s last_seen_age_ms=%.1f",
+                            camera_id,
+                            evict_target.track_id,
+                            max(0.0, observed_at - evict_target.last_seen_at) * 1000.0,
+                        )
+                    else:
+                        ignored.append(detection)
+                        self._log_track_limit(camera_id, active, observed_at)
+                        continue
                 track = self._create_track(
                     camera_id,
                     detection,
@@ -200,7 +227,8 @@ class PlateTrackManager:
                     )
                 )
                 LOGGER.debug(
-                    "Plate track created camera_id=%s track_id=%s bbox=%s",
+                    "Plate track assigned camera_id=%s track_id=%s type=new "
+                    "iou=0.000 center_distance=inf bbox=%s best_text=none pending_ocr=0",
                     camera_id,
                     track.track_id,
                     track.bbox,
@@ -449,17 +477,24 @@ class PlateTrackManager:
             text,
         )
 
-    def _log_track_limit(self, camera_id: int) -> None:
+    def _log_track_limit(self, camera_id: int, active: dict[int, PlateTrack], observed_at: float) -> None:
         now = time.monotonic()
         previous = self._last_limit_log_at.get(camera_id)
         if previous is not None and now - previous < TRACK_LIMIT_LOG_INTERVAL_SECONDS:
             return
         self._last_limit_log_at[camera_id] = now
+        active_details = []
+        for t in active.values():
+            active_details.append(
+                f"track_id={t.track_id} bbox={t.bbox} best_text={t.best_text} "
+                f"pending_ocr={t.pending_ocr_count} last_seen_age_ms={max(0.0, observed_at - t.last_seen_at) * 1000.0:.1f}"
+            )
         LOGGER.debug(
             "Plate detection ignored because track limit reached camera_id=%s "
-            "max_active_tracks=%s",
+            "max_active_tracks=%s active_tracks=[%s]",
             camera_id,
             self.max_active_tracks_per_camera,
+            ", ".join(active_details),
         )
 
 
