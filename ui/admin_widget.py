@@ -786,13 +786,12 @@ class CameraSettingsWidget(QWidget):
                 "Kararlar: "
                 f"bekleyen={health.awaiting_confirmation}, "
                 f"canlı-2frame={health.confirmed_live_multiframe}, "
-                f"buffer-kurtarılan={health.buffered_confirmation_succeeded}/{health.buffered_confirmation_attempted}"
+                f"kayıt={health.saved_records}"
             )
             lines.append(
                 "Discard / Ret: "
                 f"tek-frame-red={health.single_frame_discarded}, "
-                f"buffer-başarısız={health.buffered_confirmation_failed}, "
-                f"çatışma={health.buffered_confirmation_conflict}"
+                f"track-end-red={health.track_end_discarded}"
             )
             lines.append(
                 "Son OCR işi: "

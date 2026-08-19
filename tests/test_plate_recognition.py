@@ -5389,7 +5389,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(saved.record.plate, "23ABC123")
         self.assertEqual(self._record_count(), 1)
 
-    def test_buffered_confirmation_rescue_saves_when_second_evidence_found_in_buffer(self) -> None:
+    def test_track_end_does_not_use_buffered_frame_as_new_confirmation(self) -> None:
         config = replace(
             self.config,
             plate_stabilization_window_ms=2000,
@@ -5426,7 +5426,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIsNone(finalized.record)
         self.assertEqual(self._record_count(), 0)
 
-    def test_cross_track_contamination_prevented(self) -> None:
+    def test_track_end_never_consumes_other_vehicle_buffer_evidence(self) -> None:
         from app.plate_detector import PlateDetection
         config = replace(
             self.config,
@@ -5434,20 +5434,26 @@ class RecognitionPipelineTests(unittest.TestCase):
             pre_detection_buffer_duration_ms=5000,
         )
         frame_buffer = PreDetectionFrameBuffer(config)
-        # Snapshot in buffer has Vehicle B
+        # Snapshot in buffer has Vehicle B, frame 95
         frame_buffer.ingest(
             self._make_snapshot(95, 9.8, value=75),
             motion_score=0.0,
         )
+        # Snapshot in buffer has Vehicle B, frame 97
+        frame_buffer.ingest(
+            self._make_snapshot(97, 9.9, value=75),
+            motion_score=0.0,
+        )
         
-        # We mock OCR to return Vehicle B in the buffer, and Vehicle A in the live frame
+        provider = SequencedOcrProvider(
+            [
+                [OcrSegment("34ABC123", 0.95, (0, 0, 10, 10), 0)],
+                [OcrSegment("35XYZ456", 0.96, (0, 0, 10, 10), 0)],
+                [OcrSegment("35XYZ456", 0.96, (0, 0, 10, 10), 0)],
+            ]
+        )
         processor = PlateRecognitionProcessor(
-            SequencedOcrProvider(
-                [
-                    [OcrSegment("34ABC123", 0.95, (0, 0, 10, 10), 0)],
-                    [OcrSegment("35XYZ456", 0.96, (0, 0, 10, 10), 0)],
-                ]
-            ),
+            provider,
             self.plate_service,
             config,
             frame_buffer=frame_buffer,
@@ -5465,6 +5471,9 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIsNotNone(finalized)
         self.assertIs(finalized.state, RecognitionState.AMBIGUOUS_DISCARDED)
         self.assertEqual(self._record_count(), 0)
+        
+        # Buffer OCR should NEVER have been invoked during finalize_track
+        self.assertEqual(len(provider.calls), 1)
 
     def test_same_frame_reprocess_does_not_confirm(self) -> None:
         config = recognition_config(Path(self.temp_directory.name))
@@ -5519,7 +5528,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIsNone(finalized.record)
         self.assertEqual(self._record_count(), 0)
 
-    def test_buffer_recovery_across_three_frames(self) -> None:
+    def test_track_end_discards_single_observation_even_when_buffer_contains_frames(self) -> None:
         config = recognition_config(Path(self.temp_directory.name))
         frame_buffer = PreDetectionFrameBuffer(config)
         frame_buffer.ingest(self._make_snapshot(92, 9.5), motion_score=0.0)
@@ -5547,7 +5556,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIsNone(finalized.record)
         self.assertEqual(self._record_count(), 0)
 
-    def test_two_concurrent_tracks_isolate_buffered_confirmation(self) -> None:
+    def test_two_concurrent_tracks_isolate_single_observation_discard(self) -> None:
         from app.plate_detector import PlateDetection
         from app.plate_tracking import PlateTrackManager
 
@@ -5640,7 +5649,7 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIsNotNone(outcome_11)
         self.assertIs(outcome_11.state, RecognitionState.AMBIGUOUS_DISCARDED)
 
-    def test_pending_ocr_race_waits_for_live_ocr_before_rescue(self) -> None:
+    def test_pending_ocr_completes_before_track_finalization(self) -> None:
         from app.plate_tracking import PlateTrackManager
 
         track_manager = PlateTrackManager(
