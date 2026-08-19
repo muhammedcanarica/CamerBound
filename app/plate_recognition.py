@@ -131,6 +131,11 @@ SHADOW_COMPARISON_VARIANT_NAMES = (
 ROI_FALLBACK_MAX_WIDTH = 960
 SINGLE_OBSERVATION_MIN_CONFIDENCE = 0.98
 SINGLE_OBSERVATION_MIN_VARIANT_SUPPORT = 3
+# Track end is the last chance to use already-computed OCR evidence. Requiring
+# both a high score and same-frame variant consensus keeps this deliberately
+# narrower than lowering the live confirmation requirement globally.
+TRACK_END_RESCUE_MIN_CONFIDENCE = 0.92
+TRACK_END_RESCUE_MIN_VARIANT_SUPPORT = 2
 RISKY_CONFIRMATIONS_REQUIRED = 3
 POST_SAVE_CONFIRMATIONS_REQUIRED = 4
 POST_SAVE_NEAR_DUPLICATE_WINDOW_SECONDS = 45 * 60
@@ -553,21 +558,13 @@ class ConfirmationTracker:
             ) and candidates_share_spatial_session(candidate, item.candidate):
                 near_groups[item.candidate.plate].append(item)
         runner_up_votes = max((len(items) for items in near_groups.values()), default=0)
+        candidate_votes = len(exact)
         correction_risk = any(item.candidate.correction_cost > 0 for item in exact)
         effective_required = self.required
-        if (
-            len(exact) == 1
-            and candidate_qualifies_for_single_observation(exact[0].candidate)
-            and not spatial_alias
-            and post_save_near_plate is None
-        ):
-            effective_required = 1
         if correction_risk or near_groups:
             effective_required = max(effective_required, RISKY_CONFIRMATIONS_REQUIRED)
         if post_save_near_plate is not None:
             effective_required = max(effective_required, POST_SAVE_CONFIRMATIONS_REQUIRED)
-
-        candidate_votes = len(exact)
         ambiguity_margin_ok = not near_groups or candidate_votes - runner_up_votes >= 2
         detector_votes = sum(
             1 for item in exact if item.candidate.detector_crop_evidence
@@ -748,7 +745,6 @@ class PendingPlateDecision:
     representatives: dict[str, _RepresentativeFrame] = field(default_factory=dict)
     provisional_plate: str | None = None
     deadline_monotonic: float | None = None
-    min_hold_until_monotonic: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,6 +756,7 @@ class _PlateDecisionEvaluation:
     near_conflicts: tuple[str, ...]
     reliable: bool
     suppression_reason: str | None = None
+    finalization_source: FinalizationSource | None = None
 
 
 class RecognitionState(StrEnum):
@@ -774,6 +771,15 @@ class RecognitionState(StrEnum):
     STALE_TRACK_DROPPED = "STALE_TRACK_DROPPED"
 
 
+class FinalizationSource(StrEnum):
+    NORMAL_CONFIRMATION = "normal-confirmation"
+    LIVE_SINGLE_OBSERVATION = "live-single-observation"
+    TRACK_END_RESCUE = "track-end-rescue"
+    BUFFERED_MULTI_FRAME = "buffered-multiframe"
+    AMBIGUOUS_DISCARD = "ambiguous-discard"
+    DUPLICATE_SUPPRESSED = "duplicate-suppressed"
+
+
 @dataclass(frozen=True, slots=True)
 class RecognitionOutcome:
     candidate: PlateCandidate | None
@@ -785,6 +791,8 @@ class RecognitionOutcome:
     detections: tuple[PlateDetection, ...] = ()
     used_roi_fallback: bool = False
     suppression_reason: str | None = None
+    finalization_source: FinalizationSource | None = None
+    track_ended: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -813,6 +821,20 @@ class RecognitionRuntimeHealth:
     ocr_inference_errors: int = 0
     valid_candidates: int = 0
     saved_records: int = 0
+    awaiting_confirmation: int = 0
+    confirmed_live_multiframe: int = 0
+    buffered_confirmation_attempted: int = 0
+    buffered_confirmation_succeeded: int = 0
+    buffered_confirmation_failed: int = 0
+    buffered_confirmation_conflict: int = 0
+    single_frame_discarded: int = 0
+    normal_confirmed: int = 0
+    single_observation_live_confirmed: int = 0
+    track_end_rescued: int = 0
+    track_end_discarded: int = 0
+    track_end_discarded_low_confidence: int = 0
+    track_end_discarded_conflict: int = 0
+    track_end_discarded_correction: int = 0
     queue_depth: int = 0
     dropped_jobs: int = 0
     stale_jobs: int = 0
@@ -2391,12 +2413,14 @@ class PlateRecognitionProcessor:
         config: PlateRecognitionConfig,
         detector: PlateDetector | None = None,
         track_manager: PlateTrackManager | None = None,
+        frame_buffer: PreDetectionFrameBuffer | None = None,
     ) -> None:
         self.provider = provider
         self.plate_service = plate_service
         self.config = config
         self.detector = detector
         self.track_manager = track_manager
+        self.frame_buffer = frame_buffer
         self.confirmations = ConfirmationTracker(
             config.confirmations_required,
             config.confirmation_window_seconds,
@@ -2420,6 +2444,7 @@ class PlateRecognitionProcessor:
         self._pending_decisions: dict[
             tuple[int, int | None], PendingPlateDecision
         ] = {}
+        self._rescued_track_keys: set[tuple[int, int]] = set()
         self._evidence_sequence = 0
 
     def process(
@@ -3070,6 +3095,7 @@ class PlateRecognitionProcessor:
                 confirmation_required=progress.required_count,
                 duplicate=True,
                 suppression_reason="active-presence",
+                finalization_source=FinalizationSource.DUPLICATE_SUPPRESSED,
                 **detection_context,
             )
         try:
@@ -3100,6 +3126,7 @@ class PlateRecognitionProcessor:
                 confirmation_required=progress.required_count,
                 duplicate=True,
                 suppression_reason=exc.reason.value,
+                finalization_source=FinalizationSource.DUPLICATE_SUPPRESSED,
                 **detection_context,
             )
         except Exception:
@@ -3114,6 +3141,7 @@ class PlateRecognitionProcessor:
             record=record,
             confirmation_count=progress.observed_count,
             confirmation_required=progress.required_count,
+            finalization_source=FinalizationSource.NORMAL_CONFIRMATION,
             **detection_context,
         )
 
@@ -3137,7 +3165,14 @@ class PlateRecognitionProcessor:
         outcomes: list[tuple[int, RecognitionOutcome]] = []
         for decision_key, decision in tuple(self._pending_decisions.items()):
             if decision.provisional_plate is None:
-                if current >= decision.cleanup_deadline_monotonic:
+                # Track-scoped evidence is owned by the track lifecycle. The OCR
+                # loop checks decision deadlines before track expiration, so
+                # clearing it here could erase a 1/2 observation immediately
+                # before finalize_track gets its only rescue opportunity.
+                if (
+                    decision.track_id is None
+                    and current >= decision.cleanup_deadline_monotonic
+                ):
                     self._pending_decisions.pop(decision_key, None)
                 continue
             if (
@@ -3164,25 +3199,213 @@ class PlateRecognitionProcessor:
         decision = self._pending_decisions.get(key)
         try:
             if decision is None:
+                self._log_track_final_decision(camera_id, track_id, None, None)
                 return None
-            if decision.provisional_plate is None:
-                self._pending_decisions.pop(key, None)
-                evaluation = self._evaluate_pending_decision(decision)
-                return self._outcome(
-                    camera_id,
-                    RecognitionState.AMBIGUOUS_DISCARDED,
-                    candidate=evaluation.winner,
-                    confirmation_count=evaluation.winner_votes,
-                    confirmation_required=evaluation.required_votes,
-                    suppression_reason=(
-                        evaluation.suppression_reason or "insufficient-evidence"
-                    ),
-                )
-            return self._finalize_pending_decision(camera_id, track_id)
+            buffered_rescued = self._attempt_buffered_confirmation_rescue(
+                camera_id,
+                track_id,
+                decision,
+            )
+            outcome = self._finalize_pending_decision(
+                camera_id,
+                track_id,
+                track_ended=True,
+                buffered_rescued=buffered_rescued,
+            )
+            self._log_track_final_decision(camera_id, track_id, decision, outcome)
+            return outcome
         finally:
             self.confirmations.clear_track(camera_id, track_id)
             self._observation_frame_ids.pop(key, None)
             self._observation_frame_id_sets.pop(key, None)
+
+    def _attempt_buffered_confirmation_rescue(
+        self,
+        camera_id: int,
+        track_id: int,
+        decision: PendingPlateDecision,
+    ) -> bool:
+        if self.frame_buffer is None:
+            return False
+        track_key = (camera_id, track_id)
+        if track_key in self._rescued_track_keys:
+            return False
+        self._rescued_track_keys.add(track_key)
+
+        if not decision.observations:
+            return False
+
+        evaluation = self._evaluate_pending_decision(decision, track_ended=False)
+        if evaluation.reliable:
+            return False
+
+        leader = evaluation.winner
+        if leader is None or not TurkishPlateValidator.is_valid(leader.plate):
+            return False
+
+        snapshots = self.frame_buffer.snapshots(camera_id)
+        if not snapshots:
+            return False
+
+        existing_frame_ids = set(decision.frame_keys)
+        for obs in decision.observations:
+            if obs.candidate.frame_id is not None:
+                existing_frame_ids.add(obs.candidate.frame_id)
+
+        leader_observed_at = decision.observations[-1].observed_at
+
+        candidates = [
+            s
+            for s in snapshots
+            if s.frame_id not in existing_frame_ids
+            and crop_roi(s.full_frame, self.config.roi_for(s.direction)) is not None
+        ]
+        if not candidates:
+            return False
+
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                _snapshot_roi_quality(item, self.config.roi_for),
+                -abs(item.observed_at - leader_observed_at),
+            ),
+            reverse=True,
+        )
+
+        selected: list[FrameSnapshot] = []
+        for item in ranked:
+            if not selected or all(
+                abs(item.observed_at - s.observed_at) >= 0.150 for s in selected
+            ):
+                selected.append(item)
+            if len(selected) >= 3:
+                break
+        if not selected and ranked:
+            selected = ranked[:3]
+
+        rescued_any = False
+        for snapshot in selected:
+            roi_crop = crop_roi(
+                snapshot.full_frame,
+                self.config.roi_for(snapshot.direction),
+            )
+            if roi_crop is None:
+                continue
+
+            candidate_found: PlateCandidate | None = None
+            candidate_detection: PlateDetection | None = None
+            plate_crop: np.ndarray | None = None
+
+            if self.detector is not None:
+                try:
+                    detections = self.detector.detect(roi_crop)
+                except Exception:
+                    detections = []
+                selected_dets = select_plate_detections(
+                    detections,
+                    self.config.plate_detector.max_plate_candidates_per_frame,
+                    roi_width=roi_crop.shape[1],
+                    roi_height=roi_crop.shape[0],
+                )
+                matched_detection: PlateDetection | None = None
+                best_score = -1.0
+                for det in selected_dets:
+                    det_bbox = (det.x, det.y, det.width, det.height)
+                    if leader.detector_bbox is not None:
+                        ref_bbox = (
+                            int(leader.detector_bbox[0]),
+                            int(leader.detector_bbox[1]),
+                            int(leader.detector_bbox[2]),
+                            int(leader.detector_bbox[3]),
+                        )
+                        iou = bbox_iou(det_bbox, ref_bbox)
+                        dist = normalized_center_distance(det_bbox, ref_bbox)
+                    else:
+                        iou = 0.5
+                        dist = 0.5
+                    if iou >= 0.10 or dist <= 1.5:
+                        score = iou - dist * 0.1
+                        if score > best_score:
+                            best_score = score
+                            matched_detection = det
+
+                if matched_detection is not None:
+                    plate_crop = crop_padded_plate(
+                        roi_crop,
+                        matched_detection,
+                        self.config.plate_detector.crop_padding_ratio,
+                        minimum_aspect_ratio=MIN_PLATE_CROP_ASPECT_RATIO,
+                    )
+                    if plate_crop is not None:
+                        det_ocr = recognize_detector_crops(
+                            self.provider,
+                            (plate_crop,),
+                            camera_id,
+                            self.config.min_confidence,
+                            crop_detections=(matched_detection,),
+                        )
+                        candidate_found = det_ocr.candidate
+                        candidate_detection = matched_detection
+            else:
+                crop_variants = preprocess_variants(
+                    roi_crop,
+                    brightness=roi_mean_brightness(roi_crop),
+                )
+                segments = self.provider.recognize(crop_variants)
+                candidate_found = select_best_candidate(segments, camera_id)
+
+            if (
+                candidate_found is not None
+                and candidate_found.confidence >= self.config.min_confidence
+            ):
+                tagged_candidate = replace(
+                    candidate_found,
+                    frame_id=snapshot.frame_id,
+                    observed_at=snapshot.observed_at,
+                    camera_id=camera_id,
+                    track_id=track_id,
+                    detector_crop_evidence=(
+                        candidate_detection is not None
+                        or leader.detector_crop_evidence
+                    ),
+                )
+                self._add_stabilization_evidence(
+                    candidate=tagged_candidate,
+                    camera_id=camera_id,
+                    direction=snapshot.direction,
+                    observed_at=snapshot.observed_at,
+                    captured_at=snapshot.captured_at,
+                    full_frame=snapshot.full_frame,
+                    quality_score=ocr_job_quality_score(
+                        (roi_crop if plate_crop is None else plate_crop,),
+                        (
+                            ()
+                            if candidate_detection is None
+                            else (candidate_detection,)
+                        ),
+                    ),
+                    detections=(
+                        ()
+                        if candidate_detection is None
+                        else (candidate_detection,)
+                    ),
+                    used_roi_fallback=candidate_detection is None,
+                    processing_now=time.monotonic(),
+                    base_confirmed_plate=None,
+                )
+                self.confirmations.observe_progress(
+                    tagged_candidate,
+                    snapshot.observed_at,
+                    frame_id=snapshot.frame_id,
+                )
+                eval_check = self._evaluate_pending_decision(
+                    decision, track_ended=True
+                )
+                if eval_check.reliable:
+                    rescued_any = True
+                    break
+
+        return rescued_any
 
     def clear_pending_decisions(self) -> None:
         self._pending_decisions.clear()
@@ -3300,18 +3523,15 @@ class PlateRecognitionProcessor:
         ):
             provisional = base_confirmed_plate
             window_seconds = self.config.plate_stabilization_window_ms / 1000.0
-            min_hold_seconds = self.config.plate_stabilization_min_hold_ms / 1000.0
             decision.provisional_plate = provisional
             decision.deadline_monotonic = processing_now + window_seconds
-            decision.min_hold_until_monotonic = processing_now + min_hold_seconds
             LOGGER.debug(
                 "Plate provisionally confirmed camera_id=%s track_id=%s candidate=%s "
-                "deadline_ms=%s min_hold_ms=%s observations=%s",
+                "deadline_ms=%s observations=%s",
                 camera_id,
                 candidate.track_id,
                 provisional,
                 self.config.plate_stabilization_window_ms,
-                self.config.plate_stabilization_min_hold_ms,
                 len(decision.observations),
             )
         return decision
@@ -3319,6 +3539,9 @@ class PlateRecognitionProcessor:
     def _evaluate_pending_decision(
         self,
         decision: PendingPlateDecision,
+        *,
+        track_ended: bool = False,
+        buffered_rescued: bool = False,
     ) -> _PlateDecisionEvaluation:
         if not decision.observations:
             return _PlateDecisionEvaluation(None, 0, 0, 1, (), False)
@@ -3366,12 +3589,6 @@ class PlateRecognitionProcessor:
         runner_up_votes = max((len(items) for items in competing.values()), default=0)
         correction_risk = any(item.candidate.correction_cost > 0 for item in winner_items)
         required_votes = self.config.confirmations_required
-        single_observation_fast_path = (
-            winner_votes == 1
-            and candidate_qualifies_for_single_observation(winner_items[0].candidate)
-        )
-        if single_observation_fast_path:
-            required_votes = 1
         if correction_risk or competing:
             required_votes = max(required_votes, RISKY_CONFIRMATIONS_REQUIRED)
 
@@ -3422,7 +3639,15 @@ class PlateRecognitionProcessor:
         )
         near_conflicts = tuple(sorted(competing))
         if not reliable and suppression_reason is None and competing:
-            suppression_reason = "near-duplicate-ambiguity"
+            suppression_reason = "near-conflict"
+        if track_ended and not reliable:
+            if competing:
+                suppression_reason = "near-conflict"
+            elif correction_risk and winner_votes < RISKY_CONFIRMATIONS_REQUIRED:
+                suppression_reason = "corrected-candidate"
+            else:
+                suppression_reason = suppression_reason or "insufficient-temporal-evidence"
+
         confidence = sum(item.candidate.confidence for item in winner_items) / winner_votes
         winner = replace(winner, confidence=confidence)
         candidate_evidence = "|".join(
@@ -3440,8 +3665,7 @@ class PlateRecognitionProcessor:
         LOGGER.debug(
             "Plate stabilization evaluation camera_id=%s track_id=%s provisional=%s "
             "candidates=%s winner=%s winner_votes=%s runner_up_votes=%s "
-            "required_votes=%s single_observation_fast_path=%s "
-            "near_conflicts=%s reliable=%s "
+            "required_votes=%s near_conflicts=%s reliable=%s "
             "finalization=window-deadline suppression_reason=%s",
             decision.camera_id,
             decision.track_id,
@@ -3451,7 +3675,6 @@ class PlateRecognitionProcessor:
             winner_votes,
             runner_up_votes,
             required_votes,
-            "yes" if single_observation_fast_path else "no",
             ",".join(near_conflicts) or "none",
             reliable,
             suppression_reason or "none",
@@ -3464,18 +3687,34 @@ class PlateRecognitionProcessor:
             near_conflicts=near_conflicts,
             reliable=reliable,
             suppression_reason=suppression_reason,
+            finalization_source=(
+                FinalizationSource.BUFFERED_MULTI_FRAME
+                if reliable and buffered_rescued
+                else FinalizationSource.NORMAL_CONFIRMATION
+                if reliable
+                else FinalizationSource.AMBIGUOUS_DISCARD
+                if track_ended
+                else None
+            ),
         )
 
     def _finalize_pending_decision(
         self,
         camera_id: int,
         track_id: int | None = None,
+        *,
+        track_ended: bool = False,
+        buffered_rescued: bool = False,
     ) -> RecognitionOutcome:
         decision_key = (camera_id, track_id)
         decision = self._pending_decisions.get(decision_key)
         if decision is None:
             return self._outcome(camera_id, RecognitionState.AMBIGUOUS_DISCARDED)
-        evaluation = self._evaluate_pending_decision(decision)
+        evaluation = self._evaluate_pending_decision(
+            decision,
+            track_ended=track_ended,
+            buffered_rescued=buffered_rescued,
+        )
         self._pending_decisions.pop(decision_key, None)
         winner = evaluation.winner
         if winner is None or not evaluation.reliable:
@@ -3488,7 +3727,7 @@ class PlateRecognitionProcessor:
                 evaluation.required_votes,
                 evaluation.runner_up_votes,
                 ",".join(evaluation.near_conflicts) or "none",
-                evaluation.suppression_reason or "insufficient-evidence",
+                evaluation.suppression_reason or "insufficient-temporal-evidence",
             )
             return self._outcome(
                 camera_id,
@@ -3497,8 +3736,13 @@ class PlateRecognitionProcessor:
                 confirmation_count=evaluation.winner_votes,
                 confirmation_required=evaluation.required_votes,
                 suppression_reason=(
-                    evaluation.suppression_reason or "insufficient-evidence"
+                    evaluation.suppression_reason or "insufficient-temporal-evidence"
                 ),
+                finalization_source=(
+                    evaluation.finalization_source
+                    or FinalizationSource.AMBIGUOUS_DISCARD
+                ),
+                track_ended=track_ended,
             )
 
         representative = decision.representatives.get(winner.plate)
@@ -3516,6 +3760,8 @@ class PlateRecognitionProcessor:
                 confirmation_count=evaluation.winner_votes,
                 confirmation_required=evaluation.required_votes,
                 suppression_reason="representative-frame-missing",
+                finalization_source=FinalizationSource.AMBIGUOUS_DISCARD,
+                track_ended=track_ended,
             )
         if not self.presences.claim_record(winner):
             return self._outcome(
@@ -3528,6 +3774,8 @@ class PlateRecognitionProcessor:
                 suppression_reason="active-presence",
                 detections=representative.detections,
                 used_roi_fallback=representative.used_roi_fallback,
+                finalization_source=FinalizationSource.DUPLICATE_SUPPRESSED,
+                track_ended=track_ended,
             )
         try:
             record = self.plate_service.save_plate_detection(
@@ -3548,6 +3796,8 @@ class PlateRecognitionProcessor:
                 suppression_reason=exc.reason.value,
                 detections=representative.detections,
                 used_roi_fallback=representative.used_roi_fallback,
+                finalization_source=FinalizationSource.DUPLICATE_SUPPRESSED,
+                track_ended=track_ended,
             )
         except Exception:
             self.presences.release_record_claim(winner)
@@ -3563,6 +3813,52 @@ class PlateRecognitionProcessor:
             confirmation_required=evaluation.required_votes,
             detections=representative.detections,
             used_roi_fallback=representative.used_roi_fallback,
+            finalization_source=evaluation.finalization_source,
+            track_ended=track_ended,
+        )
+
+    @staticmethod
+    def _log_track_final_decision(
+        camera_id: int,
+        track_id: int,
+        decision: PendingPlateDecision | None,
+        outcome: RecognitionOutcome | None,
+    ) -> None:
+        candidate = outcome.candidate if outcome is not None else None
+        observations = 0
+        rivals: set[str] = set()
+        if decision is not None and candidate is not None:
+            observations = sum(
+                item.candidate.plate == candidate.plate for item in decision.observations
+            )
+            rivals = {
+                item.candidate.plate
+                for item in decision.observations
+                if item.candidate.plate != candidate.plate
+            }
+        decision_str = "SAVED" if outcome is not None and outcome.record is not None else "DISCARDED"
+        source_str = (
+            outcome.finalization_source.value
+            if outcome is not None and outcome.finalization_source is not None
+            else "none"
+        )
+        reason_str = (
+            outcome.suppression_reason
+            if outcome is not None and outcome.suppression_reason is not None
+            else "none"
+        )
+        LOGGER.debug(
+            "Plate finalization camera_id=%s track_id=%s candidate=%s "
+            "matching_distinct_frames=%s conflicts=%s decision=%s "
+            "source=%s reason=%s",
+            camera_id,
+            track_id,
+            candidate.plate if candidate is not None else "none",
+            observations,
+            ",".join(sorted(rivals)) or "none",
+            decision_str,
+            source_str,
+            reason_str,
         )
 
     @staticmethod
@@ -3686,6 +3982,8 @@ class PlateRecognitionProcessor:
         detections: tuple[PlateDetection, ...] = (),
         used_roi_fallback: bool = False,
         suppression_reason: str | None = None,
+        finalization_source: FinalizationSource | None = None,
+        track_ended: bool = False,
     ) -> RecognitionOutcome:
         signature = (state, candidate.plate if candidate is not None else None)
         if (
@@ -3710,6 +4008,8 @@ class PlateRecognitionProcessor:
             detections=detections,
             used_roi_fallback=used_roi_fallback,
             suppression_reason=suppression_reason,
+            finalization_source=finalization_source,
+            track_ended=track_ended,
         )
 
     def _log_ocr_diagnostics(
@@ -4004,6 +4304,8 @@ class PlateOcrWorker:
         ) = None,
         on_inference_error: Callable[[], None] | None = None,
         track_manager: PlateTrackManager | None = None,
+        frame_buffer: PreDetectionFrameBuffer | None = None,
+        detector_factory: Callable[[], PlateDetector] | None = None,
     ) -> None:
         self.plate_service = plate_service
         self.config = config
@@ -4015,6 +4317,8 @@ class PlateOcrWorker:
         self.on_job_processed = on_job_processed
         self.on_inference_error = on_inference_error
         self.track_manager = track_manager
+        self.frame_buffer = frame_buffer
+        self.detector_factory = detector_factory
         self.initialized = threading.Event()
         self.failed = threading.Event()
         self.initialization_error: Exception | None = None
@@ -4024,11 +4328,25 @@ class PlateOcrWorker:
         try:
             try:
                 provider = self.provider_factory()
+                detector: PlateDetector | None = None
+                if (
+                    self.config.plate_detector.enabled
+                    and self.detector_factory is not None
+                ):
+                    try:
+                        detector = self.detector_factory()
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "OCR worker detector initialization failed; falling back to ROI crops error_type=%s",
+                            type(exc).__name__,
+                        )
                 processor = PlateRecognitionProcessor(
                     provider,
                     self.plate_service,
                     self.config,
+                    detector=detector,
                     track_manager=self.track_manager,
+                    frame_buffer=self.frame_buffer,
                 )
             except Exception as exc:
                 self.initialization_error = exc
@@ -4213,6 +4531,20 @@ class PlateRecognitionWorker(QObject):
         self._ocr_inference_errors = 0
         self._valid_candidates = 0
         self._saved_records = 0
+        self._awaiting_confirmation = 0
+        self._confirmed_live_multiframe = 0
+        self._buffered_confirmation_attempted = 0
+        self._buffered_confirmation_succeeded = 0
+        self._buffered_confirmation_failed = 0
+        self._buffered_confirmation_conflict = 0
+        self._single_frame_discarded = 0
+        self._normal_confirmed = 0
+        self._single_observation_live_confirmed = 0
+        self._track_end_rescued = 0
+        self._track_end_discarded = 0
+        self._track_end_discarded_low_confidence = 0
+        self._track_end_discarded_conflict = 0
+        self._track_end_discarded_correction = 0
         self._last_frame_at: float | None = None
         self._last_ocr_job_at: float | None = None
         self._last_inference_ok: bool | None = None
@@ -4346,6 +4678,8 @@ class PlateRecognitionWorker(QObject):
             self._record_ocr_job_processed,
             self._record_ocr_inference_error,
             self._track_manager,
+            frame_buffer=self._frame_buffer,
+            detector_factory=self.detector_factory,
         )
         ocr_thread = threading.Thread(
             target=ocr_worker.run,
@@ -4541,6 +4875,28 @@ class PlateRecognitionWorker(QObject):
                 "ocr_inference_errors": self._ocr_inference_errors,
                 "valid_candidates": self._valid_candidates,
                 "saved_records": self._saved_records,
+                "awaiting_confirmation": self._awaiting_confirmation,
+                "confirmed_live_multiframe": self._confirmed_live_multiframe,
+                "buffered_confirmation_attempted": (
+                    self._buffered_confirmation_attempted
+                    if self._buffered_confirmation_attempted > 0
+                    else (
+                        self._buffered_confirmation_succeeded
+                        + self._buffered_confirmation_failed
+                        + self._buffered_confirmation_conflict
+                    )
+                ),
+                "buffered_confirmation_succeeded": self._buffered_confirmation_succeeded,
+                "buffered_confirmation_failed": self._buffered_confirmation_failed,
+                "buffered_confirmation_conflict": self._buffered_confirmation_conflict,
+                "single_frame_discarded": self._single_frame_discarded,
+                "normal_confirmed": self._normal_confirmed,
+                "single_observation_live_confirmed": self._single_observation_live_confirmed,
+                "track_end_rescued": self._track_end_rescued,
+                "track_end_discarded": self._track_end_discarded,
+                "track_end_discarded_low_confidence": self._track_end_discarded_low_confidence,
+                "track_end_discarded_conflict": self._track_end_discarded_conflict,
+                "track_end_discarded_correction": self._track_end_discarded_correction,
                 "last_frame_age_seconds": (
                     None
                     if self._last_frame_at is None
@@ -4619,6 +4975,50 @@ class PlateRecognitionWorker(QObject):
                 self._last_candidate = outcome.candidate.plate
             if outcome.record is not None:
                 self._saved_records += 1
+            if outcome.state is RecognitionState.AWAITING_CONFIRMATION:
+                self._awaiting_confirmation += 1
+            if outcome.record is not None:
+                if outcome.finalization_source in {
+                    FinalizationSource.NORMAL_CONFIRMATION,
+                    FinalizationSource.LIVE_SINGLE_OBSERVATION,
+                }:
+                    self._normal_confirmed += 1
+                    self._confirmed_live_multiframe += 1
+                elif outcome.finalization_source in {
+                    FinalizationSource.BUFFERED_MULTI_FRAME,
+                    FinalizationSource.TRACK_END_RESCUE,
+                }:
+                    self._track_end_rescued += 1
+                    self._buffered_confirmation_succeeded += 1
+            if (
+                outcome.state is RecognitionState.AMBIGUOUS_DISCARDED
+                and outcome.finalization_source is FinalizationSource.AMBIGUOUS_DISCARD
+                and outcome.track_ended
+            ):
+                self._track_end_discarded += 1
+                self._single_frame_discarded += 1
+                reason = outcome.suppression_reason or ""
+                if reason in {
+                    "insufficient-temporal-evidence",
+                    "single-observation-low-confidence",
+                    "insufficient-variant-consensus",
+                    "fallback-only",
+                    "track-assignment-uncertain",
+                }:
+                    self._track_end_discarded_low_confidence += 1
+                    self._buffered_confirmation_failed += 1
+                elif reason in {
+                    "near-duplicate-ambiguity",
+                    "near-conflict",
+                    "multiple-valid-candidates",
+                    "spatial-alias",
+                    "post-save-near-duplicate",
+                }:
+                    self._track_end_discarded_conflict += 1
+                    self._buffered_confirmation_conflict += 1
+                elif reason == "corrected-candidate":
+                    self._track_end_discarded_correction += 1
+                    self._buffered_confirmation_failed += 1
         if (
             outcome.candidate is not None
             and outcome.state not in {

@@ -176,7 +176,6 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(config.confirmation_window_seconds, 3)
         self.assertEqual(config.duplicate_cooldown_seconds, 10)
         self.assertEqual(config.plate_stabilization_window_ms, 2000)
-        self.assertEqual(config.plate_stabilization_min_hold_ms, 500)
 
     def test_missing_ocr_sampling_interval_defaults_to_250(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
@@ -198,9 +197,8 @@ class PlateRecognitionConfigTests(unittest.TestCase):
         self.assertEqual(config.confirmations_required, 2)
         self.assertEqual(config.duplicate_cooldown_seconds, 120)
         self.assertEqual(config.plate_stabilization_window_ms, 2000)
-        self.assertEqual(config.plate_stabilization_min_hold_ms, 500)
 
-    def test_stabilization_settings_enforce_safe_bounds_and_hold_window(self) -> None:
+    def test_stabilization_window_enforces_safe_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             settings_path = Path(temp_directory) / "settings.json"
             settings_path.write_text(
@@ -208,8 +206,7 @@ class PlateRecognitionConfigTests(unittest.TestCase):
                     {
                         "database_path": "test.db",
                         "plate_detection": {
-                            "plate_stabilization_window_ms": 1000,
-                            "plate_stabilization_min_hold_ms": 4000,
+                            "plate_stabilization_window_ms": 20_000,
                         },
                     }
                 ),
@@ -218,10 +215,9 @@ class PlateRecognitionConfigTests(unittest.TestCase):
 
             config = load_config(settings_path).plate_recognition
 
-        self.assertEqual(config.plate_stabilization_window_ms, 1000)
-        self.assertEqual(config.plate_stabilization_min_hold_ms, 1000)
+        self.assertEqual(config.plate_stabilization_window_ms, 2_000)
         self.assertTrue(
-            any("karar penceresini aşamaz" in warning for warning in config.warnings)
+            any("plate_stabilization_window_ms" in warning for warning in config.warnings)
         )
 
     def test_plate_capture_defaults_and_invalid_values_use_safe_fallbacks(self) -> None:
