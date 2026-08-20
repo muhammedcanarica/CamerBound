@@ -358,7 +358,6 @@ class DashboardHome(QWidget):
         state_texts = {
             RecognitionState.LOW_CONFIDENCE: "Okuma yeterli değil, kaydedilmedi",
             RecognitionState.SAVED: "Kaydedildi",
-            RecognitionState.DUPLICATE_SUPPRESSED: "Zaten kaydedildi",
             RecognitionState.AMBIGUOUS_DISCARDED: "Kararsız okuma, kaydedilmedi",
         }
         if outcome.state is RecognitionState.AWAITING_CONFIRMATION:
@@ -368,6 +367,56 @@ class DashboardHome(QWidget):
             )
         elif outcome.state is RecognitionState.STABILIZING:
             state_text = "Karar stabilize ediliyor"
+        elif outcome.state is RecognitionState.DUPLICATE_SUPPRESSED:
+            suppression_key = (outcome.suppression_reason or "").upper().replace(
+                "-", "_"
+            )
+            state_text = {
+                "SAME_FRAME_OBSERVATION": "Aynı kare, yeni doğrulama sayılmadı",
+                "EXACT_COOLDOWN": "Tekrar kayıt engellendi (EXACT_COOLDOWN)",
+                "SAME_DIRECTION_STATE": (
+                    "Aynı yön kısa süreli tekrar koruması (SAME_DIRECTION_STATE)"
+                ),
+                "ACTIVE_PRESENCE": (
+                    "Araç hâlâ aktif görünümde (ACTIVE_PRESENCE)"
+                ),
+                "STALE_HISTORICAL": (
+                    "Eski zamanlı sonuç reddedildi (STALE_HISTORICAL)"
+                ),
+            }.get(suppression_key, "Zaten kaydedildi")
+        elif outcome.state is RecognitionState.AMBIGUOUS_DISCARDED:
+            suppression_key = (outcome.suppression_reason or "").upper().replace(
+                "-", "_"
+            )
+            state_text = {
+                "INSUFFICIENT_TEMPORAL_EVIDENCE": (
+                    "Kaydedilmedi: yetersiz ikinci kare"
+                ),
+                "INSUFFICIENT_VARIANT_CONSENSUS": (
+                    "Kaydedilmedi: yetersiz ikinci kare"
+                ),
+                "SINGLE_OBSERVATION_LOW_CONFIDENCE": (
+                    "Kaydedilmedi: yetersiz ikinci kare"
+                ),
+                "FALLBACK_ONLY": "Kaydedilmedi: yetersiz ikinci kare",
+                "NEAR_CONFLICT": "Kaydedilmedi: çelişkili plaka adayları",
+                "CORRECTED_CANDIDATE": (
+                    "Kaydedilmedi: düzeltilmiş aday için kanıt yetersiz"
+                ),
+                "REPRESENTATIVE_FRAME_MISSING": (
+                    "Kaydedilmedi: kayıt karesi bulunamadı"
+                ),
+            }.get(
+                suppression_key,
+                "Kaydedilmedi: track sona erdi"
+                if outcome.track_ended
+                else "Kararsız okuma, kaydedilmedi",
+            )
+        elif outcome.state is RecognitionState.STALE_TRACK_DROPPED:
+            state_text = "Kaydedilmedi: stale track sonucu"
+        elif outcome.state is RecognitionState.PERSISTENCE_ERROR:
+            exception_class = outcome.persistence_exception_class or "UNKNOWN"
+            state_text = f"Kaydedilmedi: kayıt hatası ({exception_class})"
         else:
             state_text = state_texts.get(outcome.state, "Plaka aranıyor")
         card.ocr_status.setText(

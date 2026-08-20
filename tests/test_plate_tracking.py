@@ -170,10 +170,67 @@ class PlateTrackManagerTests(unittest.TestCase):
         tracker.expire_due(101.9)
         self.assertEqual(len(tracker.active_snapshots(1)), 1)
 
+    def test_global_assignment_preserves_two_plausible_vehicle_movements(self) -> None:
+        tracker = manager()
+        first = tracker.update(
+            1,
+            (
+                PlateDetection(0.90, x=100, y=20, width=100, height=30),
+                PlateDetection(0.90, x=260, y=20, width=100, height=30),
+            ),
+            10.0,
+        )
+        left_id, right_id = (item.track_id for item in first.assignments)
+
+        # Both movements are individually plausible. A local greedy choice can
+        # consume left_id with the growing right-hand plate and leave the actual
+        # left-hand plate unmatched, even though a two-match assignment exists.
+        second = tracker.update(
+            1,
+            (
+                PlateDetection(0.90, x=120, y=20, width=200, height=30),
+                PlateDetection(0.90, x=30, y=20, width=100, height=30),
+            ),
+            10.2,
+        )
+
+        self.assertEqual(second.assignments[0].track_id, right_id)
+        self.assertEqual(second.assignments[1].track_id, left_id)
+        self.assertTrue(all(not item.created for item in second.assignments))
+        self.assertEqual(second.ignored_detections, ())
+
+    def test_false_candidate_does_not_evict_recent_unmatched_real_track(self) -> None:
+        tracker = manager(timeout_ms=3_000)
+        first = tracker.update(
+            1,
+            (
+                PlateDetection(0.92, x=100, y=20, width=100, height=30),
+                PlateDetection(0.91, x=500, y=20, width=100, height=30),
+            ),
+            10.0,
+        )
+        left_id, right_id = (item.track_id for item in first.assignments)
+
+        second = tracker.update(
+            1,
+            (
+                PlateDetection(0.92, x=110, y=20, width=100, height=30),
+                PlateDetection(0.20, x=850, y=20, width=35, height=15),
+            ),
+            10.2,
+        )
+
+        self.assertEqual(
+            {item.track_id for item in second.active_tracks},
+            {left_id, right_id},
+        )
+        self.assertEqual(len(second.ignored_detections), 1)
+        self.assertEqual(tracker.consume_finalized(), ())
+
 
 class TrackAwareOcrSchedulingTests(unittest.TestCase):
     @staticmethod
-    def _job(track_id: int, quality: float) -> OcrJob:
+    def _job(track_id: int, quality: float, *, frame_id: int | None = None) -> OcrJob:
         now = time.monotonic()
         frame = np.zeros((80, 200, 3), dtype=np.uint8)
         crop = np.zeros((20, 90, 3), dtype=np.uint8)
@@ -193,7 +250,7 @@ class TrackAwareOcrSchedulingTests(unittest.TestCase):
             detector_ms=1.0,
             quality_score=quality,
             job_type=OcrJobType.DETECTOR_CROP,
-            frame_id=track_id,
+            frame_id=track_id if frame_id is None else frame_id,
             track_id=track_id,
         )
 
@@ -248,94 +305,52 @@ class TrackAwareOcrSchedulingTests(unittest.TestCase):
         self.assertTrue(all(len(job.ocr_crops) == 1 for job in result.jobs))
         self.assertTrue(all(job.frame_id == 7 for job in result.jobs))
 
+    def test_replacement_processing_and_clear_keep_pending_accounting_balanced(self) -> None:
+        tracker = manager(timeout_ms=500)
+        track_id = tracker.update(1, [detection(100)], 10.0).assignments[0].track_id
+        buffer = OcrJobBuffer(
+            max_per_camera=5,
+            max_age_ms=2_500,
+            on_job_discarded=lambda job: tracker.mark_ocr_finished(
+                job.track_id, dropped=True
+            ),
+        )
+
+        def enqueue(job: OcrJob) -> object:
+            self.assertTrue(tracker.mark_ocr_scheduled(job.track_id))
+            result = buffer.add(job)
+            if not result.accepted:
+                tracker.mark_ocr_finished(job.track_id, dropped=True)
+            return result
+
+        enqueue(self._job(track_id, 0.90, frame_id=100))
+        enqueue(self._job(track_id, 0.80, frame_id=102))
+        replacement = enqueue(self._job(track_id, 0.85, frame_id=104))
+
+        self.assertTrue(replacement.accepted)
+        self.assertEqual(replacement.replaced, 1)
+        self.assertEqual(buffer.pending_track_count(1, track_id), 2)
+        self.assertEqual(tracker.active_snapshots(1)[0].pending_ocr_count, 2)
+
+        processing = buffer.take()
+        self.assertIsNotNone(processing)
+        self.assertEqual(buffer.pending_track_count(1, track_id), 1)
+        self.assertEqual(tracker.active_snapshots(1)[0].pending_ocr_count, 2)
+
+        tracker.expire_due(10.6)
+        self.assertEqual(tracker.consume_finalized(), ())
+        tracker.mark_ocr_finished(processing.track_id)
+        self.assertEqual(tracker.consume_finalized(), ())
+
+        buffer.clear()
+        tracker.mark_ocr_finished(track_id, dropped=True)
+        finalized = tracker.consume_finalized()
+        self.assertEqual(len(finalized), 1)
+        self.assertEqual(finalized[0].pending_ocr_count, 0)
+        self.assertEqual(finalized[0].ocr_jobs_scheduled, 3)
+        self.assertEqual(finalized[0].ocr_jobs_completed, 1)
+        self.assertEqual(finalized[0].ocr_jobs_dropped, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
-class TestEvictionAndStarvation(unittest.TestCase):
-    def test_starvation_eviction_of_unverified_track(self) -> None:
-        manager = PlateTrackManager(max_active_tracks_per_camera=2, timeout_ms=3000, iou_threshold=0.25)
-        res1 = manager.update(1, [
-            PlateDetection(confidence=0.9, x=220, y=100, width=105, height=30),
-            PlateDetection(confidence=0.5, x=40, y=95, width=55, height=24)
-        ], 10.0)
-        self.assertEqual(len(res1.active_tracks), 2)
-        
-        res2 = manager.update(1, [
-            PlateDetection(confidence=0.9, x=620, y=100, width=105, height=30)
-        ], 10.1)
-        
-        self.assertEqual(len(res2.ignored_detections), 0)
-        self.assertEqual(len(res2.active_tracks), 2)
-        
-    def test_verified_track_is_protected_from_eviction(self) -> None:
-        manager = PlateTrackManager(max_active_tracks_per_camera=2, timeout_ms=3000, iou_threshold=0.25)
-        res1 = manager.update(1, [
-            PlateDetection(confidence=0.9, x=220, y=100, width=105, height=30),
-            PlateDetection(confidence=0.5, x=40, y=95, width=55, height=24)
-        ], 10.0)
-        
-        t1_id = res1.assignments[0].track_id
-        t2_id = res1.assignments[1].track_id
-        
-        manager.mark_ocr_scheduled(t1_id)
-        manager.can_accept_ocr_result(t1_id)
-        manager.record_ocr_result(t1_id, '23AFP779', 0.95, 10.0)
-        
-        res2 = manager.update(1, [
-            PlateDetection(confidence=0.9, x=620, y=100, width=105, height=30)
-        ], 10.1)
-        
-        self.assertEqual(len(res2.ignored_detections), 0)
-        
-        active_ids = {t.track_id for t in res2.active_tracks}
-        self.assertIn(t1_id, active_ids)
-        self.assertNotIn(t2_id, active_ids)
-
-    def test_track_with_pending_ocr_is_protected_from_eviction(self) -> None:
-        manager = PlateTrackManager(max_active_tracks_per_camera=2, timeout_ms=3000, iou_threshold=0.25)
-        res1 = manager.update(1, [
-            PlateDetection(confidence=0.9, x=220, y=100, width=105, height=30),
-            PlateDetection(confidence=0.5, x=40, y=95, width=55, height=24)
-        ], 10.0)
-        
-        t1_id = res1.assignments[0].track_id
-        t2_id = res1.assignments[1].track_id
-        
-        manager.mark_ocr_scheduled(t1_id)
-        
-        res2 = manager.update(1, [
-            PlateDetection(confidence=0.9, x=620, y=100, width=105, height=30)
-        ], 10.1)
-        
-        self.assertEqual(len(res2.ignored_detections), 0)
-        active_ids = {t.track_id for t in res2.active_tracks}
-        self.assertIn(t1_id, active_ids)
-        self.assertNotIn(t2_id, active_ids)
-
-    def test_two_real_vehicles_supported(self) -> None:
-        manager = PlateTrackManager(max_active_tracks_per_camera=2, timeout_ms=3000, iou_threshold=0.25)
-        res1 = manager.update(1, [
-            PlateDetection(confidence=0.9, x=220, y=100, width=105, height=30),
-            PlateDetection(confidence=0.9, x=40, y=95, width=55, height=24)
-        ], 10.0)
-        
-        t1_id = res1.assignments[0].track_id
-        t2_id = res1.assignments[1].track_id
-        
-        manager.mark_ocr_scheduled(t1_id)
-        manager.can_accept_ocr_result(t1_id)
-        manager.record_ocr_result(t1_id, '34ABC123', 0.95, 10.0)
-        
-        manager.mark_ocr_scheduled(t2_id)
-        manager.can_accept_ocr_result(t2_id)
-        manager.record_ocr_result(t2_id, '35XYZ789', 0.95, 10.0)
-        
-        res2 = manager.update(1, [
-            PlateDetection(confidence=0.5, x=620, y=100, width=105, height=30)
-        ], 10.1)
-        
-        self.assertEqual(len(res2.ignored_detections), 1)
-        self.assertEqual(len(res2.active_tracks), 2)

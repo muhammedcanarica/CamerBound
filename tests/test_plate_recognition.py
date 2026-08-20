@@ -72,6 +72,7 @@ from app.plate_recognition import (
 from app.ocr_models import OcrModelInvalid, OcrModelNotFound as ModelNotFound, validate_model_directory
 from app.ocr_debug import save_debug_images
 from app.plate_service import PlateService
+from app.plate_tracking import PlateTrackManager
 
 
 class FakeOcrProvider:
@@ -1914,6 +1915,8 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIsNotNone(saved.record)
         self.assertTrue(duplicate.duplicate)
         self.assertIsNone(duplicate.record)
+        self.assertIs(duplicate.state, RecognitionState.DUPLICATE_SUPPRESSED)
+        self.assertEqual(duplicate.suppression_reason, "ACTIVE_PRESENCE")
         self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 1)
         self.assertEqual(self._record_count(), 1)
 
@@ -1944,7 +1947,44 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertIsNone(outcome.record)
         self.assertEqual(self._record_count(), 1)
 
-    def test_presence_release_cannot_create_duplicate_parked_movement(self) -> None:
+    def test_exact_cooldown_reason_reaches_recognition_outcome(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        detected_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        first_processor = PlateRecognitionProcessor(
+            FakeOcrProvider(), self.plate_service, self.config
+        )
+        first_processor.process(
+            camera.id, camera.direction, frame, detected_at, monotonic_at=1.0
+        )
+        saved = first_processor.process(
+            camera.id, camera.direction, frame, detected_at, monotonic_at=2.0
+        )
+
+        restarted_processor = PlateRecognitionProcessor(
+            FakeOcrProvider(), self.plate_service, self.config
+        )
+        restarted_processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            detected_at + timedelta(seconds=5),
+            monotonic_at=10.0,
+        )
+        duplicate = restarted_processor.process(
+            camera.id,
+            camera.direction,
+            frame,
+            detected_at + timedelta(seconds=6),
+            monotonic_at=11.0,
+        )
+
+        self.assertIs(saved.state, RecognitionState.SAVED)
+        self.assertIs(duplicate.state, RecognitionState.DUPLICATE_SUPPRESSED)
+        self.assertEqual(duplicate.suppression_reason, "EXACT_COOLDOWN")
+        self.assertEqual(self._record_count(), 1)
+
+    def test_presence_release_allows_new_confirmed_event_after_cooldown(self) -> None:
         camera = self.camera_service.list_cameras()[0]
         processor = PlateRecognitionProcessor(
             FakeOcrProvider(confidence=0.97), self.plate_service, self.config
@@ -1973,11 +2013,11 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(first.record)
-        self.assertIsNone(second.record)
-        self.assertTrue(second.duplicate)
-        self.assertEqual(second.suppression_reason, "same-direction-state")
-        self.assertEqual(self._record_count(), 1)
-        self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 1)
+        self.assertIsNotNone(second.record)
+        self.assertIs(second.state, RecognitionState.SAVED)
+        self.assertFalse(second.duplicate)
+        self.assertEqual(self._record_count(), 2)
+        self.assertEqual(len(list(Path(self.temp_directory.name).rglob("*.jpg"))), 2)
 
     def test_same_plate_is_independent_for_entry_and_exit_cameras(self) -> None:
         cameras = {
@@ -4937,6 +4977,7 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         self.assertEqual(first.confirmation_count, 1)
         self.assertIs(duplicate.state, RecognitionState.DUPLICATE_SUPPRESSED)
+        self.assertEqual(duplicate.suppression_reason, "same-frame-observation")
         processor.finalize_due(processor.next_pending_deadline() + 0.01)
         self.assertEqual(processor.pending_decision_count, 0)
         self.assertEqual(self._record_count(), 0)
@@ -5843,6 +5884,444 @@ class RecognitionPipelineTests(unittest.TestCase):
         processor.finalize_track(1, track_id)
         
         self.assertEqual(self._record_count(), 1)
+
+    def test_sequence_moving_plate_keeps_track_evidence_and_saves_on_track_end(self) -> None:
+        tracker = PlateTrackManager(
+            max_active_tracks_per_camera=2,
+            timeout_ms=3_000,
+            iou_threshold=0.25,
+        )
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("23AFP779", 0.95, (0, 0, 10, 10), 0)],
+                    [OcrSegment("23AFP779", 0.96, (0, 0, 10, 10), 0)],
+                ]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2_000,
+            ),
+            track_manager=tracker,
+        )
+        first_detections = (
+            PlateDetection(0.90, x=100, y=20, width=100, height=30),
+            PlateDetection(0.90, x=260, y=20, width=100, height=30),
+        )
+        first_update = tracker.update(1, first_detections, 10.0)
+        plate_track_id = first_update.assignments[1].track_id
+
+        self.assertTrue(tracker.mark_ocr_scheduled(plate_track_id))
+        first_outcome = processor.process_ocr_job(
+            self._make_ocr_job(
+                frame_id=100,
+                observed_at=10.0,
+                detection=first_detections[1],
+                track_id=plate_track_id,
+            ),
+            queue_depth=0,
+        )
+        tracker.mark_ocr_finished(plate_track_id)
+
+        second_detections = (
+            PlateDetection(0.91, x=120, y=20, width=200, height=30),
+            PlateDetection(0.89, x=30, y=20, width=100, height=30),
+        )
+        second_update = tracker.update(1, second_detections, 10.2)
+        self.assertEqual(second_update.assignments[0].track_id, plate_track_id)
+        self.assertTrue(tracker.mark_ocr_scheduled(plate_track_id))
+        second_outcome = processor.process_ocr_job(
+            self._make_ocr_job(
+                frame_id=102,
+                observed_at=10.2,
+                detection=second_detections[0],
+                track_id=plate_track_id,
+                frame_value=72,
+            ),
+            queue_depth=0,
+        )
+        tracker.mark_ocr_finished(plate_track_id)
+
+        finalized = processor.finalize_track(
+            1,
+            plate_track_id,
+        )
+
+        self.assertIs(first_outcome.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertIs(second_outcome.state, RecognitionState.STABILIZING)
+        self.assertIsNotNone(finalized)
+        self.assertIs(finalized.state, RecognitionState.SAVED)
+        self.assertEqual(finalized.record.plate, "23AFP779")
+        self.assertEqual(self._record_count(), 1)
+
+    def test_terminal_track_debug_trace_explains_unsaved_valid_candidate(self) -> None:
+        tracker = PlateTrackManager(
+            max_active_tracks_per_camera=2,
+            timeout_ms=3_000,
+            iou_threshold=0.25,
+        )
+        detection = PlateDetection(0.91, x=20, y=10, width=100, height=30)
+        track_id = tracker.update(
+            1,
+            (detection,),
+            10.0,
+            direction=Direction.ENTRY.value,
+        ).assignments[0].track_id
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [[OcrSegment("23AFP779", 0.95, (0, 0, 10, 10), 0)]]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2_000,
+            ),
+            track_manager=tracker,
+        )
+
+        self.assertTrue(tracker.mark_ocr_scheduled(track_id))
+        processor.process_ocr_job(
+            self._make_ocr_job(
+                frame_id=100,
+                observed_at=10.0,
+                detection=detection,
+                track_id=track_id,
+            ),
+            queue_depth=0,
+        )
+        tracker.mark_ocr_finished(track_id)
+        snapshot = tracker.active_snapshots(1)[0]
+
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            finalized = processor.finalize_track(1, track_id, snapshot)
+
+        terminal_line = next(
+            line for line in captured.output if "TRACK FINAL" in line
+        )
+        self.assertIs(finalized.state, RecognitionState.AMBIGUOUS_DISCARDED)
+        self.assertIn("direction=ENTRY", terminal_line)
+        self.assertIn("detector_updates=1", terminal_line)
+        self.assertIn("ocr_scheduled=1", terminal_line)
+        self.assertIn("ocr_completed=1", terminal_line)
+        self.assertIn("ocr_dropped=0", terminal_line)
+        self.assertIn("valid_ocr_results=1", terminal_line)
+        self.assertIn("distinct_valid_ocr_frames=1", terminal_line)
+        self.assertIn("best_text=23AFP779", terminal_line)
+        self.assertIn("confirmation=1/2", terminal_line)
+        self.assertIn("final_state=AMBIGUOUS_DISCARDED", terminal_line)
+        self.assertIn(
+            "suppression_reason=insufficient-variant-consensus",
+            terminal_line,
+        )
+
+    def test_visible_23agf470_one_frame_has_terminal_no_save_classification(self) -> None:
+        tracker = PlateTrackManager(
+            max_active_tracks_per_camera=2,
+            timeout_ms=3_000,
+            iou_threshold=0.25,
+        )
+        detection = PlateDetection(0.92, x=40, y=20, width=110, height=32)
+        track_id = tracker.update(
+            1,
+            (detection,),
+            10.0,
+            direction=Direction.ENTRY.value,
+        ).assignments[0].track_id
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [[OcrSegment("23AGF470", 0.95, (0, 0, 10, 10), 0)]]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2_000,
+            ),
+            track_manager=tracker,
+        )
+
+        self.assertTrue(tracker.mark_ocr_scheduled(track_id))
+        processor.process_ocr_job(
+            self._make_ocr_job(
+                frame_id=100,
+                observed_at=10.0,
+                detection=detection,
+                track_id=track_id,
+            ),
+            queue_depth=0,
+        )
+        tracker.mark_ocr_finished(track_id)
+        snapshot = tracker.active_snapshots(1)[0]
+
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            finalized = processor.finalize_track(1, track_id, snapshot)
+
+        terminal_line = next(line for line in captured.output if "TRACK FINAL" in line)
+        self.assertEqual(snapshot.best_text, "23AGF470")
+        self.assertIs(finalized.state, RecognitionState.AMBIGUOUS_DISCARDED)
+        self.assertEqual(
+            finalized.terminal_classification,
+            "INSUFFICIENT_TEMPORAL_EVIDENCE",
+        )
+        self.assertFalse(finalized.save_attempted)
+        self.assertEqual(finalized.save_result, "not-confirmed")
+        self.assertIn(
+            "terminal_classification=INSUFFICIENT_TEMPORAL_EVIDENCE",
+            terminal_line,
+        )
+        self.assertIn("save_attempted=no", terminal_line)
+        self.assertIn("save_result=not-confirmed", terminal_line)
+        self.assertEqual(self._record_count(), 0)
+
+    def test_visible_23agf470_two_frames_save_on_track_end(self) -> None:
+        tracker = PlateTrackManager(
+            max_active_tracks_per_camera=2,
+            timeout_ms=3_000,
+            iou_threshold=0.25,
+        )
+        detection = PlateDetection(0.92, x=40, y=20, width=110, height=32)
+        track_id = tracker.update(
+            1,
+            (detection,),
+            10.0,
+            direction=Direction.ENTRY.value,
+        ).assignments[0].track_id
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("23AGF470", 0.95, (0, 0, 10, 10), 0)],
+                    [OcrSegment("23AGF470", 0.96, (0, 0, 10, 10), 0)],
+                ]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2_000,
+            ),
+            track_manager=tracker,
+        )
+        outcomes = []
+        for frame_id, observed_at in ((100, 10.0), (102, 10.2)):
+            self.assertTrue(tracker.mark_ocr_scheduled(track_id))
+            outcomes.append(
+                processor.process_ocr_job(
+                    self._make_ocr_job(
+                        frame_id=frame_id,
+                        observed_at=observed_at,
+                        detection=detection,
+                        track_id=track_id,
+                    ),
+                    queue_depth=0,
+                )
+            )
+            tracker.mark_ocr_finished(track_id)
+        snapshot = tracker.active_snapshots(1)[0]
+
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            finalized = processor.finalize_track(1, track_id, snapshot)
+
+        terminal_line = next(line for line in captured.output if "TRACK FINAL" in line)
+        self.assertIs(outcomes[0].state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertIs(outcomes[1].state, RecognitionState.STABILIZING)
+        self.assertEqual(snapshot.best_text, "23AGF470")
+        self.assertIs(finalized.state, RecognitionState.SAVED)
+        self.assertEqual(finalized.record.plate, "23AGF470")
+        self.assertEqual(finalized.terminal_classification, "SAVED")
+        self.assertTrue(finalized.save_attempted)
+        self.assertEqual(finalized.save_result, "saved")
+        self.assertIn("terminal_classification=SAVED", terminal_line)
+        self.assertIn("save_attempted=yes", terminal_line)
+        self.assertIn("save_result=saved", terminal_line)
+        self.assertEqual(self._record_count(), 1)
+
+    def test_duplicate_due_reason_survives_until_track_terminal_log(self) -> None:
+        camera = self.camera_service.list_cameras()[0]
+        detected_at = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+        self.plate_service.save_plate_detection(
+            "23AGF470", camera.id, 0.97, detected_at
+        )
+        tracker = PlateTrackManager(
+            max_active_tracks_per_camera=2,
+            timeout_ms=3_000,
+            iou_threshold=0.25,
+        )
+        detection = PlateDetection(0.92, x=40, y=20, width=110, height=32)
+        track_id = tracker.update(
+            camera.id,
+            (detection,),
+            10.0,
+            direction=camera.direction.value,
+        ).assignments[0].track_id
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("23AGF470", 0.95, (0, 0, 10, 10), 0)],
+                    [OcrSegment("23AGF470", 0.96, (0, 0, 10, 10), 0)],
+                ]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2_000,
+            ),
+            track_manager=tracker,
+        )
+        for frame_id, observed_at, captured_at in (
+            (100, 10.0, detected_at + timedelta(seconds=5)),
+            (102, 10.2, detected_at + timedelta(seconds=6)),
+        ):
+            self.assertTrue(tracker.mark_ocr_scheduled(track_id))
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    frame_id=frame_id,
+                    observed_at=observed_at,
+                    captured_at=captured_at,
+                    detection=detection,
+                    track_id=track_id,
+                ),
+                queue_depth=0,
+            )
+            tracker.mark_ocr_finished(track_id)
+
+        due = processor.finalize_due(processor.next_pending_deadline() + 0.01)[0][1]
+        snapshot = tracker.active_snapshots(camera.id)[0]
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            self.assertIsNone(processor.finalize_track(camera.id, track_id, snapshot))
+
+        terminal_line = next(line for line in captured.output if "TRACK FINAL" in line)
+        self.assertIs(due.state, RecognitionState.DUPLICATE_SUPPRESSED)
+        self.assertEqual(due.suppression_reason, "EXACT_COOLDOWN")
+        self.assertIn("terminal_classification=EXACT_COOLDOWN", terminal_line)
+        self.assertIn("save_attempted=yes", terminal_line)
+        self.assertIn("save_result=duplicate", terminal_line)
+        self.assertEqual(self._record_count(), 1)
+
+    def test_persistence_exception_is_terminal_outcome_not_inference_error(self) -> None:
+        tracker = PlateTrackManager(
+            max_active_tracks_per_camera=2,
+            timeout_ms=3_000,
+            iou_threshold=0.25,
+        )
+        detection = PlateDetection(0.92, x=40, y=20, width=110, height=32)
+        track_id = tracker.update(
+            1,
+            (detection,),
+            10.0,
+            direction=Direction.ENTRY.value,
+        ).assignments[0].track_id
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("23AGF470", 0.95, (0, 0, 10, 10), 0)],
+                    [OcrSegment("23AGF470", 0.96, (0, 0, 10, 10), 0)],
+                ]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2_000,
+            ),
+            track_manager=tracker,
+        )
+        for frame_id, observed_at in ((100, 10.0), (102, 10.2)):
+            self.assertTrue(tracker.mark_ocr_scheduled(track_id))
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    frame_id=frame_id,
+                    observed_at=observed_at,
+                    detection=detection,
+                    track_id=track_id,
+                ),
+                queue_depth=0,
+            )
+            tracker.mark_ocr_finished(track_id)
+        snapshot = tracker.active_snapshots(1)[0]
+
+        with patch.object(
+            self.plate_service,
+            "save_plate_detection",
+            side_effect=RuntimeError("simulated persistence failure"),
+        ), self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            finalized = processor.finalize_track(1, track_id, snapshot)
+
+        terminal_line = next(line for line in captured.output if "TRACK FINAL" in line)
+        self.assertIs(finalized.state, RecognitionState.PERSISTENCE_ERROR)
+        self.assertEqual(finalized.suppression_reason, "PERSISTENCE_EXCEPTION")
+        self.assertEqual(finalized.terminal_classification, "PERSISTENCE_EXCEPTION")
+        self.assertTrue(finalized.save_attempted)
+        self.assertEqual(finalized.save_result, "error")
+        self.assertEqual(finalized.persistence_exception_class, "RuntimeError")
+        self.assertIn("terminal_classification=PERSISTENCE_EXCEPTION", terminal_line)
+        self.assertIn("save_attempted=yes", terminal_line)
+        self.assertIn("save_result=error", terminal_line)
+        self.assertIn("persistence_exception=RuntimeError", terminal_line)
+        self.assertNotIn("simulated persistence failure", terminal_line)
+        self.assertEqual(self._record_count(), 0)
+
+    def test_two_one_frame_tracks_report_fragmentation_without_saving(self) -> None:
+        tracker = PlateTrackManager(
+            max_active_tracks_per_camera=2,
+            timeout_ms=3_000,
+            iou_threshold=0.25,
+        )
+        first_detection = PlateDetection(0.92, x=40, y=20, width=110, height=32)
+        second_detection = PlateDetection(0.93, x=400, y=20, width=120, height=34)
+        first_track = tracker.update(
+            1,
+            (first_detection,),
+            10.0,
+            direction=Direction.ENTRY.value,
+        ).assignments[0].track_id
+        second_track = tracker.update(
+            1,
+            (second_detection,),
+            10.2,
+            direction=Direction.ENTRY.value,
+        ).assignments[0].track_id
+        self.assertNotEqual(first_track, second_track)
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("23AGF470", 0.95, (0, 0, 10, 10), 0)],
+                    [OcrSegment("23AGF470", 0.96, (0, 0, 10, 10), 0)],
+                ]
+            ),
+            self.plate_service,
+            recognition_config(
+                Path(self.temp_directory.name),
+                stabilization_window_ms=2_000,
+            ),
+            track_manager=tracker,
+        )
+        for track_id, frame_id, observed_at, detection in (
+            (first_track, 100, 10.0, first_detection),
+            (second_track, 102, 10.2, second_detection),
+        ):
+            self.assertTrue(tracker.mark_ocr_scheduled(track_id))
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    frame_id=frame_id,
+                    observed_at=observed_at,
+                    detection=detection,
+                    track_id=track_id,
+                ),
+                queue_depth=0,
+            )
+            tracker.mark_ocr_finished(track_id)
+        snapshots = {item.track_id: item for item in tracker.active_snapshots(1)}
+
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            first = processor.finalize_track(1, first_track, snapshots[first_track])
+            second = processor.finalize_track(1, second_track, snapshots[second_track])
+
+        terminal_lines = [line for line in captured.output if "TRACK FINAL" in line]
+        self.assertIs(first.state, RecognitionState.AMBIGUOUS_DISCARDED)
+        self.assertIs(second.state, RecognitionState.AMBIGUOUS_DISCARDED)
+        self.assertEqual(len(terminal_lines), 2)
+        self.assertIn(f"track_id={first_track}", terminal_lines[0])
+        self.assertIn(f"track_id={second_track}", terminal_lines[1])
+        self.assertIn("terminal_classification=TRACK_FRAGMENTED", terminal_lines[1])
+        self.assertEqual(self._record_count(), 0)
 
     def test_e2e_failure_shape_detector_fast_producer(self) -> None:
         buffer = OcrJobBuffer(max_per_camera=5, max_age_ms=2_500)

@@ -142,6 +142,8 @@ RISKY_CONFIRMATIONS_REQUIRED = 3
 POST_SAVE_CONFIRMATIONS_REQUIRED = 4
 POST_SAVE_NEAR_DUPLICATE_WINDOW_SECONDS = 45 * 60
 RECENT_SAVED_EVIDENCE_LIMIT = 32
+TRACK_TERMINAL_OUTCOME_LIMIT = 128
+RECENT_UNSAVED_TRACK_LIMIT = 64
 CONFIRMATION_OBSERVATION_LIMIT_PER_CAMERA = 128
 CONFIRMED_PLATE_LIMIT = 256
 PENDING_DECISION_CAMERA_LIMIT = 16
@@ -533,7 +535,7 @@ class ConfirmationTracker:
                 None,
                 0,
                 self.required,
-                suppression_reason="active-presence",
+                suppression_reason="ACTIVE_PRESENCE",
             )
 
         if frame_id is None:
@@ -771,6 +773,7 @@ class RecognitionState(StrEnum):
     SAVED = "SAVED"
     DUPLICATE_SUPPRESSED = "DUPLICATE_SUPPRESSED"
     STALE_TRACK_DROPPED = "STALE_TRACK_DROPPED"
+    PERSISTENCE_ERROR = "PERSISTENCE_ERROR"
 
 
 class FinalizationSource(StrEnum):
@@ -780,6 +783,45 @@ class FinalizationSource(StrEnum):
     BUFFERED_MULTI_FRAME = "buffered-multiframe"
     AMBIGUOUS_DISCARD = "ambiguous-discard"
     DUPLICATE_SUPPRESSED = "duplicate-suppressed"
+
+
+def _terminal_classification(
+    state: RecognitionState,
+    suppression_reason: str | None,
+) -> str:
+    reason = (suppression_reason or "").upper().replace("-", "_")
+    if state is RecognitionState.SAVED:
+        return "SAVED"
+    if state is RecognitionState.PERSISTENCE_ERROR or reason == "PERSISTENCE_EXCEPTION":
+        return "PERSISTENCE_EXCEPTION"
+    if reason in {
+        "ACTIVE_PRESENCE",
+        "EXACT_COOLDOWN",
+        "SAME_DIRECTION_STATE",
+        "STALE_HISTORICAL",
+        "SAME_FRAME_OBSERVATION",
+    }:
+        return reason
+    if state is RecognitionState.STABILIZING:
+        return "STABILIZATION_PENDING"
+    if state is RecognitionState.STALE_TRACK_DROPPED or reason == "STALE_TRACK":
+        return "STALE_TRACK"
+    if reason in {"NEAR_CONFLICT", "NEAR_DUPLICATE_AMBIGUITY"}:
+        return "NEAR_CONFLICT"
+    if reason == "CORRECTED_CANDIDATE":
+        return "CORRECTED_CANDIDATE"
+    if reason == "REPRESENTATIVE_FRAME_MISSING":
+        return "REPRESENTATIVE_FRAME_MISSING"
+    if reason in {
+        "INSUFFICIENT_TEMPORAL_EVIDENCE",
+        "INSUFFICIENT_VARIANT_CONSENSUS",
+        "SINGLE_OBSERVATION_LOW_CONFIDENCE",
+        "FALLBACK_ONLY",
+    } or state is RecognitionState.AWAITING_CONFIRMATION:
+        return "INSUFFICIENT_TEMPORAL_EVIDENCE"
+    if reason == "TRACK_ASSIGNMENT_UNCERTAIN":
+        return "TRACK_FRAGMENTED"
+    return "OTHER"
 
 
 @dataclass(frozen=True, slots=True)
@@ -795,6 +837,10 @@ class RecognitionOutcome:
     suppression_reason: str | None = None
     finalization_source: FinalizationSource | None = None
     track_ended: bool = False
+    terminal_classification: str | None = None
+    save_attempted: bool = False
+    save_result: str = "not-confirmed"
+    persistence_exception_class: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1768,6 +1814,7 @@ class PlateDetectionProcessor:
                         selected,
                         observed_at,
                         activity_at=time.monotonic(),
+                        direction=direction.value,
                     )
                     active_tracks = tracking.active_tracks
                     ignored_track_detections = len(tracking.ignored_detections)
@@ -1868,6 +1915,7 @@ class PlateDetectionProcessor:
                 (),
                 observed_at,
                 activity_at=time.monotonic(),
+                direction=direction.value,
             )
             active_tracks = tracking.active_tracks
 
@@ -2468,6 +2516,12 @@ class PlateRecognitionProcessor:
         self._pending_decisions: dict[
             tuple[int, int | None], PendingPlateDecision
         ] = {}
+        self._track_terminal_outcomes: dict[
+            tuple[int, int], RecognitionOutcome
+        ] = {}
+        self._recent_unsaved_tracks: dict[
+            tuple[int, str], tuple[int, float]
+        ] = {}
         self._rescued_track_keys: set[tuple[int, int]] = set()
         self._evidence_sequence = 0
 
@@ -2994,6 +3048,7 @@ class PlateRecognitionProcessor:
                 candidate.plate,
                 candidate.confidence,
                 observed_at,
+                frame_id,
             )
         ):
             LOGGER.debug(
@@ -3024,7 +3079,7 @@ class PlateRecognitionProcessor:
                 RecognitionState.DUPLICATE_SUPPRESSED,
                 candidate=candidate,
                 duplicate=True,
-                suppression_reason="active-presence",
+                suppression_reason="same-frame-observation",
                 **detection_context,
             )
 
@@ -3132,8 +3187,9 @@ class PlateRecognitionProcessor:
                 confirmation_count=progress.observed_count,
                 confirmation_required=progress.required_count,
                 duplicate=True,
-                suppression_reason="active-presence",
+                suppression_reason="ACTIVE_PRESENCE",
                 finalization_source=FinalizationSource.DUPLICATE_SUPPRESSED,
+                save_result="duplicate",
                 **detection_context,
             )
         try:
@@ -3149,7 +3205,7 @@ class PlateRecognitionProcessor:
                 "Duplicate plate detection suppressed camera_id=%s "
                 "suppression_reason=%s latest_movement_direction=%s",
                 camera_id,
-                exc.reason.value,
+                exc.reason.name,
                 (
                     exc.latest_direction.value
                     if exc.latest_direction is not None
@@ -3163,13 +3219,33 @@ class PlateRecognitionProcessor:
                 confirmation_count=progress.observed_count,
                 confirmation_required=progress.required_count,
                 duplicate=True,
-                suppression_reason=exc.reason.value,
+                suppression_reason=exc.reason.name,
                 finalization_source=FinalizationSource.DUPLICATE_SUPPRESSED,
+                save_attempted=True,
+                save_result="duplicate",
                 **detection_context,
             )
-        except Exception:
+        except Exception as exc:
             self.presences.release_record_claim(confirmed)
-            raise
+            LOGGER.exception(
+                "Plate persistence failed camera_id=%s plate=%s exception_type=%s",
+                camera_id,
+                confirmed.plate,
+                type(exc).__name__,
+            )
+            return self._outcome(
+                camera_id,
+                RecognitionState.PERSISTENCE_ERROR,
+                candidate=confirmed,
+                confirmation_count=progress.observed_count,
+                confirmation_required=progress.required_count,
+                suppression_reason="PERSISTENCE_EXCEPTION",
+                finalization_source=FinalizationSource.NORMAL_CONFIRMATION,
+                save_attempted=True,
+                save_result="error",
+                persistence_exception_class=type(exc).__name__,
+                **detection_context,
+            )
         self._remember_saved_evidence(confirmed, detection_time)
         LOGGER.info("Plate detection saved for camera_id=%s", camera_id)
         return self._outcome(
@@ -3180,6 +3256,8 @@ class PlateRecognitionProcessor:
             confirmation_count=progress.observed_count,
             confirmation_required=progress.required_count,
             finalization_source=FinalizationSource.NORMAL_CONFIRMATION,
+            save_attempted=True,
+            save_result="saved",
             **detection_context,
         )
 
@@ -3232,12 +3310,16 @@ class PlateRecognitionProcessor:
         self,
         camera_id: int,
         track_id: int,
+        track_snapshot: PlateTrackSnapshot | None = None,
     ) -> RecognitionOutcome | None:
         key = (camera_id, track_id)
         decision = self._pending_decisions.get(key)
+        previous_outcome = self._track_terminal_outcomes.pop(key, None)
         try:
             if decision is None:
-                self._log_track_final_decision(camera_id, track_id, None, None)
+                self._log_track_final_decision(
+                    camera_id, track_id, None, previous_outcome, track_snapshot
+                )
                 return None
             buffered_rescued = self._attempt_buffered_confirmation_rescue(
                 camera_id,
@@ -3250,9 +3332,12 @@ class PlateRecognitionProcessor:
                 track_ended=True,
                 buffered_rescued=buffered_rescued,
             )
-            self._log_track_final_decision(camera_id, track_id, decision, outcome)
+            self._log_track_final_decision(
+                camera_id, track_id, decision, outcome, track_snapshot
+            )
             return outcome
         finally:
+            self._track_terminal_outcomes.pop(key, None)
             self.confirmations.clear_track(camera_id, track_id)
             self._observation_frame_ids.pop(key, None)
             self._observation_frame_id_sets.pop(key, None)
@@ -3446,6 +3531,8 @@ class PlateRecognitionProcessor:
 
     def clear_pending_decisions(self) -> None:
         self._pending_decisions.clear()
+        self._track_terminal_outcomes.clear()
+        self._recent_unsaved_tracks.clear()
 
     def _add_stabilization_evidence(
         self,
@@ -3818,11 +3905,12 @@ class PlateRecognitionProcessor:
                 confirmation_count=evaluation.winner_votes,
                 confirmation_required=evaluation.required_votes,
                 duplicate=True,
-                suppression_reason="active-presence",
+                suppression_reason="ACTIVE_PRESENCE",
                 detections=representative.detections,
                 used_roi_fallback=representative.used_roi_fallback,
                 finalization_source=FinalizationSource.DUPLICATE_SUPPRESSED,
                 track_ended=track_ended,
+                save_result="duplicate",
             )
         try:
             record = self.plate_service.save_plate_detection(
@@ -3840,15 +3928,37 @@ class PlateRecognitionProcessor:
                 confirmation_count=evaluation.winner_votes,
                 confirmation_required=evaluation.required_votes,
                 duplicate=True,
-                suppression_reason=exc.reason.value,
+                suppression_reason=exc.reason.name,
                 detections=representative.detections,
                 used_roi_fallback=representative.used_roi_fallback,
                 finalization_source=FinalizationSource.DUPLICATE_SUPPRESSED,
                 track_ended=track_ended,
+                save_attempted=True,
+                save_result="duplicate",
             )
-        except Exception:
+        except Exception as exc:
             self.presences.release_record_claim(winner)
-            raise
+            LOGGER.exception(
+                "Plate persistence failed camera_id=%s plate=%s exception_type=%s",
+                camera_id,
+                winner.plate,
+                type(exc).__name__,
+            )
+            return self._outcome(
+                camera_id,
+                RecognitionState.PERSISTENCE_ERROR,
+                candidate=winner,
+                confirmation_count=evaluation.winner_votes,
+                confirmation_required=evaluation.required_votes,
+                suppression_reason="PERSISTENCE_EXCEPTION",
+                detections=representative.detections,
+                used_roi_fallback=representative.used_roi_fallback,
+                finalization_source=evaluation.finalization_source,
+                track_ended=track_ended,
+                save_attempted=True,
+                save_result="error",
+                persistence_exception_class=type(exc).__name__,
+            )
         self._remember_saved_evidence(winner, representative.captured_at)
         LOGGER.info("Stabilized plate decision saved for camera_id=%s", camera_id)
         return self._outcome(
@@ -3862,38 +3972,156 @@ class PlateRecognitionProcessor:
             used_roi_fallback=representative.used_roi_fallback,
             finalization_source=evaluation.finalization_source,
             track_ended=track_ended,
+            save_attempted=True,
+            save_result="saved",
         )
 
-    @staticmethod
     def _log_track_final_decision(
+        self,
         camera_id: int,
         track_id: int,
         decision: PendingPlateDecision | None,
         outcome: RecognitionOutcome | None,
+        track_snapshot: PlateTrackSnapshot | None = None,
     ) -> None:
         candidate = outcome.candidate if outcome is not None else None
         observations = 0
         distinct_ocr_frames = 0
+        vote_counts: dict[str, int] = defaultdict(int)
         if decision is not None and candidate is not None:
             observations = sum(
                 item.candidate.plate == candidate.plate for item in decision.observations
             )
-            distinct_ocr_frames = len({item.candidate.frame_id for item in decision.observations if item.candidate.frame_id is not None})
+            distinct_ocr_frames = len(
+                {
+                    item.candidate.frame_id
+                    for item in decision.observations
+                    if item.candidate.frame_id is not None
+                }
+            )
+        if decision is not None:
+            for item in decision.observations:
+                vote_counts[item.candidate.plate] += 1
         
         state_str = outcome.state.value if outcome else "UNSPECIFIED"
-        reason_str = outcome.suppression_reason if outcome else "none"
+        reason_str = (
+            outcome.suppression_reason
+            if outcome is not None
+            else "no-valid-ocr-evidence"
+        )
+        source_str = (
+            outcome.finalization_source.value
+            if outcome is not None and outcome.finalization_source is not None
+            else "none"
+        )
+        first_seen = track_snapshot.first_seen_at if track_snapshot is not None else 0.0
+        last_seen = track_snapshot.last_seen_at if track_snapshot is not None else first_seen
+        best_text = (
+            candidate.plate
+            if candidate is not None
+            else track_snapshot.best_text
+            if track_snapshot is not None
+            else None
+        )
+        best_confidence = (
+            candidate.confidence
+            if candidate is not None
+            else track_snapshot.best_confidence
+            if track_snapshot is not None
+            else 0.0
+        )
+        classification = (
+            outcome.terminal_classification
+            if outcome is not None and outcome.terminal_classification is not None
+            else "OTHER"
+        )
+        related_track_id: int | None = None
+        if best_text is not None and track_snapshot is not None:
+            recent_key = (camera_id, best_text)
+            if (
+                classification == "INSUFFICIENT_TEMPORAL_EVIDENCE"
+                and (outcome is None or outcome.record is None)
+            ):
+                previous = self._recent_unsaved_tracks.get(recent_key)
+                if (
+                    previous is not None
+                    and previous[0] != track_id
+                    and abs(track_snapshot.first_seen_at - previous[1])
+                    <= self.config.confirmation_window_seconds
+                ):
+                    classification = "TRACK_FRAGMENTED"
+                    related_track_id = previous[0]
+                self._recent_unsaved_tracks[recent_key] = (
+                    track_id,
+                    track_snapshot.last_seen_at,
+                )
+                while len(self._recent_unsaved_tracks) > RECENT_UNSAVED_TRACK_LIMIT:
+                    self._recent_unsaved_tracks.pop(
+                        next(iter(self._recent_unsaved_tracks))
+                    )
+            else:
+                self._recent_unsaved_tracks.pop(recent_key, None)
+        save_attempted = bool(outcome is not None and outcome.save_attempted)
+        save_result = outcome.save_result if outcome is not None else "not-confirmed"
+        persistence_exception = (
+            outcome.persistence_exception_class
+            if outcome is not None and outcome.persistence_exception_class is not None
+            else "none"
+        )
         
         LOGGER.debug(
-            "TRACK FINAL camera_id=%s track_id=%s best_text=%s best_confidence=%.3f "
-            "distinct_ocr_frames=%s confirmation_votes=%s final_state=%s suppression_reason=%s",
+            "TRACK FINAL camera_id=%s direction=%s track_id=%s first_seen=%.3f "
+            "last_seen=%.3f lifetime_ms=%.1f detector_updates=%s last_bbox=%s "
+            "ocr_scheduled=%s ocr_completed=%s ocr_dropped=%s valid_ocr_results=%s "
+            "distinct_valid_ocr_frames=%s best_text=%s best_confidence=%.3f "
+            "candidate_votes=%s confirmation=%s/%s pending_plate=%s final_state=%s "
+            "finalization_source=%s suppression_reason=%s "
+            "terminal_classification=%s related_track_id=%s "
+            "save_attempted=%s save_result=%s persistence_exception=%s",
             camera_id,
+            (
+                decision.direction.value
+                if decision is not None
+                else track_snapshot.direction
+                if track_snapshot is not None and track_snapshot.direction is not None
+                else "unknown"
+            ),
             track_id,
-            candidate.plate if candidate else "none",
-            candidate.confidence if candidate else 0.0,
-            distinct_ocr_frames,
-            observations,
+            first_seen,
+            last_seen,
+            max(0.0, last_seen - first_seen) * 1000.0,
+            track_snapshot.detector_update_count if track_snapshot is not None else 0,
+            track_snapshot.bbox if track_snapshot is not None else None,
+            track_snapshot.ocr_jobs_scheduled if track_snapshot is not None else 0,
+            track_snapshot.ocr_jobs_completed if track_snapshot is not None else 0,
+            track_snapshot.ocr_jobs_dropped if track_snapshot is not None else 0,
+            track_snapshot.valid_ocr_result_count if track_snapshot is not None else 0,
+            (
+                len(track_snapshot.valid_ocr_frame_ids)
+                if track_snapshot is not None
+                else distinct_ocr_frames
+            ),
+            best_text or "none",
+            best_confidence,
+            ",".join(
+                f"{plate}:{count}" for plate, count in sorted(vote_counts.items())
+            )
+            or "none",
+            outcome.confirmation_count if outcome is not None else observations,
+            outcome.confirmation_required if outcome is not None else 0,
+            (
+                decision.provisional_plate
+                if decision is not None and decision.provisional_plate is not None
+                else "none"
+            ),
             state_str,
+            source_str,
             reason_str or "none",
+            classification,
+            related_track_id if related_track_id is not None else "none",
+            "yes" if save_attempted else "no",
+            save_result,
+            persistence_exception,
         )
 
     @staticmethod
@@ -4019,6 +4247,10 @@ class PlateRecognitionProcessor:
         suppression_reason: str | None = None,
         finalization_source: FinalizationSource | None = None,
         track_ended: bool = False,
+        terminal_classification: str | None = None,
+        save_attempted: bool = False,
+        save_result: str = "not-confirmed",
+        persistence_exception_class: str | None = None,
     ) -> RecognitionOutcome:
         signature = (state, candidate.plate if candidate is not None else None)
         if (
@@ -4033,7 +4265,7 @@ class PlateRecognitionProcessor:
                 confirmation_required,
             )
         self._last_pipeline_state[camera_id] = signature
-        return RecognitionOutcome(
+        outcome = RecognitionOutcome(
             candidate=candidate,
             record=record,
             state=state,
@@ -4045,7 +4277,36 @@ class PlateRecognitionProcessor:
             suppression_reason=suppression_reason,
             finalization_source=finalization_source,
             track_ended=track_ended,
+            terminal_classification=(
+                terminal_classification
+                or _terminal_classification(state, suppression_reason)
+            ),
+            save_attempted=save_attempted,
+            save_result=save_result,
+            persistence_exception_class=persistence_exception_class,
         )
+        if candidate is not None and candidate.track_id is not None:
+            track_terminal = (
+                record is not None
+                or state is RecognitionState.PERSISTENCE_ERROR
+                or (
+                    state is RecognitionState.DUPLICATE_SUPPRESSED
+                    and outcome.terminal_classification != "SAME_FRAME_OBSERVATION"
+                )
+                or (
+                    state is RecognitionState.AMBIGUOUS_DISCARDED
+                    and track_ended
+                )
+                or state is RecognitionState.STALE_TRACK_DROPPED
+            )
+            if track_terminal:
+                key = (camera_id, candidate.track_id)
+                self._track_terminal_outcomes[key] = outcome
+                while len(self._track_terminal_outcomes) > TRACK_TERMINAL_OUTCOME_LIMIT:
+                    self._track_terminal_outcomes.pop(
+                        next(iter(self._track_terminal_outcomes))
+                    )
+        return outcome
 
     def _log_ocr_diagnostics(
         self,
@@ -4407,6 +4668,7 @@ class PlateOcrWorker:
                     outcome = processor.finalize_track(
                         track.camera_id,
                         track.track_id,
+                        track,
                     )
                     if outcome is not None:
                         self.on_outcome(track.camera_id, outcome)
@@ -4668,7 +4930,7 @@ class PlateRecognitionWorker(QObject):
         self._job_buffer.wake_all()
 
     def _discard_track_job(self, job: OcrJob) -> None:
-        self._track_manager.mark_ocr_finished(job.track_id)
+        self._track_manager.mark_ocr_finished(job.track_id, dropped=True)
 
     def _enqueue_ocr_job(self, job: OcrJob) -> OcrBufferAddResult | None:
         if not self._track_manager.mark_ocr_scheduled(job.track_id):
@@ -4682,7 +4944,7 @@ class PlateRecognitionWorker(QObject):
             return None
         result = self._job_buffer.add(job)
         if not result.accepted:
-            self._track_manager.mark_ocr_finished(job.track_id)
+            self._track_manager.mark_ocr_finished(job.track_id, dropped=True)
         elif result.accepted:
             self._record_ocr_job_queued()
         return result

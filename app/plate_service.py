@@ -79,7 +79,7 @@ class DuplicatePlateDetection(Exception):
         reason: DuplicateSuppressionReason = DuplicateSuppressionReason.EXACT_COOLDOWN,
         latest_direction: Direction | None = None,
     ) -> None:
-        super().__init__("Aynı plaka cooldown süresi içinde zaten kaydedildi.")
+        super().__init__(f"Plaka kaydı engellendi: {reason.name}")
         self.plate = plate
         self.camera_id = camera_id
         self.reason = reason
@@ -192,7 +192,16 @@ class PlateService:
                     latest_direction,
                 )
 
-            if latest_direction is current_direction:
+            if (
+                latest_movement is not None
+                and latest_direction is current_direction
+                and self._inside_cooldown(
+                    latest_movement["timestamp"], detection_time
+                )
+            ):
+                # A missing opposite-direction read makes the persisted movement
+                # state incomplete. Keep same-direction suppression bounded to
+                # the duplicate window instead of locking the plate indefinitely.
                 self._raise_duplicate(
                     normalized_plate,
                     camera_id,
@@ -329,7 +338,7 @@ class PlateService:
             "suppression_reason=%s latest_movement_direction=%s",
             camera_id,
             plate,
-            reason.value,
+            reason.name,
             latest_direction.value if latest_direction is not None else "none",
         )
         raise DuplicatePlateDetection(plate, camera_id, reason, latest_direction)
