@@ -4,8 +4,16 @@ __pycache__/
 venv/
 .tools/
 .camera-test/
-.test-tmp-escalated/
+.test-tmp*/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.idea/
+.vscode/
+.coverage
+htmlcov/
+.DS_Store
+Thumbs.db
 data/*.db
 data/*.db-shm
 data/*.db-wal
