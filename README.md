@@ -6,6 +6,12 @@
 
 CamerBound, ENTRY ve EXIT kameralarından araç plakalarını yerel olarak okuyup kayıt altına alan Windows masaüstü uygulamasıdır. Kamera görüntüsü, OCR, kullanıcılar, kayıt geçmişi ve araç fotoğrafları uygulamanın çalıştığı bilgisayarda tutulur.
 
+## Windows için İndir
+
+[⬇️ CamerBound v1.0.0 — Windows Installer](https://github.com/muhammedcanarica/CamerBound/releases/latest/download/CamerBound_Setup.exe)
+
+Windows 10/11 x64 içindir. Python kurulumu gerektirmez.
+
 ## Features
 
 - RTSP/IP kamera, webcam ve yerel video kaynağı desteği
