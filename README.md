@@ -1,5 +1,9 @@
 # CamerBound
 
+<p align="center">
+  <img src="assets/camerbound-plate-recognition.png" alt="CamerBound plaka okuma görseli" width="640">
+</p>
+
 CamerBound, ENTRY ve EXIT kameralarından araç plakalarını yerel olarak okuyup kayıt altına alan Windows masaüstü uygulamasıdır. Kamera görüntüsü, OCR, kullanıcılar, kayıt geçmişi ve araç fotoğrafları uygulamanın çalıştığı bilgisayarda tutulur.
 
 ## Features
