@@ -23,7 +23,9 @@ data/captures/
 debug/
 build/
 dist/
+dist-installer/
 *.spec
+!packaging/CamerBound.spec
 models/ocr/**
 models/ocr-staging/
 models/ocr-backup/
