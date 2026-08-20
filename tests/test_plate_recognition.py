@@ -29,6 +29,7 @@ from app.plate_recognition import (
     DetectionJobResult,
     FinalizationSource,
     FrameSnapshot,
+    LIVE_FRAMES_PER_REPLAY_FRAME,
     LOW_LIGHT_THRESHOLD,
     MotionEvent,
     OcrImageProfile,
@@ -2095,6 +2096,358 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(health.frames_ingested, 101)
         self.assertIsNotNone(health.last_frame_age_seconds)
         self.assertEqual(health.ocr_jobs_processed, 0)
+        entry = next(
+            item for item in health.direction_metrics
+            if item.direction is Direction.ENTRY
+        )
+        exit_direction = next(
+            item for item in health.direction_metrics
+            if item.direction is Direction.EXIT
+        )
+        self.assertEqual(entry.frames_ingested, 100)
+        self.assertEqual(entry.live_frames_superseded_before_detector, 99)
+        self.assertEqual(exit_direction.frames_ingested, 1)
+        self.assertEqual(exit_direction.live_frames_superseded_before_detector, 0)
+
+    def test_runtime_health_separates_detector_pass_cost_by_direction(self) -> None:
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        diagnostics = DetectorDiagnostics(
+            detector_variant="tiled",
+            raw_brightness=120.0,
+            shadow_metric=10.0,
+            enhanced_pass=False,
+            raw_detector_ms=10.0,
+            enhanced_detector_ms=0.0,
+            detections=1,
+            tiled_recovery_pass=True,
+            recovery_tile_count=2,
+            tiled_detector_ms=20.0,
+            raw_detector_calls=1,
+            tiled_detector_calls=2,
+            tiled_hit=True,
+        )
+
+        worker._record_detector_result(
+            20,
+            Direction.EXIT,
+            True,
+            30.0,
+            7.0,
+            diagnostics,
+        )
+
+        health = worker.runtime_health()
+        exit_direction = next(
+            item for item in health.direction_metrics
+            if item.direction is Direction.EXIT
+        )
+        entry = next(
+            item for item in health.direction_metrics
+            if item.direction is Direction.ENTRY
+        )
+        self.assertEqual(exit_direction.detector_frames_processed, 1)
+        self.assertEqual(exit_direction.raw_detector_calls, 1)
+        self.assertEqual(exit_direction.tiled_detector_calls, 2)
+        self.assertEqual(exit_direction.tiled_hits, 1)
+        self.assertEqual(exit_direction.detector_frame_age_mean_ms, 7.0)
+        self.assertEqual(entry.detector_frames_processed, 0)
+        self.assertEqual(health.tiled_detector_calls, 2)
+
+    def test_empty_live_misses_only_schedule_periodic_expensive_recovery(self) -> None:
+        class PolicyAwareDetector:
+            def __init__(self) -> None:
+                self.recovery_permissions: list[bool] = []
+                self.last_diagnostics = None
+
+            def detect(self, _image: np.ndarray) -> list[PlateDetection]:
+                self.recovery_permissions.append(True)
+                return []
+
+            def detect_with_policy(
+                self,
+                _image: np.ndarray,
+                *,
+                allow_expensive_recovery: bool,
+                should_continue_expensive_recovery: object | None = None,
+            ) -> list[PlateDetection]:
+                self.recovery_permissions.append(allow_expensive_recovery)
+                return []
+
+        detector = PolicyAwareDetector()
+        processor = PlateDetectionProcessor(self.config, detector)
+        frame = np.full((200, 400, 3), 120, dtype=np.uint8)
+        captured_at = datetime.now(timezone.utc)
+
+        for index in range(100):
+            now = index * 0.25
+            with patch("app.plate_recognition.time.monotonic", return_value=now):
+                processor.prepare_job(
+                    1,
+                    Direction.ENTRY,
+                    frame,
+                    captured_at=captured_at,
+                    observed_at=now,
+                    received_at=now,
+                    frame_id=index + 1,
+                    motion_score=0.0,
+                )
+
+        self.assertFalse(detector.recovery_permissions[0])
+        self.assertEqual(sum(detector.recovery_permissions), 12)
+        simulated_raw_plus_tile_inferences = (
+            len(detector.recovery_permissions)
+            + 3 * sum(detector.recovery_permissions)
+        )
+        self.assertEqual(simulated_raw_plus_tile_inferences, 136)
+
+    def test_new_motion_event_retains_one_bounded_expensive_recovery_attempt(self) -> None:
+        class PolicyAwareDetector:
+            def __init__(self) -> None:
+                self.recovery_permissions: list[bool] = []
+                self.last_diagnostics = None
+
+            def detect(self, _image: np.ndarray) -> list[PlateDetection]:
+                self.recovery_permissions.append(True)
+                return []
+
+            def detect_with_policy(
+                self,
+                _image: np.ndarray,
+                *,
+                allow_expensive_recovery: bool,
+                should_continue_expensive_recovery: object | None = None,
+            ) -> list[PlateDetection]:
+                self.recovery_permissions.append(allow_expensive_recovery)
+                return []
+
+        detector = PolicyAwareDetector()
+        processor = PlateDetectionProcessor(self.config, detector)
+        frame = np.full((200, 400, 3), 120, dtype=np.uint8)
+        captured_at = datetime.now(timezone.utc)
+
+        for index in range(2):
+            with patch(
+                "app.plate_recognition.time.monotonic",
+                return_value=0.25 + index * 0.25,
+            ):
+                processor.prepare_job(
+                    2,
+                    Direction.EXIT,
+                    frame,
+                    captured_at=captured_at,
+                    observed_at=0.25 + index * 0.25,
+                    received_at=0.25 + index * 0.25,
+                    frame_id=index + 1,
+                    zero_detection_fallback_event_id=77,
+                    motion_score=0.1,
+                    event_frames=index + 1,
+                )
+
+        self.assertEqual(detector.recovery_permissions, [True, False])
+
+    def test_fast_live_pass_observes_short_exit_crossing_before_latest_frame_replaces_it(self) -> None:
+        class AmplifiedBlockingDetector:
+            def __init__(self) -> None:
+                self.fast_started = threading.Event()
+                self.legacy_started = threading.Event()
+                self.release_fast = threading.Event()
+                self.release_legacy = threading.Event()
+                self.second_started = threading.Event()
+                self.calls = 0
+                self.values: list[int] = []
+                self.last_diagnostics = None
+
+            def _result(self, image: np.ndarray) -> list[PlateDetection]:
+                value = int(round(float(image.mean())))
+                self.values.append(value)
+                return (
+                    [PlateDetection(0.9, x=20, y=10, width=100, height=30)]
+                    if value in {101, 102, 103, 104}
+                    else []
+                )
+
+            def detect(self, image: np.ndarray) -> list[PlateDetection]:
+                self.calls += 1
+                if self.calls == 1:
+                    self.legacy_started.set()
+                    self.release_legacy.wait(1.0)
+                else:
+                    self.second_started.set()
+                return self._result(image)
+
+            def detect_with_policy(
+                self,
+                image: np.ndarray,
+                *,
+                allow_expensive_recovery: bool,
+                should_continue_expensive_recovery: object | None = None,
+            ) -> list[PlateDetection]:
+                self.calls += 1
+                if self.calls == 1:
+                    self.fast_started.set()
+                    self.release_fast.wait(1.0)
+                else:
+                    self.second_started.set()
+                return self._result(image)
+
+        detector = AmplifiedBlockingDetector()
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        processor = PlateDetectionProcessor(self.config, detector)
+        captured_at = datetime.now(timezone.utc)
+        processed: list[tuple[int, bool]] = []
+        first_empty = np.zeros((200, 400, 3), dtype=np.uint8)
+        worker.submit_frame(1, Direction.ENTRY, first_empty)
+
+        def consume_two_frames() -> None:
+            for _ in range(2):
+                pending = None
+                deadline = time.monotonic() + 1.0
+                while pending is None and time.monotonic() < deadline:
+                    pending = worker._take_due_frame()
+                    if pending is None:
+                        time.sleep(0.005)
+                if pending is None:
+                    return
+                camera_id, item = pending
+                result = processor.prepare_job(
+                    camera_id,
+                    item.direction,
+                    item.frame,
+                    captured_at=item.captured_at,
+                    observed_at=item.observed_at,
+                    received_at=item.received_at,
+                    frame_id=item.frame_id,
+                    expensive_recovery_guard=(
+                        lambda: not worker._has_pending_live_frame()
+                    ),
+                )
+                processed.append((camera_id, bool(result.detections)))
+
+        thread = threading.Thread(target=consume_two_frames)
+        thread.start()
+        self.assertTrue(
+            detector.fast_started.wait(0.2) or detector.legacy_started.is_set()
+        )
+        worker.submit_frame(
+            2,
+            Direction.EXIT,
+            np.full((200, 400, 3), 101, dtype=np.uint8),
+        )
+        if detector.fast_started.is_set():
+            detector.release_fast.set()
+            self.assertTrue(detector.second_started.wait(0.5))
+            for value in (102, 103, 104, 105):
+                worker.submit_frame(
+                    2,
+                    Direction.EXIT,
+                    np.full((200, 400, 3), value, dtype=np.uint8),
+                )
+        else:
+            for value in (102, 103, 104, 105):
+                worker.submit_frame(
+                    2,
+                    Direction.EXIT,
+                    np.full((200, 400, 3), value, dtype=np.uint8),
+                )
+            detector.release_legacy.set()
+        thread.join(2.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertIn((2, True), processed)
+        exit_metric = next(
+            item for item in worker.runtime_health().direction_metrics
+            if item.direction is Direction.EXIT
+        )
+        self.assertGreaterEqual(
+            exit_metric.live_frames_superseded_before_detector,
+            1,
+        )
+
+    def test_legacy_amplified_detector_loses_short_exit_crossing_to_latest_coalescing(self) -> None:
+        class LegacyBlockingDetector:
+            def __init__(self) -> None:
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.calls = 0
+                self.values: list[int] = []
+
+            def detect(self, image: np.ndarray) -> list[PlateDetection]:
+                self.calls += 1
+                if self.calls == 1:
+                    self.started.set()
+                    self.release.wait(1.0)
+                value = int(round(float(image.mean())))
+                self.values.append(value)
+                return (
+                    [PlateDetection(0.9, x=20, y=10, width=100, height=30)]
+                    if value in {101, 102, 103, 104}
+                    else []
+                )
+
+        detector = LegacyBlockingDetector()
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        processor = PlateDetectionProcessor(self.config, detector)
+        processed: list[tuple[int, bool]] = []
+        worker.submit_frame(
+            1,
+            Direction.ENTRY,
+            np.zeros((200, 400, 3), dtype=np.uint8),
+        )
+
+        def consume_two_frames() -> None:
+            for _ in range(2):
+                pending = None
+                deadline = time.monotonic() + 1.0
+                while pending is None and time.monotonic() < deadline:
+                    pending = worker._take_due_frame()
+                    if pending is None:
+                        time.sleep(0.005)
+                if pending is None:
+                    return
+                camera_id, item = pending
+                result = processor.prepare_job(
+                    camera_id,
+                    item.direction,
+                    item.frame,
+                    captured_at=item.captured_at,
+                    observed_at=item.observed_at,
+                    received_at=item.received_at,
+                    frame_id=item.frame_id,
+                )
+                processed.append((camera_id, bool(result.detections)))
+
+        thread = threading.Thread(target=consume_two_frames)
+        thread.start()
+        self.assertTrue(detector.started.wait(0.5))
+        for value in (101, 102, 103, 104, 105):
+            worker.submit_frame(
+                2,
+                Direction.EXIT,
+                np.full((200, 400, 3), value, dtype=np.uint8),
+            )
+        detector.release.set()
+        thread.join(2.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(detector.values, [0, 105])
+        self.assertNotIn((2, True), processed)
+        exit_metric = next(
+            item for item in worker.runtime_health().direction_metrics
+            if item.direction is Direction.EXIT
+        )
+        self.assertEqual(exit_metric.live_frames_superseded_before_detector, 4)
 
     def test_analysis_ingestion_keeps_bounded_frames_when_ui_preview_is_coalesced(self) -> None:
         worker = PlateRecognitionWorker(
@@ -2613,6 +2966,85 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         self.assertEqual((first[0], second[0], third[0]), ("live", "live", "replay"))
 
+    def test_replay_never_preempts_a_fresh_due_live_frame(self) -> None:
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        event = MotionEvent(
+            event_id=1,
+            camera_id=1,
+            direction=Direction.ENTRY,
+            started_at=1.0,
+            ended_at=1.1,
+            enqueued_at=time.monotonic(),
+            frames=(self._make_snapshot(99, 1.0),),
+        )
+        worker._replay_buffer.add(event)
+        worker.submit_frame(10, Direction.ENTRY, np.zeros((20, 40, 3), dtype=np.uint8))
+        worker.submit_frame(20, Direction.EXIT, np.zeros((20, 40, 3), dtype=np.uint8))
+        worker._live_frames_since_replay = LIVE_FRAMES_PER_REPLAY_FRAME
+
+        with patch("app.plate_recognition.time.monotonic", return_value=10.0):
+            first = worker._take_detector_frame(replay_enabled=True)
+            second = worker._take_detector_frame(replay_enabled=True)
+            third = worker._take_detector_frame(replay_enabled=True)
+
+        self.assertEqual((first[0], second[0], third[0]), ("live", "live", "replay"))
+        self.assertEqual({first[1], second[1]}, {10, 20})
+
+    def test_pending_exit_live_frame_blocks_entry_expensive_recovery(self) -> None:
+        class GuardRecordingDetector:
+            def __init__(self) -> None:
+                self.allowed: bool | None = None
+                self.guard_result: bool | None = None
+                self.last_diagnostics = None
+
+            def detect_with_policy(
+                self,
+                _image: np.ndarray,
+                *,
+                allow_expensive_recovery: bool,
+                should_continue_expensive_recovery: object | None = None,
+            ) -> list[PlateDetection]:
+                self.allowed = allow_expensive_recovery
+                self.guard_result = should_continue_expensive_recovery()
+                return []
+
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        detector = GuardRecordingDetector()
+        processor = PlateDetectionProcessor(self.config, detector)
+        worker.submit_frame(
+            20,
+            Direction.EXIT,
+            np.zeros((200, 400, 3), dtype=np.uint8),
+        )
+        now = time.monotonic()
+
+        processor.prepare_job(
+            10,
+            Direction.ENTRY,
+            np.zeros((200, 400, 3), dtype=np.uint8),
+            captured_at=datetime.now(timezone.utc),
+            observed_at=now,
+            received_at=now,
+            frame_id=1,
+            zero_detection_fallback_event_id=55,
+            motion_score=0.1,
+            event_frames=1,
+            expensive_recovery_guard=(
+                lambda: not worker._has_pending_live_frame()
+            ),
+        )
+
+        self.assertTrue(detector.allowed)
+        self.assertFalse(detector.guard_result)
+
     def test_historical_replay_detections_are_not_emitted_to_live_overlay(self) -> None:
         detector = FakePlateDetector(
             [PlateDetection(0.9, x=20, y=10, width=100, height=30)]
@@ -2813,6 +3245,50 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         self.assertIs(taken, crop)
         self.assertEqual(buffer.stale_count, 1)
+        self.assertEqual(
+            buffer.stale_counts_by_type()[OcrJobType.ZERO_DETECTION_FALLBACK],
+            1,
+        )
+        self.assertEqual(
+            buffer.stale_counts_by_type()[OcrJobType.DETECTOR_CROP],
+            0,
+        )
+
+    def test_runtime_health_classifies_stale_ocr_jobs_by_work_type(self) -> None:
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        queued_at = time.monotonic() - 30.0
+        worker._job_buffer.add(
+            self._make_ocr_job(
+                camera_id=1,
+                queued_at=queued_at,
+                job_type=OcrJobType.DETECTOR_CROP,
+            )
+        )
+        worker._job_buffer.add(
+            self._make_ocr_job(
+                camera_id=2,
+                queued_at=queued_at,
+                job_type=OcrJobType.ZERO_DETECTION_FALLBACK,
+            )
+        )
+        worker._job_buffer.add(
+            self._make_ocr_job(
+                camera_id=3,
+                queued_at=queued_at,
+                job_type=OcrJobType.STATIC_ZERO_DETECTION_RESCUE,
+            )
+        )
+
+        self.assertIsNone(worker._job_buffer.take())
+        health = worker.runtime_health()
+
+        self.assertEqual(health.stale_detector_crop, 1)
+        self.assertEqual(health.stale_zero_detection_fallback, 1)
+        self.assertEqual(health.stale_static_rescue, 1)
 
     def test_detector_crop_is_processed_next_after_busy_fallback(self) -> None:
         fallback_started = threading.Event()

@@ -180,6 +180,86 @@ class PlateDetectorTests(unittest.TestCase):
         self.assertTrue(detector.last_diagnostics.tiled_recovery_pass)
         self.assertEqual(detector.last_diagnostics.recovery_tile_count, 3)
 
+    def test_fast_live_pass_skips_expensive_recovery_on_wide_empty_roi(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [_empty_ssd_output()],
+            )
+
+            detections = detector.detect_with_policy(
+                np.full((256, 956, 3), 120, dtype=np.uint8),
+                allow_expensive_recovery=False,
+            )
+
+        self.assertEqual(detections, [])
+        self.assertEqual(request.calls, 1)
+        self.assertEqual(detector.last_diagnostics.raw_detector_calls, 1)
+        self.assertEqual(detector.last_diagnostics.enhanced_detector_calls, 0)
+        self.assertEqual(detector.last_diagnostics.tiled_detector_calls, 0)
+
+    def test_detector_diagnostics_count_tiled_inferences_and_contributed_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [
+                    _empty_ssd_output(),
+                    _empty_ssd_output(),
+                    _plate_ssd_output(),
+                    _empty_ssd_output(),
+                ],
+            )
+
+            detections = detector.detect(
+                np.full((256, 956, 3), 120, dtype=np.uint8)
+            )
+
+        self.assertEqual(request.calls, 4)
+        self.assertEqual(len(detections), 1)
+        diagnostics = detector.last_diagnostics
+        self.assertEqual(diagnostics.raw_detector_calls, 1)
+        self.assertEqual(diagnostics.enhanced_detector_calls, 0)
+        self.assertEqual(diagnostics.tiled_detector_calls, 3)
+        self.assertFalse(diagnostics.raw_hit)
+        self.assertFalse(diagnostics.enhanced_hit)
+        self.assertTrue(diagnostics.tiled_hit)
+
+    def test_hundred_wide_empty_misses_amplify_to_four_hundred_inferences(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [_empty_ssd_output() for _ in range(400)],
+            )
+            image = np.full((256, 956, 3), 120, dtype=np.uint8)
+
+            for _ in range(100):
+                self.assertEqual(detector.detect(image), [])
+
+        self.assertEqual(request.calls, 400)
+
+    def test_recovery_guard_stops_remaining_tiles_for_fresh_live_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            detector, request = _make_sequenced_detector(
+                Path(temp_directory),
+                [_empty_ssd_output(), _empty_ssd_output()],
+            )
+            guard_calls = 0
+
+            def recovery_guard() -> bool:
+                nonlocal guard_calls
+                guard_calls += 1
+                return guard_calls == 1
+
+            detections = detector.detect_with_policy(
+                np.full((256, 956, 3), 120, dtype=np.uint8),
+                allow_expensive_recovery=True,
+                should_continue_expensive_recovery=recovery_guard,
+            )
+
+        self.assertEqual(detections, [])
+        self.assertEqual(request.calls, 2)
+        self.assertEqual(detector.last_diagnostics.tiled_detector_calls, 1)
+
     def test_bright_raw_miss_does_not_run_enhanced_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temp_directory:
             detector, request = _make_sequenced_detector(

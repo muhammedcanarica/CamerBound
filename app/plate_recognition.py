@@ -104,6 +104,7 @@ MOTION_PIXEL_DIFFERENCE_THRESHOLD = 20
 MOTION_CONTINUE_THRESHOLD_RATIO = 0.60
 RECENT_PROCESSED_FRAME_ID_LIMIT = 256
 LIVE_FRAMES_PER_REPLAY_FRAME = 2
+EXPENSIVE_DETECTOR_RECOVERY_INTERVAL_SECONDS = 2.0
 LOW_LIGHT_THRESHOLD = 85.0
 LOW_LIGHT_GAMMA = 0.72
 SHADOW_DYNAMIC_RANGE_THRESHOLD = 80.0
@@ -209,8 +210,10 @@ def _log_plate_detector_diagnostics(
         "highest_plate_confidence=%s confidence_rejected=%s bbox_rejected=%s "
         "detector_input=%sx%s input_layout=%s input_dtype=%s roi_size=%sx%s "
         "resize_scale_x=%.4f resize_scale_y=%.4f aspect_distortion_ratio=%.2f "
-        "tiled_recovery=%s recovery_tiles=%s raw_detector_ms=%.1f "
-        "enhanced_detector_ms=%.1f tiled_detector_ms=%.1f detector_latency_ms=%.1f",
+        "raw_calls=%s enhanced_calls=%s tiled_recovery=%s tiled_calls=%s "
+        "raw_hit=%s enhanced_hit=%s tiled_hit=%s recovery_interrupted=%s "
+        "raw_detector_ms=%.1f enhanced_detector_ms=%.1f tiled_detector_ms=%.1f "
+        "detector_latency_ms=%.1f",
         camera_id,
         source,
         diagnostics.detector_variant,
@@ -237,8 +240,14 @@ def _log_plate_detector_diagnostics(
         diagnostics.resize_scale_x,
         diagnostics.resize_scale_y,
         diagnostics.aspect_distortion_ratio,
+        diagnostics.raw_detector_calls,
+        diagnostics.enhanced_detector_calls,
         "yes" if diagnostics.tiled_recovery_pass else "no",
-        diagnostics.recovery_tile_count,
+        diagnostics.tiled_detector_calls,
+        "yes" if diagnostics.raw_hit else "no",
+        "yes" if diagnostics.enhanced_hit else "no",
+        "yes" if diagnostics.tiled_hit else "no",
+        "yes" if diagnostics.expensive_recovery_interrupted else "no",
         diagnostics.raw_detector_ms,
         diagnostics.enhanced_detector_ms,
         diagnostics.tiled_detector_ms,
@@ -859,6 +868,33 @@ class CameraBufferHealth:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectionRecognitionMetrics:
+    direction: Direction
+    frames_ingested: int = 0
+    detector_frames_processed: int = 0
+    detector_hits: int = 0
+    detector_misses: int = 0
+    live_frames_superseded_before_detector: int = 0
+    ocr_jobs_queued: int = 0
+    valid_candidates: int = 0
+    saved_records: int = 0
+    detector_mean_ms: float | None = None
+    detector_p95_ms: float | None = None
+    detector_frame_age_mean_ms: float | None = None
+    detector_frame_age_p95_ms: float | None = None
+    raw_detector_calls: int = 0
+    enhanced_detector_calls: int = 0
+    tiled_recovery_events: int = 0
+    tiled_detector_calls: int = 0
+    raw_hits: int = 0
+    enhanced_hits: int = 0
+    tiled_hits: int = 0
+    raw_detector_ms: float = 0.0
+    enhanced_detector_ms: float = 0.0
+    tiled_detector_ms: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class RecognitionRuntimeHealth:
     frames_ingested: int = 0
     detector_frames_processed: int = 0
@@ -886,6 +922,9 @@ class RecognitionRuntimeHealth:
     queue_depth: int = 0
     dropped_jobs: int = 0
     stale_jobs: int = 0
+    stale_detector_crop: int = 0
+    stale_zero_detection_fallback: int = 0
+    stale_static_rescue: int = 0
     last_frame_age_seconds: float | None = None
     last_ocr_job_age_seconds: float | None = None
     last_inference_ok: bool | None = None
@@ -900,6 +939,17 @@ class RecognitionRuntimeHealth:
     queue_wait_p95_ms: float | None = None
     end_to_end_mean_ms: float | None = None
     end_to_end_p95_ms: float | None = None
+    raw_detector_calls: int = 0
+    enhanced_detector_calls: int = 0
+    tiled_recovery_events: int = 0
+    tiled_detector_calls: int = 0
+    raw_hits: int = 0
+    enhanced_hits: int = 0
+    tiled_hits: int = 0
+    raw_detector_ms: float = 0.0
+    enhanced_detector_ms: float = 0.0
+    tiled_detector_ms: float = 0.0
+    direction_metrics: tuple[DirectionRecognitionMetrics, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1434,6 +1484,7 @@ class OcrJobBuffer:
         self.dropped_count = 0
         self.replaced_count = 0
         self.stale_count = 0
+        self._stale_counts_by_type: dict[OcrJobType, int] = defaultdict(int)
         self._on_job_discarded = on_job_discarded
 
     def add(self, job: OcrJob) -> OcrBufferAddResult:
@@ -1655,8 +1706,16 @@ class OcrJobBuffer:
         camera_jobs.extend(kept)
         self.stale_count += discarded
         for job in discarded_jobs:
+            self._stale_counts_by_type[job.job_type] += 1
             self._notify_discarded(job)
         return discarded
+
+    def stale_counts_by_type(self) -> dict[OcrJobType, int]:
+        with self._condition:
+            return {
+                job_type: self._stale_counts_by_type.get(job_type, 0)
+                for job_type in OcrJobType
+            }
 
     def _max_age_seconds(self, job: OcrJob) -> float:
         if job.job_type is OcrJobType.DETECTOR_CROP:
@@ -1718,6 +1777,8 @@ class PlateDetectionProcessor:
         self._first_static_miss_at: dict[int, float] = {}
         self._last_static_rescue_at: dict[int, float] = {}
         self._last_valid_candidate_at: dict[int, float] = {}
+        self._last_expensive_recovery_at: dict[int, float] = {}
+        self._last_expensive_recovery_event_id: dict[int, int] = {}
         self._rescue_state_lock = threading.Lock()
         self._raw_capture_lock = threading.Lock()
         self._raw_capture_pending = threading.Event()
@@ -1747,6 +1808,7 @@ class PlateDetectionProcessor:
         motion_score: float | None = None,
         event_frames: int = 0,
         ring_depth: int = 0,
+        expensive_recovery_guard: Callable[[], bool] | None = None,
     ) -> DetectionJobResult:
         roi_crop = crop_roi(frame, self.config.roi_for(direction))
         if roi_crop is None:
@@ -1771,7 +1833,43 @@ class PlateDetectionProcessor:
 
         if detector_config.enabled and self.detector is not None:
             try:
-                detections = self.detector.detect(roi_crop)
+                policy_detect = getattr(self.detector, "detect_with_policy", None)
+                if callable(policy_detect):
+                    allow_expensive_recovery = (
+                        self._should_run_expensive_detector_recovery(
+                            camera_id,
+                            detector_source=detector_source,
+                            motion_event_id=zero_detection_fallback_event_id,
+                        )
+                    )
+                    detections = policy_detect(
+                        roi_crop,
+                        allow_expensive_recovery=allow_expensive_recovery,
+                        should_continue_expensive_recovery=(
+                            expensive_recovery_guard
+                        ),
+                    )
+                    diagnostics = getattr(self.detector, "last_diagnostics", None)
+                    if (
+                        allow_expensive_recovery
+                        and (
+                            not isinstance(diagnostics, DetectorDiagnostics)
+                            or (
+                                not diagnostics.raw_hit
+                                and not (
+                                    diagnostics.expensive_recovery_interrupted
+                                    and diagnostics.enhanced_detector_calls == 0
+                                    and diagnostics.tiled_detector_calls == 0
+                                )
+                            )
+                        )
+                    ):
+                        self._note_expensive_detector_recovery(
+                            camera_id,
+                            motion_event_id=zero_detection_fallback_event_id,
+                        )
+                else:
+                    detections = self.detector.detect(roi_crop)
                 tiled_recovery = (
                     getattr(self.detector, "last_diagnostics", None) is not None
                     and getattr(
@@ -2057,6 +2155,42 @@ class PlateDetectionProcessor:
             active_tracks=active_tracks,
             ignored_track_detections=ignored_track_detections,
         )
+
+    def _should_run_expensive_detector_recovery(
+        self,
+        camera_id: int,
+        *,
+        detector_source: str,
+        motion_event_id: int | None,
+    ) -> bool:
+        now = time.monotonic()
+        if motion_event_id is not None:
+            previous_event_id = self._last_expensive_recovery_event_id.get(camera_id)
+            if previous_event_id != motion_event_id:
+                return True
+
+        previous_at = self._last_expensive_recovery_at.get(camera_id)
+        if previous_at is None:
+            # Establish a cheap raw-pass baseline before periodic static recovery.
+            self._last_expensive_recovery_at[camera_id] = now
+            return False
+        if (
+            detector_source == "live"
+            and now - previous_at
+            >= EXPENSIVE_DETECTOR_RECOVERY_INTERVAL_SECONDS
+        ):
+            return True
+        return False
+
+    def _note_expensive_detector_recovery(
+        self,
+        camera_id: int,
+        *,
+        motion_event_id: int | None,
+    ) -> None:
+        self._last_expensive_recovery_at[camera_id] = time.monotonic()
+        if motion_event_id is not None:
+            self._last_expensive_recovery_event_id[camera_id] = motion_event_id
 
     def _should_run_static_zero_detection_rescue(
         self,
@@ -4778,6 +4912,7 @@ class PlateRecognitionWorker(QObject):
         self._last_processed_at: dict[int, float] = {}
         self._camera_order: deque[int] = deque()
         self._known_camera_ids: set[int] = set()
+        self._camera_directions: dict[int, Direction] = {}
         self._last_detection_diagnostic_at: dict[int, float] = {}
         self._last_ring_diagnostic_at: dict[int, float] = {}
         self._ingest_diagnostic_started_at: dict[int, float] = {}
@@ -4839,6 +4974,26 @@ class PlateRecognitionWorker(QObject):
         self._ocr_latency_ms: deque[float] = deque(maxlen=128)
         self._queue_wait_ms: deque[float] = deque(maxlen=128)
         self._end_to_end_ms: deque[float] = deque(maxlen=128)
+        self._frames_ingested_by_direction: dict[Direction, int] = defaultdict(int)
+        self._detector_processed_by_direction: dict[Direction, int] = defaultdict(int)
+        self._detector_hits_by_direction: dict[Direction, int] = defaultdict(int)
+        self._detector_misses_by_direction: dict[Direction, int] = defaultdict(int)
+        self._superseded_by_direction: dict[Direction, int] = defaultdict(int)
+        self._ocr_queued_by_direction: dict[Direction, int] = defaultdict(int)
+        self._valid_candidates_by_direction: dict[Direction, int] = defaultdict(int)
+        self._saved_by_direction: dict[Direction, int] = defaultdict(int)
+        self._detector_latency_by_direction: dict[Direction, deque[float]] = defaultdict(
+            lambda: deque(maxlen=128)
+        )
+        self._detector_frame_age_by_direction: dict[
+            Direction, deque[float]
+        ] = defaultdict(lambda: deque(maxlen=128))
+        self._detector_pass_counts_by_direction: dict[
+            Direction, dict[str, int]
+        ] = defaultdict(lambda: defaultdict(int))
+        self._detector_pass_ms_by_direction: dict[
+            Direction, dict[str, float]
+        ] = defaultdict(lambda: defaultdict(float))
 
     def arm_raw_capture(self, direction: Direction | None = None) -> bool:
         processor = self._detector_processor
@@ -4856,6 +5011,8 @@ class PlateRecognitionWorker(QObject):
             frame_id = self._next_frame_id
             self._next_frame_id += 1
             self._frames_ingested += 1
+            self._frames_ingested_by_direction[direction] += 1
+            self._camera_directions[camera_id] = direction
             self._last_frame_at = observed_at
         owned_frame = frame
         if isinstance(frame, np.ndarray) and frame.flags.writeable:
@@ -4916,6 +5073,8 @@ class PlateRecognitionWorker(QObject):
             if camera_id not in self._known_camera_ids:
                 self._known_camera_ids.add(camera_id)
                 self._camera_order.append(camera_id)
+            if camera_id in self._latest_frames:
+                self._superseded_by_direction[direction] += 1
             self._latest_frames[camera_id] = item
         self._wake_event.set()
 
@@ -4946,7 +5105,7 @@ class PlateRecognitionWorker(QObject):
         if not result.accepted:
             self._track_manager.mark_ocr_finished(job.track_id, dropped=True)
         elif result.accepted:
-            self._record_ocr_job_queued()
+            self._record_ocr_job_queued(job)
         return result
 
     @Slot()
@@ -5067,6 +5226,10 @@ class PlateRecognitionWorker(QObject):
                         item.ring_depth,
                     )
                     continue
+                detector_frame_age_ms = max(
+                    0.0,
+                    (time.monotonic() - item.observed_at) * 1000.0,
+                )
                 try:
                     result = detector_processor.prepare_job(
                         camera_id,
@@ -5082,6 +5245,9 @@ class PlateRecognitionWorker(QObject):
                         motion_score=item.motion_score,
                         event_frames=item.event_frames,
                         ring_depth=item.ring_depth,
+                        expensive_recovery_guard=(
+                            lambda: not self._has_pending_live_frame()
+                        ),
                     )
                 except Exception as exc:
                     LOGGER.exception("Transient plate detector error")
@@ -5093,7 +5259,14 @@ class PlateRecognitionWorker(QObject):
                 if source == "live":
                     self.detections_changed.emit(camera_id, result.detections)
                     self.tracks_changed.emit(camera_id, result.active_tracks)
-                self._record_detector_result(bool(result.detections), result.detector_ms)
+                self._record_detector_result(
+                    camera_id,
+                    item.direction,
+                    bool(result.detections),
+                    result.detector_ms,
+                    detector_frame_age_ms,
+                    getattr(detector, "last_diagnostics", None),
+                )
                 if not result.jobs:
                     if source == "live":
                         self.outcome_changed.emit(
@@ -5137,6 +5310,7 @@ class PlateRecognitionWorker(QObject):
                 self._latest_frames.clear()
                 self._camera_order.clear()
                 self._known_camera_ids.clear()
+                self._camera_directions.clear()
                 self._processed_frame_ids.clear()
                 self._processed_frame_id_sets.clear()
                 self._completed_motion_events.clear()
@@ -5149,6 +5323,10 @@ class PlateRecognitionWorker(QObject):
         now = time.monotonic()
         with self._lock:
             camera_ids = tuple(sorted(self._known_camera_ids))
+            direction_metrics = tuple(
+                self._direction_metrics_locked(direction)
+                for direction in (Direction.ENTRY, Direction.EXIT)
+            )
             values = {
                 "frames_ingested": self._frames_ingested,
                 "detector_frames_processed": self._detector_frames_processed,
@@ -5202,29 +5380,136 @@ class PlateRecognitionWorker(QObject):
                 "queue_wait_p95_ms": _p95_or_none(self._queue_wait_ms),
                 "end_to_end_mean_ms": _mean_or_none(self._end_to_end_ms),
                 "end_to_end_p95_ms": _p95_or_none(self._end_to_end_ms),
+                "raw_detector_calls": sum(
+                    item.raw_detector_calls for item in direction_metrics
+                ),
+                "enhanced_detector_calls": sum(
+                    item.enhanced_detector_calls for item in direction_metrics
+                ),
+                "tiled_recovery_events": sum(
+                    item.tiled_recovery_events for item in direction_metrics
+                ),
+                "tiled_detector_calls": sum(
+                    item.tiled_detector_calls for item in direction_metrics
+                ),
+                "raw_hits": sum(item.raw_hits for item in direction_metrics),
+                "enhanced_hits": sum(
+                    item.enhanced_hits for item in direction_metrics
+                ),
+                "tiled_hits": sum(item.tiled_hits for item in direction_metrics),
+                "raw_detector_ms": sum(
+                    item.raw_detector_ms for item in direction_metrics
+                ),
+                "enhanced_detector_ms": sum(
+                    item.enhanced_detector_ms for item in direction_metrics
+                ),
+                "tiled_detector_ms": sum(
+                    item.tiled_detector_ms for item in direction_metrics
+                ),
+                "direction_metrics": direction_metrics,
             }
+        stale_counts = self._job_buffer.stale_counts_by_type()
         return RecognitionRuntimeHealth(
             **values,
             queue_depth=self._job_buffer.pending_count(),
             dropped_jobs=self._job_buffer.dropped_count,
             stale_jobs=self._job_buffer.stale_count,
+            stale_detector_crop=stale_counts[OcrJobType.DETECTOR_CROP],
+            stale_zero_detection_fallback=(
+                stale_counts[OcrJobType.ZERO_DETECTION_FALLBACK]
+            ),
+            stale_static_rescue=(
+                stale_counts[OcrJobType.STATIC_ZERO_DETECTION_RESCUE]
+            ),
             buffers=tuple(
                 self._frame_buffer.health(camera_id, now) for camera_id in camera_ids
             ),
         )
 
-    def _record_detector_result(self, detected: bool, detector_ms: float) -> None:
+    def _direction_metrics_locked(
+        self,
+        direction: Direction,
+    ) -> DirectionRecognitionMetrics:
+        counts = self._detector_pass_counts_by_direction[direction]
+        timings = self._detector_pass_ms_by_direction[direction]
+        detector_latency = self._detector_latency_by_direction[direction]
+        frame_age = self._detector_frame_age_by_direction[direction]
+        return DirectionRecognitionMetrics(
+            direction=direction,
+            frames_ingested=self._frames_ingested_by_direction[direction],
+            detector_frames_processed=self._detector_processed_by_direction[direction],
+            detector_hits=self._detector_hits_by_direction[direction],
+            detector_misses=self._detector_misses_by_direction[direction],
+            live_frames_superseded_before_detector=self._superseded_by_direction[
+                direction
+            ],
+            ocr_jobs_queued=self._ocr_queued_by_direction[direction],
+            valid_candidates=self._valid_candidates_by_direction[direction],
+            saved_records=self._saved_by_direction[direction],
+            detector_mean_ms=_mean_or_none(detector_latency),
+            detector_p95_ms=_p95_or_none(detector_latency),
+            detector_frame_age_mean_ms=_mean_or_none(frame_age),
+            detector_frame_age_p95_ms=_p95_or_none(frame_age),
+            raw_detector_calls=counts["raw_calls"],
+            enhanced_detector_calls=counts["enhanced_calls"],
+            tiled_recovery_events=counts["tiled_events"],
+            tiled_detector_calls=counts["tiled_calls"],
+            raw_hits=counts["raw_hits"],
+            enhanced_hits=counts["enhanced_hits"],
+            tiled_hits=counts["tiled_hits"],
+            raw_detector_ms=timings["raw_ms"],
+            enhanced_detector_ms=timings["enhanced_ms"],
+            tiled_detector_ms=timings["tiled_ms"],
+        )
+
+    def _record_detector_result(
+        self,
+        camera_id: int,
+        direction: Direction,
+        detected: bool,
+        detector_ms: float,
+        detector_frame_age_ms: float,
+        diagnostics: DetectorDiagnostics | None,
+    ) -> None:
         with self._lock:
+            self._camera_directions[camera_id] = direction
             self._detector_frames_processed += 1
             self._detector_latency_ms.append(max(0.0, detector_ms))
+            self._detector_processed_by_direction[direction] += 1
+            self._detector_latency_by_direction[direction].append(
+                max(0.0, detector_ms)
+            )
+            self._detector_frame_age_by_direction[direction].append(
+                max(0.0, detector_frame_age_ms)
+            )
             if detected:
                 self._detector_hits += 1
+                self._detector_hits_by_direction[direction] += 1
             else:
                 self._detector_misses += 1
+                self._detector_misses_by_direction[direction] += 1
+            if diagnostics is not None:
+                counts = self._detector_pass_counts_by_direction[direction]
+                timings = self._detector_pass_ms_by_direction[direction]
+                counts["raw_calls"] += diagnostics.raw_detector_calls
+                counts["enhanced_calls"] += diagnostics.enhanced_detector_calls
+                counts["tiled_calls"] += diagnostics.tiled_detector_calls
+                counts["tiled_events"] += int(
+                    diagnostics.tiled_detector_calls > 0
+                )
+                counts["raw_hits"] += int(diagnostics.raw_hit)
+                counts["enhanced_hits"] += int(diagnostics.enhanced_hit)
+                counts["tiled_hits"] += int(diagnostics.tiled_hit)
+                timings["raw_ms"] += max(0.0, diagnostics.raw_detector_ms)
+                timings["enhanced_ms"] += max(
+                    0.0, diagnostics.enhanced_detector_ms
+                )
+                timings["tiled_ms"] += max(0.0, diagnostics.tiled_detector_ms)
 
-    def _record_ocr_job_queued(self) -> None:
+    def _record_ocr_job_queued(self, job: OcrJob) -> None:
         with self._lock:
             self._ocr_jobs_queued += 1
+            self._ocr_queued_by_direction[job.direction] += 1
 
     def _record_ocr_job_processed(
         self,
@@ -5244,6 +5529,7 @@ class PlateRecognitionWorker(QObject):
             self._last_state = outcome.state
             if outcome.candidate is not None:
                 self._valid_candidates += 1
+                self._valid_candidates_by_direction[_job.direction] += 1
                 self._last_candidate = outcome.candidate.plate
 
     def _record_ocr_inference_error(self) -> None:
@@ -5259,6 +5545,9 @@ class PlateRecognitionWorker(QObject):
                 self._last_candidate = outcome.candidate.plate
             if outcome.record is not None:
                 self._saved_records += 1
+                direction = self._camera_directions.get(camera_id)
+                if direction is not None:
+                    self._saved_by_direction[direction] += 1
             if outcome.state is RecognitionState.AWAITING_CONFIRMATION:
                 self._awaiting_confirmation += 1
             if outcome.record is not None:
@@ -5518,14 +5807,6 @@ class PlateRecognitionWorker(QObject):
         *,
         replay_enabled: bool,
     ) -> tuple[str, int, _PendingFrame] | None:
-        if (
-            replay_enabled
-            and self._live_frames_since_replay >= LIVE_FRAMES_PER_REPLAY_FRAME
-        ):
-            replay = self._take_replay_frame()
-            if replay is not None:
-                self._live_frames_since_replay = 0
-                return replay
         live = self._take_due_frame()
         if live is not None:
             self._live_frames_since_replay += 1
@@ -5537,6 +5818,10 @@ class PlateRecognitionWorker(QObject):
                 self._live_frames_since_replay = 0
                 return replay
         return None
+
+    def _has_pending_live_frame(self) -> bool:
+        with self._lock:
+            return bool(self._latest_frames)
 
     def _take_replay_frame(self) -> tuple[str, int, _PendingFrame] | None:
         replay_item = self._replay_buffer.take_with_event()

@@ -815,14 +815,28 @@ class CameraSettingsWidget(QWidget):
             )
             lines.append(
                 f"Queue: {health.queue_depth}, drop={health.dropped_jobs}, "
-                f"stale={health.stale_jobs}"
+                f"stale={health.stale_jobs} "
+                f"(detector-crop={health.stale_detector_crop}, "
+                f"zero-fallback={health.stale_zero_detection_fallback}, "
+                f"static-rescue={health.stale_static_rescue})"
             )
-            if health.detector_mean_ms is not None:
-                def latency_pair(mean: float | None, p95: float | None) -> str:
-                    if mean is None or p95 is None:
-                        return "yok"
-                    return f"{mean:.1f}/{p95:.1f} ms"
+            lines.append(
+                "Detector pass: "
+                f"raw={health.raw_detector_calls} (hit={health.raw_hits}), "
+                f"enhanced={health.enhanced_detector_calls} "
+                f"(hit={health.enhanced_hits}), "
+                f"tiled-event={health.tiled_recovery_events}, "
+                f"tile-call={health.tiled_detector_calls} "
+                f"(hit={health.tiled_hits}); süre raw/enhanced/tiled="
+                f"{health.raw_detector_ms:.0f}/{health.enhanced_detector_ms:.0f}/"
+                f"{health.tiled_detector_ms:.0f} ms"
+            )
+            def latency_pair(mean: float | None, p95: float | None) -> str:
+                if mean is None or p95 is None:
+                    return "yok"
+                return f"{mean:.1f}/{p95:.1f} ms"
 
+            if health.detector_mean_ms is not None:
                 lines.append(
                     "Latency (son 128): "
                     f"detector={latency_pair(health.detector_mean_ms, health.detector_p95_ms)}, "
@@ -841,6 +855,22 @@ class CameraSettingsWidget(QWidget):
                     f"ingest={buffer.recognition_ingest_fps:.2f} FPS, "
                     f"ring={buffer.estimated_ring_memory_mb:.1f} MiB, "
                     f"event={buffer.active_event_frames}"
+                )
+            for metric in health.direction_metrics:
+                lines.append(
+                    f"Yön {metric.direction.value}: "
+                    f"frame={metric.frames_ingested}, "
+                    f"detector={metric.detector_frames_processed} "
+                    f"(hit={metric.detector_hits}, miss={metric.detector_misses}), "
+                    f"superseded={metric.live_frames_superseded_before_detector}, "
+                    f"OCR={metric.ocr_jobs_queued}, aday={metric.valid_candidates}, "
+                    f"kayıt={metric.saved_records}, "
+                    f"detector mean/p95="
+                    f"{latency_pair(metric.detector_mean_ms, metric.detector_p95_ms)}, "
+                    f"frame-age mean/p95="
+                    f"{latency_pair(metric.detector_frame_age_mean_ms, metric.detector_frame_age_p95_ms)}, "
+                    f"raw/enhanced/tile-call={metric.raw_detector_calls}/"
+                    f"{metric.enhanced_detector_calls}/{metric.tiled_detector_calls}"
                 )
             self.diagnostics_ready.emit("\n".join(lines))
 

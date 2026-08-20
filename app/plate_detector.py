@@ -103,6 +103,14 @@ class DetectorDiagnostics:
     tiled_recovery_pass: bool = False
     recovery_tile_count: int = 0
     tiled_detector_ms: float = 0.0
+    raw_detector_calls: int = 0
+    enhanced_detector_calls: int = 0
+    tiled_detector_calls: int = 0
+    raw_hit: bool = False
+    enhanced_hit: bool = False
+    tiled_hit: bool = False
+    expensive_recovery_allowed: bool = True
+    expensive_recovery_interrupted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +180,18 @@ class OpenVinoPlateDetector:
             ) from exc
 
     def detect(self, image: np.ndarray) -> list[PlateDetection]:
+        return self.detect_with_policy(
+            image,
+            allow_expensive_recovery=True,
+        )
+
+    def detect_with_policy(
+        self,
+        image: np.ndarray,
+        *,
+        allow_expensive_recovery: bool,
+        should_continue_expensive_recovery: Callable[[], bool] | None = None,
+    ) -> list[PlateDetection]:
         if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
             raise PlateDetectorError("Plate detector input'u BGR renkli görüntü olmalıdır.")
         self.last_diagnostics = None
@@ -192,14 +212,40 @@ class OpenVinoPlateDetector:
                 raw_detector_ms=raw_detector_ms,
                 enhanced_detector_ms=0.0,
                 detections=len(raw_detections),
+                raw_detector_calls=1,
+                raw_hit=True,
+                expensive_recovery_allowed=allow_expensive_recovery,
                 **self._diagnostic_context(image, raw_parse),
             )
             return raw_detections
 
         lighting = measure_detector_lighting(image)
+        if not allow_expensive_recovery:
+            self.last_diagnostics = DetectorDiagnostics(
+                detector_variant="raw",
+                raw_brightness=lighting.mean_brightness,
+                shadow_metric=lighting.shadow_metric,
+                enhanced_pass=False,
+                raw_detector_ms=raw_detector_ms,
+                enhanced_detector_ms=0.0,
+                detections=0,
+                raw_detector_calls=1,
+                expensive_recovery_allowed=False,
+                **self._diagnostic_context(image, raw_parse),
+            )
+            return []
+
         enhanced_detections: list[PlateDetection] = []
         enhanced_detector_ms = 0.0
-        enhanced_pass = lighting.is_difficult
+        enhanced_pass = False
+        recovery_interrupted = False
+        enhanced_parse = raw_parse
+        if lighting.is_difficult:
+            enhanced_pass = (
+                should_continue_expensive_recovery is None
+                or should_continue_expensive_recovery()
+            )
+            recovery_interrupted = not enhanced_pass
         if enhanced_pass:
             enhanced = enhance_shadowed_detector_image(image)
             enhanced_started_at = time.perf_counter()
@@ -220,6 +266,10 @@ class OpenVinoPlateDetector:
                     raw_detector_ms=raw_detector_ms,
                     enhanced_detector_ms=enhanced_detector_ms,
                     detections=len(enhanced_detections),
+                    raw_detector_calls=1,
+                    enhanced_detector_calls=1,
+                    enhanced_hit=True,
+                    expensive_recovery_allowed=True,
                     **self._diagnostic_context(image, enhanced_parse),
                 )
                 return enhanced_detections
@@ -228,12 +278,22 @@ class OpenVinoPlateDetector:
         tiled_started_at = time.perf_counter()
         tiled_detections: list[PlateDetection] = []
         tiled_parse = SsdParseDiagnostics(0, 0, None, 0, 0)
+        tiled_detector_calls = 0
         for x_offset, tile in tiles:
+            if recovery_interrupted:
+                break
+            if (
+                should_continue_expensive_recovery is not None
+                and not should_continue_expensive_recovery()
+            ):
+                recovery_interrupted = True
+                break
             tile_detections, tile_parse = self._infer_detections(
                 tile,
                 coordinate_width=tile.shape[1],
                 coordinate_height=tile.shape[0],
             )
+            tiled_detector_calls += 1
             tiled_detections.extend(
                 PlateDetection(
                     confidence=detection.confidence,
@@ -247,7 +307,11 @@ class OpenVinoPlateDetector:
             tiled_parse = _merge_parse_diagnostics(tiled_parse, tile_parse)
         tiled_detector_ms = (time.perf_counter() - tiled_started_at) * 1000.0
         tiled_detections = _deduplicate_detections(tiled_detections)
-        final_parse = tiled_parse if tiles else raw_parse
+        final_parse = (
+            tiled_parse
+            if tiled_detector_calls
+            else enhanced_parse if enhanced_pass else raw_parse
+        )
         self.last_diagnostics = DetectorDiagnostics(
             detector_variant="tiled" if tiled_detections else (
                 "enhanced" if enhanced_pass else "raw"
@@ -258,9 +322,15 @@ class OpenVinoPlateDetector:
             raw_detector_ms=raw_detector_ms,
             enhanced_detector_ms=enhanced_detector_ms,
             detections=len(tiled_detections),
-            tiled_recovery_pass=bool(tiles),
-            recovery_tile_count=len(tiles),
+            tiled_recovery_pass=tiled_detector_calls > 0,
+            recovery_tile_count=tiled_detector_calls,
             tiled_detector_ms=tiled_detector_ms,
+            raw_detector_calls=1,
+            enhanced_detector_calls=1 if enhanced_pass else 0,
+            tiled_detector_calls=tiled_detector_calls,
+            tiled_hit=bool(tiled_detections),
+            expensive_recovery_allowed=True,
+            expensive_recovery_interrupted=recovery_interrupted,
             **self._diagnostic_context(image, final_parse),
         )
         return tiled_detections
