@@ -128,7 +128,11 @@ class LoginFlowSmokeTest(unittest.TestCase):
         self.application.processEvents()
         self.assertTrue(dashboard.isVisible())
         self.assertEqual(dashboard.user.username, "admin")
-        self.assertEqual(dashboard.stack.count(), 5)
+        self.assertEqual(dashboard.stack.count(), 4)
+        self.assertNotIn(
+            "İçerideki Araçlar",
+            [button.text() for button in dashboard.nav_buttons],
+        )
         self.assertTrue(dashboard.dashboard_home.recent_table.isVisible())
         recent_headers = [
             dashboard.dashboard_home.recent_table.horizontalHeaderItem(index).text()
@@ -341,7 +345,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
         dashboard.dashboard_home._record_saved(saved_record)
         self.assertEqual(card.last_plate.text(), "Son okunan plaka: 34CLK536")
 
-        users_page = dashboard.pages[3]
+        users_page = dashboard.pages[2]
         for username, role in (("ui-user", Role.USER), ("ui-admin", Role.ADMIN)):
             with self.subTest(role=role):
                 role_index = users_page.role_input.findData(role)
@@ -364,7 +368,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
                 }
                 self.assertIn(username, table_usernames)
 
-        camera_settings = dashboard.pages[4]
+        camera_settings = dashboard.pages[3]
         dashboard.stack.setCurrentWidget(camera_settings)
         camera_settings.refresh()
         self.application.processEvents()
@@ -498,7 +502,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
         admin = self.controller.auth_service.authenticate("admin", "admin123")
         self.controller.show_dashboard(admin)
         dashboard = self.controller.dashboard_window
-        data_pages = dashboard.pages[:3]
+        data_pages = dashboard.pages[:2]
 
         self.assertEqual(
             dashboard._auto_refresh_timer.interval(),
@@ -509,10 +513,8 @@ class LoginFlowSmokeTest(unittest.TestCase):
 
         with patch.object(data_pages[0], "refresh") as dashboard_refresh, patch.object(
             data_pages[1], "refresh"
-        ) as records_refresh, patch.object(
-            data_pages[2], "refresh"
-        ) as inside_refresh:
-            refreshes = (dashboard_refresh, records_refresh, inside_refresh)
+        ) as records_refresh:
+            refreshes = (dashboard_refresh, records_refresh)
             for active_index, expected_refresh in enumerate(refreshes):
                 with self.subTest(active_index=active_index):
                     for refresh in refreshes:
@@ -529,7 +531,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
 
             for refresh in refreshes:
                 refresh.reset_mock()
-            dashboard.stack.setCurrentIndex(3)
+            dashboard.stack.setCurrentIndex(2)
             dashboard._refresh_active_data_page()
             for refresh in refreshes:
                 refresh.assert_not_called()
@@ -694,22 +696,17 @@ class LoginFlowSmokeTest(unittest.TestCase):
             self.controller.plate_service,
             "get_record_day_summaries",
             wraps=self.controller.plate_service.get_record_day_summaries,
-        ) as record_days, patch.object(
-            self.controller.plate_service,
-            "get_vehicles_inside",
-            wraps=self.controller.plate_service.get_vehicles_inside,
-        ) as vehicles_inside:
+        ) as record_days:
             self.controller.recognition_service.record_saved.emit(record)
 
         recent_records.assert_called_once()
         record_days.assert_called_once()
-        vehicles_inside.assert_called_once()
 
     def test_manual_refresh_page_switch_and_records_filter_state_are_preserved(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")
         self.controller.show_dashboard(admin)
         dashboard = self.controller.dashboard_window
-        home, records_page, inside_page = dashboard.pages[:3]
+        home, records_page = dashboard.pages[:2]
 
         with patch.object(
             self.controller.plate_service,
@@ -726,14 +723,6 @@ class LoginFlowSmokeTest(unittest.TestCase):
         ) as record_days:
             records_page.refresh_button.click()
         record_days.assert_called_once()
-
-        with patch.object(
-            self.controller.plate_service,
-            "get_vehicles_inside",
-            wraps=self.controller.plate_service.get_vehicles_inside,
-        ) as vehicles_inside:
-            inside_page.refresh_button.click()
-        vehicles_inside.assert_called_once()
 
         with patch.object(records_page, "refresh") as records_refresh:
             dashboard._activate_page(1)
@@ -773,7 +762,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
         original_protected_password = configured.protected_password
 
         self.controller.show_dashboard(admin)
-        settings_page = self.controller.dashboard_window.pages[4]
+        settings_page = self.controller.dashboard_window.pages[3]
         self.controller.dashboard_window.stack.setCurrentWidget(settings_page)
         settings_page.refresh()
         self.application.processEvents()
@@ -918,7 +907,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
             password="test-password",
         )
         self.controller.show_dashboard(admin)
-        settings_page = self.controller.dashboard_window.pages[4]
+        settings_page = self.controller.dashboard_window.pages[3]
         settings_page.refresh()
 
         with patch("ui.admin_widget.CameraCredentialsDialog") as dialog_factory, patch(
@@ -949,7 +938,11 @@ class LoginFlowSmokeTest(unittest.TestCase):
         self.application.processEvents()
 
         dashboard = self.controller.dashboard_window
-        self.assertEqual(dashboard.stack.count(), 3)
+        self.assertEqual(dashboard.stack.count(), 2)
+        self.assertNotIn(
+            "İçerideki Araçlar",
+            [button.text() for button in dashboard.nav_buttons],
+        )
         camera = self.controller.camera_service.list_cameras()[0]
         dashboard.dashboard_home.camera_directions[camera.id] = camera.direction
         dashboard.dashboard_home._show_recognition_outcome(
@@ -1075,7 +1068,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
     def test_delete_all_requires_exact_confirmation_text(self) -> None:
         admin = self.controller.auth_service.authenticate("admin", "admin123")
         self.controller.show_dashboard(admin)
-        settings_page = self.controller.dashboard_window.pages[4]
+        settings_page = self.controller.dashboard_window.pages[3]
 
         with patch.object(
             self.controller.plate_service,
@@ -1101,7 +1094,7 @@ class LoginFlowSmokeTest(unittest.TestCase):
         QTest.mouseClick(login.login_button, Qt.MouseButton.LeftButton)
         self.application.processEvents()
 
-        role_input = self.controller.dashboard_window.pages[3].role_input
+        role_input = self.controller.dashboard_window.pages[2].role_input
         role_input.ensurePolished()
         role_input.view().ensurePolished()
         popup_palette = role_input.view().palette()

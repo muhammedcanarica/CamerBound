@@ -24,7 +24,6 @@ from app.plate_service import (
     PlateRecord,
     PlateRecordDaySummary,
     PlateService,
-    VehicleInside,
 )
 from ui.display_helpers import display_timestamp
 from ui.record_detail_dialog import RecordDetailDialog
@@ -246,49 +245,3 @@ class RecordsWidget(QWidget):
             return
         dialog = RecordDetailDialog(record, self.plate_service, self)
         dialog.exec()
-
-
-class InsideVehiclesWidget(QWidget):
-    def __init__(self, plate_service: PlateService, user: SessionUser) -> None:
-        super().__init__()
-        self.plate_service = plate_service
-        self.user = user
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 22)
-        layout.setSpacing(14)
-        header = QHBoxLayout()
-        header.addWidget(QLabel("İçerideki Araçlar", objectName="pageTitle"))
-        header.addStretch()
-        self.refresh_button = QPushButton("Yenile")
-        self.refresh_button.clicked.connect(self.refresh)
-        header.addWidget(self.refresh_button)
-        layout.addLayout(header)
-        description = QLabel(
-            "Son hareketi giriş olan araçlar gösterilir.", objectName="mutedLabel"
-        )
-        layout.addWidget(description)
-        self.table = QTableWidget()
-        prepare_table(self.table, ["Plaka", "Giriş zamanı", "Kamera"])
-        layout.addWidget(self.table, 1)
-
-    def refresh(self) -> None:
-        try:
-            vehicles = self.plate_service.get_vehicles_inside(self.user)
-        except (ValueError, PermissionError) as exc:
-            QMessageBox.warning(self, "Araçlar alınamadı", str(exc))
-            return
-        self._populate(vehicles)
-
-    def _populate(self, vehicles: list[VehicleInside]) -> None:
-        self.table.setRowCount(len(vehicles))
-        for row_index, vehicle in enumerate(vehicles):
-            values = (
-                vehicle.plate,
-                display_timestamp(vehicle.entry_time),
-                vehicle.camera_name,
-            )
-            for column, value in enumerate(values):
-                self.table.setItem(row_index, column, QTableWidgetItem(value))

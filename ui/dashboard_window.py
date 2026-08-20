@@ -36,11 +36,7 @@ from app.plate_recognition import (
 from app.plate_service import PlateRecord, PlateService
 from ui.admin_widget import CameraSettingsWidget, UsersAdminWidget
 from ui.display_helpers import display_plate, display_timestamp
-from ui.records_widget import (
-    InsideVehiclesWidget,
-    RecordsWidget,
-    prepare_table,
-)
+from ui.records_widget import RecordsWidget, prepare_table
 
 
 AUTO_REFRESH_INTERVAL_MS = 5_000
@@ -753,12 +749,6 @@ class DashboardWindow(QMainWindow):
             "Kayıtlar",
             RecordsWidget(self.plate_service, self.user),
         )
-        self._add_page(
-            sidebar_layout,
-            "İçerideki Araçlar",
-            InsideVehiclesWidget(self.plate_service, self.user),
-        )
-
         if self.user.role is Role.ADMIN:
             self._add_page(
                 sidebar_layout,
@@ -808,10 +798,7 @@ class DashboardWindow(QMainWindow):
     @Slot()
     def _refresh_active_data_page(self) -> None:
         page = self.stack.currentWidget()
-        if not isinstance(
-            page,
-            (DashboardHome, RecordsWidget, InsideVehiclesWidget),
-        ):
+        if not isinstance(page, (DashboardHome, RecordsWidget)):
             return
         if isinstance(page, DashboardHome):
             page.refresh(preserve_preview=True)
@@ -820,18 +807,16 @@ class DashboardWindow(QMainWindow):
 
     @Slot(object)
     def _refresh_record_pages(self, _record: PlateRecord) -> None:
-        for page in self.pages[1:3]:
-            refresh = getattr(page, "refresh", None)
-            if callable(refresh):
-                refresh()
+        for page in self.pages:
+            if isinstance(page, RecordsWidget):
+                page.refresh()
 
     @Slot()
     def _refresh_after_records_changed(self) -> None:
         self.dashboard_home.refresh()
-        for page in self.pages[1:3]:
-            refresh = getattr(page, "refresh", None)
-            if callable(refresh):
-                refresh()
+        for page in self.pages:
+            if isinstance(page, RecordsWidget):
+                page.refresh()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._auto_refresh_timer.stop()
