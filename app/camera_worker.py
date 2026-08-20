@@ -190,7 +190,8 @@ class CameraWorker(QObject):
     def _read_frames(self, capture: VideoCaptureLike) -> bool:
         last_preview_at = 0.0
         diagnostic_started_at = time.monotonic()
-        diagnostic_frame_count = 0
+        diagnostic_source_read_count = 0
+        diagnostic_analysis_emit_count = 0
         file_frame_interval = self._file_frame_interval(capture)
         next_file_frame_at = time.monotonic()
         is_network_source = _is_network_source(self.source)
@@ -216,6 +217,7 @@ class CameraWorker(QObject):
                 return self._stop_event.is_set()
 
             consecutive_read_failures = 0
+            diagnostic_source_read_count += 1
 
             now = time.monotonic()
             if now - last_preview_at >= self.preview_interval:
@@ -225,19 +227,24 @@ class CameraWorker(QObject):
                     setflags(write=False)
                 self.frame_ready.emit(self.camera_id, copied_frame)
                 last_preview_at = now
-                diagnostic_frame_count += 1
-                diagnostic_elapsed = now - diagnostic_started_at
-                if (
-                    LOGGER.isEnabledFor(logging.DEBUG)
-                    and diagnostic_elapsed >= 5.0
-                ):
-                    LOGGER.debug(
-                        "Camera worker throughput camera_id=%s camera_worker_fps=%.2f",
-                        self.camera_id,
-                        diagnostic_frame_count / max(diagnostic_elapsed, 0.001),
-                    )
-                    diagnostic_started_at = now
-                    diagnostic_frame_count = 0
+                diagnostic_analysis_emit_count += 1
+            diagnostic_elapsed = now - diagnostic_started_at
+            if (
+                LOGGER.isEnabledFor(logging.DEBUG)
+                and diagnostic_elapsed >= 5.0
+            ):
+                LOGGER.debug(
+                    "Camera worker throughput camera_id=%s source_read_fps=%.2f "
+                    "analysis_emit_fps=%.2f",
+                    self.camera_id,
+                    diagnostic_source_read_count
+                    / max(diagnostic_elapsed, 0.001),
+                    diagnostic_analysis_emit_count
+                    / max(diagnostic_elapsed, 0.001),
+                )
+                diagnostic_started_at = now
+                diagnostic_source_read_count = 0
+                diagnostic_analysis_emit_count = 0
 
             if file_frame_interval is not None:
                 next_file_frame_at += file_frame_interval

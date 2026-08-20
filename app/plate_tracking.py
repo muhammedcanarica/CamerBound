@@ -14,6 +14,7 @@ from app.plate_detector import PlateDetection
 LOGGER = logging.getLogger(__name__)
 TRACK_LIMIT_LOG_INTERVAL_SECONDS = 5.0
 TRACK_CANDIDATE_LIMIT = 8
+TRACK_DETECTOR_FRAME_ID_LIMIT = 32
 TRACK_VALID_FRAME_ID_LIMIT = 16
 TRACK_CENTER_DISTANCE_THRESHOLD = 1.25
 _TrackPair = tuple[tuple[int, float, float], int, int, float, float]
@@ -59,6 +60,7 @@ class PlateTrack:
     finalized: bool = False
     retired_at: float | None = None
     ocr_candidates: dict[str, _TrackCandidateEvidence] = field(default_factory=dict)
+    detector_frame_ids: set[int] = field(default_factory=set)
     valid_ocr_frame_ids: set[int] = field(default_factory=set)
 
 
@@ -79,6 +81,7 @@ class PlateTrackSnapshot:
     ocr_jobs_completed: int
     ocr_jobs_dropped: int
     valid_ocr_result_count: int
+    detector_frame_ids: tuple[int, ...]
     valid_ocr_frame_ids: tuple[int, ...]
     best_text: str | None
     best_confidence: float
@@ -131,6 +134,7 @@ class PlateTrackManager:
         *,
         activity_at: float | None = None,
         direction: str | None = None,
+        detector_frame_id: int | None = None,
     ) -> PlateTrackingUpdate:
         lifecycle_at = observed_at if activity_at is None else activity_at
         with self._lock:
@@ -175,6 +179,7 @@ class PlateTrackManager:
                     detection,
                     observed_at,
                     lifecycle_at,
+                    detector_frame_id,
                 )
                 used_detections.add(detection_index)
                 used_tracks.add(track_id)
@@ -207,6 +212,7 @@ class PlateTrackManager:
                     observed_at,
                     lifecycle_at,
                     direction,
+                    detector_frame_id,
                 )
                 active[track.track_id] = track
                 self._tracks_by_id[track.track_id] = track
@@ -425,6 +431,7 @@ class PlateTrackManager:
         observed_at: float,
         activity_at: float,
         direction: str | None,
+        detector_frame_id: int | None,
     ) -> PlateTrack:
         track = PlateTrack(
             track_id=self._next_track_id,
@@ -437,6 +444,8 @@ class PlateTrackManager:
             last_activity_at=activity_at,
             last_detection_confidence=detection.confidence,
         )
+        if detector_frame_id is not None:
+            track.detector_frame_ids.add(detector_frame_id)
         self._next_track_id += 1
         return track
 
@@ -446,6 +455,7 @@ class PlateTrackManager:
         detection: PlateDetection,
         observed_at: float,
         activity_at: float,
+        detector_frame_id: int | None,
     ) -> None:
         if observed_at >= track.last_seen_at:
             track.bbox = _detection_bbox(detection)
@@ -453,6 +463,11 @@ class PlateTrackManager:
         track.last_seen_at = max(track.last_seen_at, observed_at)
         track.last_activity_at = max(track.last_activity_at, activity_at)
         track.detector_update_count += 1
+        if (
+            detector_frame_id is not None
+            and len(track.detector_frame_ids) < TRACK_DETECTOR_FRAME_ID_LIMIT
+        ):
+            track.detector_frame_ids.add(detector_frame_id)
 
     def _camera_snapshots_locked(
         self,
@@ -484,6 +499,7 @@ class PlateTrackManager:
             ocr_jobs_completed=track.ocr_jobs_completed,
             ocr_jobs_dropped=track.ocr_jobs_dropped,
             valid_ocr_result_count=track.valid_ocr_result_count,
+            detector_frame_ids=tuple(sorted(track.detector_frame_ids)),
             valid_ocr_frame_ids=tuple(sorted(track.valid_ocr_frame_ids)),
             best_text=track.best_text,
             best_confidence=track.best_confidence,

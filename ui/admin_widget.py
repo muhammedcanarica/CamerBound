@@ -777,6 +777,8 @@ class CameraSettingsWidget(QWidget):
                 "Runtime: "
                 f"frame={health.frames_ingested} (son={last_frame}), "
                 f"detector={health.detector_frames_processed} "
+                f"(live={health.live_detector_frames_processed}, "
+                f"replay={health.replay_detector_frames_processed}), "
                 f"(hit={health.detector_hits}, miss={health.detector_misses}), "
                 f"OCR={health.ocr_jobs_processed}/{health.ocr_jobs_queued}, "
                 f"aday={health.valid_candidates}, "
@@ -836,6 +838,15 @@ class CameraSettingsWidget(QWidget):
                     return "yok"
                 return f"{mean:.1f}/{p95:.1f} ms"
 
+            def latency_triplet(
+                mean: float | None,
+                p95: float | None,
+                maximum: float | None,
+            ) -> str:
+                if mean is None or p95 is None or maximum is None:
+                    return "yok"
+                return f"{mean:.1f}/{p95:.1f}/{maximum:.1f} ms"
+
             if health.detector_mean_ms is not None:
                 lines.append(
                     "Latency (son 128): "
@@ -859,18 +870,39 @@ class CameraSettingsWidget(QWidget):
             for metric in health.direction_metrics:
                 lines.append(
                     f"Yön {metric.direction.value}: "
-                    f"frame={metric.frames_ingested}, "
-                    f"detector={metric.detector_frames_processed} "
-                    f"(hit={metric.detector_hits}, miss={metric.detector_misses}), "
+                    f"live-ingest={metric.frames_ingested}, "
+                    f"live-detector={metric.live_detector_frames_processed} "
+                    f"(hit={metric.live_detector_hits}, miss={metric.live_detector_misses}), "
+                    f"replay-detector={metric.replay_detector_frames_processed} "
+                    f"(hit={metric.replay_detector_hits}, miss={metric.replay_detector_misses}), "
                     f"superseded={metric.live_frames_superseded_before_detector}, "
                     f"OCR={metric.ocr_jobs_queued}, aday={metric.valid_candidates}, "
-                    f"kayıt={metric.saved_records}, "
+                    f"kayıt={metric.saved_records}"
+                )
+                lines.append(
+                    f"Yön {metric.direction.value} latency: "
                     f"detector mean/p95="
                     f"{latency_pair(metric.detector_mean_ms, metric.detector_p95_ms)}, "
-                    f"frame-age mean/p95="
-                    f"{latency_pair(metric.detector_frame_age_mean_ms, metric.detector_frame_age_p95_ms)}, "
+                    f"live-age mean/p95/max="
+                    f"{latency_triplet(metric.live_detector_frame_age_mean_ms, metric.live_detector_frame_age_p95_ms, metric.live_detector_frame_age_max_ms)}, "
+                    f"replay-age mean/p95/max="
+                    f"{latency_triplet(metric.replay_detector_frame_age_mean_ms, metric.replay_detector_frame_age_p95_ms, metric.replay_detector_frame_age_max_ms)}, "
                     f"raw/enhanced/tile-call={metric.raw_detector_calls}/"
                     f"{metric.enhanced_detector_calls}/{metric.tiled_detector_calls}"
+                )
+            for metric in health.ocr_job_metrics:
+                candidate_yield = (
+                    0.0
+                    if metric.jobs_processed == 0
+                    else metric.valid_candidates / metric.jobs_processed * 100.0
+                )
+                lines.append(
+                    f"OCR iş {metric.job_type.value}: "
+                    f"processed={metric.jobs_processed}, "
+                    f"inference-call={metric.inference_calls}, "
+                    f"inference mean/p95="
+                    f"{latency_pair(metric.inference_mean_ms, metric.inference_p95_ms)}, "
+                    f"valid={metric.valid_candidates} ({candidate_yield:.1f}%)"
                 )
             self.diagnostics_ready.emit("\n".join(lines))
 

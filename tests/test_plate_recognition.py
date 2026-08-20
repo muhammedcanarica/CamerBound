@@ -2157,6 +2157,138 @@ class RecognitionPipelineTests(unittest.TestCase):
         self.assertEqual(entry.detector_frames_processed, 0)
         self.assertEqual(health.tiled_detector_calls, 2)
 
+    def test_runtime_health_separates_live_and_replay_detector_age(self) -> None:
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        worker._record_detector_result(
+            20,
+            Direction.EXIT,
+            True,
+            10.0,
+            10.0,
+            None,
+            "live",
+        )
+        worker._record_detector_result(
+            20,
+            Direction.EXIT,
+            False,
+            12.0,
+            20.0,
+            None,
+            "live",
+        )
+        worker._record_detector_result(
+            20,
+            Direction.EXIT,
+            True,
+            14.0,
+            9_000.0,
+            None,
+            "replay",
+        )
+
+        health = worker.runtime_health()
+        exit_direction = next(
+            item for item in health.direction_metrics
+            if item.direction is Direction.EXIT
+        )
+        self.assertEqual(health.live_detector_frames_processed, 2)
+        self.assertEqual(health.replay_detector_frames_processed, 1)
+        self.assertEqual(exit_direction.live_detector_frames_processed, 2)
+        self.assertEqual(exit_direction.live_detector_hits, 1)
+        self.assertEqual(exit_direction.live_detector_misses, 1)
+        self.assertEqual(exit_direction.replay_detector_frames_processed, 1)
+        self.assertEqual(exit_direction.replay_detector_hits, 1)
+        self.assertEqual(exit_direction.live_detector_frame_age_mean_ms, 15.0)
+        self.assertEqual(exit_direction.live_detector_frame_age_p95_ms, 20.0)
+        self.assertEqual(exit_direction.live_detector_frame_age_max_ms, 20.0)
+        self.assertEqual(exit_direction.replay_detector_frame_age_mean_ms, 9_000.0)
+        self.assertEqual(exit_direction.replay_detector_frame_age_p95_ms, 9_000.0)
+        self.assertEqual(exit_direction.replay_detector_frame_age_max_ms, 9_000.0)
+        self.assertEqual(exit_direction.detector_frame_age_mean_ms, 15.0)
+
+    def test_runtime_health_reports_ocr_cost_and_yield_by_job_type(self) -> None:
+        worker = PlateRecognitionWorker(
+            self.plate_service,
+            self.config,
+            provider_factory=FakeOcrProvider,
+        )
+        detector_job = self._make_ocr_job(
+            camera_id=2,
+            frame_id=100,
+            observed_at=10.0,
+            track_id=17,
+        )
+        detector_processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [[OcrSegment("34ABC123", 0.95, (0, 0, 10, 10), 0)]]
+            ),
+            self.plate_service,
+            self.config,
+        )
+        with self.assertLogs("app.plate_recognition", level="DEBUG") as captured:
+            detector_outcome = detector_processor.process_ocr_job(
+                detector_job,
+                queue_depth=0,
+            )
+        fallback_job = self._make_ocr_job(
+            camera_id=2,
+            frame_id=101,
+            observed_at=10.1,
+            fallback_reason="zero-detection",
+            track_id=18,
+        )
+        fallback_outcome = PlateRecognitionProcessor(
+            EmptyOcrProvider(),
+            self.plate_service,
+            self.config,
+        ).process_ocr_job(fallback_job, queue_depth=0)
+        worker._record_ocr_job_processed(
+            detector_job,
+            detector_outcome,
+            20.0,
+            5.0,
+            30.0,
+        )
+        worker._record_ocr_job_processed(
+            fallback_job,
+            fallback_outcome,
+            40.0,
+            10.0,
+            60.0,
+        )
+
+        metrics = {
+            item.job_type: item for item in worker.runtime_health().ocr_job_metrics
+        }
+        crop = metrics[OcrJobType.DETECTOR_CROP]
+        fallback = metrics[OcrJobType.ZERO_DETECTION_FALLBACK]
+        self.assertEqual(crop.jobs_processed, 1)
+        self.assertEqual(crop.inference_calls, 1)
+        self.assertEqual(crop.valid_candidates, 1)
+        self.assertIsNotNone(crop.inference_mean_ms)
+        self.assertIsNotNone(crop.inference_p95_ms)
+        self.assertEqual(fallback.jobs_processed, 1)
+        self.assertEqual(fallback.inference_calls, 2)
+        self.assertEqual(fallback.valid_candidates, 0)
+        candidate_line = next(
+            line for line in captured.output if "OCR VALID CANDIDATE" in line
+        )
+        self.assertIn("camera_id=2", candidate_line)
+        self.assertIn("direction=EXIT", candidate_line)
+        self.assertIn("track_id=17", candidate_line)
+        self.assertIn("frame_id=100", candidate_line)
+        self.assertIn("source=live", candidate_line)
+        self.assertIn("observed_at=10.000", candidate_line)
+        self.assertIn("captured_at=2026-08-13T09:00:00+00:00", candidate_line)
+        self.assertIn("plate=34ABC123", candidate_line)
+        self.assertIn("confidence=0.950", candidate_line)
+        self.assertIn("job_type=DETECTOR_CROP", candidate_line)
+
     def test_empty_live_misses_only_schedule_periodic_expensive_recovery(self) -> None:
         class PolicyAwareDetector:
             def __init__(self) -> None:
@@ -2993,6 +3125,332 @@ class RecognitionPipelineTests(unittest.TestCase):
 
         self.assertEqual((first[0], second[0], third[0]), ("live", "live", "replay"))
         self.assertEqual({first[1], second[1]}, {10, 20})
+
+    def test_interval_blocked_exit_live_frame_waits_ahead_of_replay_and_confirms(self) -> None:
+        test_config = replace(self.config, recognition_interval_ms=200)
+
+        def build_worker() -> PlateRecognitionWorker:
+            worker = PlateRecognitionWorker(
+                self.plate_service,
+                test_config,
+                provider_factory=FakeOcrProvider,
+            )
+            worker._replay_buffer.add(
+                MotionEvent(
+                    event_id=77,
+                    camera_id=1,
+                    direction=Direction.ENTRY,
+                    started_at=9.0,
+                    ended_at=9.1,
+                    enqueued_at=10.0,
+                    frames=(self._make_snapshot(900, 9.0),),
+                )
+            )
+            return worker
+
+        def submit(
+            worker: PlateRecognitionWorker,
+            *,
+            now: float,
+            value: int,
+        ) -> None:
+            with patch("app.plate_recognition.time.monotonic", return_value=now):
+                worker.submit_frame(
+                    2,
+                    Direction.EXIT,
+                    np.full((200, 400, 3), value, dtype=np.uint8),
+                )
+
+        legacy = build_worker()
+        submit(legacy, now=10.0, value=101)
+        with patch("app.plate_recognition.time.monotonic", return_value=10.0):
+            legacy_first = legacy._take_detector_frame(replay_enabled=True)
+        submit(legacy, now=10.1, value=102)
+        with patch("app.plate_recognition.time.monotonic", return_value=10.1):
+            self.assertIsNone(legacy._take_due_frame())
+            legacy_replay = legacy._take_replay_frame()
+        submit(legacy, now=10.2, value=103)
+        submit(legacy, now=10.3, value=0)
+        with patch("app.plate_recognition.time.monotonic", return_value=10.6):
+            legacy_after_replay = legacy._take_detector_frame(replay_enabled=True)
+
+        self.assertEqual(legacy_first[0], "live")
+        self.assertEqual(legacy_replay[0], "replay")
+        self.assertEqual(int(round(float(legacy_after_replay[2].frame.mean()))), 0)
+        legacy_processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [[OcrSegment("34ABC123", 0.95, (0, 0, 10, 10), 0)]]
+            ),
+            self.plate_service,
+            test_config,
+        )
+        legacy_outcome = legacy_processor.process_ocr_job(
+            self._make_ocr_job(
+                camera_id=2,
+                frame_id=legacy_first[2].frame_id,
+                observed_at=legacy_first[2].observed_at,
+                frame_value=101,
+                track_id=17,
+            ),
+            queue_depth=0,
+        )
+        self.assertIs(legacy_outcome.state, RecognitionState.AWAITING_CONFIRMATION)
+        self.assertEqual(legacy_outcome.confirmation_count, 1)
+        legacy_terminal = legacy_processor.finalize_track(2, 17)
+        self.assertIs(legacy_terminal.state, RecognitionState.AMBIGUOUS_DISCARDED)
+        self.assertEqual(self._record_count(), 0)
+
+        worker = build_worker()
+        submit(worker, now=10.0, value=101)
+        with patch("app.plate_recognition.time.monotonic", return_value=10.0):
+            first = worker._take_detector_frame(replay_enabled=True)
+        submit(worker, now=10.1, value=102)
+        with patch("app.plate_recognition.time.monotonic", return_value=10.1):
+            blocked_by_live = worker._take_detector_frame(replay_enabled=True)
+        self.assertIsNone(blocked_by_live)
+        submit(worker, now=10.2, value=103)
+        with patch("app.plate_recognition.time.monotonic", return_value=10.25):
+            second = worker._take_detector_frame(replay_enabled=True)
+            replay = worker._take_detector_frame(replay_enabled=True)
+
+        self.assertEqual((first[0], second[0], replay[0]), ("live", "live", "replay"))
+        self.assertEqual(
+            [int(round(float(item[2].frame.mean()))) for item in (first, second)],
+            [101, 103],
+        )
+        processor = PlateRecognitionProcessor(
+            SequencedOcrProvider(
+                [
+                    [OcrSegment("34ABC123", 0.95, (0, 0, 10, 10), 0)],
+                    [OcrSegment("34ABC123", 0.96, (0, 0, 10, 10), 0)],
+                ]
+            ),
+            self.plate_service,
+            test_config,
+        )
+        outcomes = [
+            processor.process_ocr_job(
+                self._make_ocr_job(
+                    camera_id=2,
+                    frame_id=item[2].frame_id,
+                    observed_at=item[2].observed_at,
+                    frame_value=value,
+                    track_id=27,
+                ),
+                queue_depth=0,
+            )
+            for item, value in ((first, 101), (second, 103))
+        ]
+        self.assertEqual(outcomes[0].confirmation_count, 1)
+        self.assertEqual(outcomes[1].confirmation_count, 2)
+        processor.finalize_track(2, 27)
+        self.assertEqual(self._record_count(), 1)
+
+    def test_two_camera_fake_delay_benchmark_keeps_live_crossing_ahead_of_replay(self) -> None:
+        test_config = replace(
+            self.config,
+            recognition_interval_ms=200,
+            max_pending_replay_events_per_camera=2,
+            max_replay_frames_per_event=3,
+        )
+        live_detector_delay = 0.05
+        replay_detector_delay = 0.60
+        ocr_delay = 1.20
+        simulation_step = 0.05
+        producer_interval_steps = 2
+        producer_end = 3.0
+        crossing_start = 0.5
+        crossing_end = 2.5
+
+        def run(*, legacy_replay_policy: bool) -> dict[str, object]:
+            worker = PlateRecognitionWorker(
+                self.plate_service,
+                test_config,
+                provider_factory=FakeOcrProvider,
+            )
+            for camera_id, direction in (
+                (1, Direction.ENTRY),
+                (2, Direction.EXIT),
+            ):
+                for event_index in range(2):
+                    worker._replay_buffer.add(
+                        MotionEvent(
+                            event_id=camera_id * 10 + event_index,
+                            camera_id=camera_id,
+                            direction=direction,
+                            started_at=0.0,
+                            ended_at=0.1,
+                            enqueued_at=0.0,
+                            frames=tuple(
+                                self._make_snapshot(
+                                    900 + camera_id * 10 + frame_index,
+                                    frame_index * 0.01,
+                                    camera_id=camera_id,
+                                )
+                                for frame_index in range(3)
+                            ),
+                        )
+                    )
+
+            detector_free_at = 0.0
+            ocr_free_at = 0.0
+            pending_detector_crops: list[tuple[float, _PendingFrame]] = []
+            ocr_buffer = OcrJobBuffer(
+                max_per_camera=5,
+                max_age_ms=2_500,
+                detector_crop_max_age_ms=12_000,
+            )
+            candidate_times: list[float] = []
+            queue_waits: list[float] = []
+            temporal_opportunities = 0
+            live_frame_ages: list[float] = []
+
+            for step in range(round(8.0 / simulation_step) + 1):
+                now = round(step * simulation_step, 10)
+                if step % producer_interval_steps == 0 and now <= producer_end:
+                    exit_visible = crossing_start <= now <= crossing_end
+                    with patch(
+                        "app.plate_recognition.time.monotonic",
+                        return_value=now,
+                    ):
+                        worker.submit_frame(
+                            1,
+                            Direction.ENTRY,
+                            np.zeros((20, 40, 3), dtype=np.uint8),
+                        )
+                        worker.submit_frame(
+                            2,
+                            Direction.EXIT,
+                            np.full(
+                                (20, 40, 3),
+                                101 if exit_visible else 0,
+                                dtype=np.uint8,
+                            ),
+                        )
+
+                ready = [item for item in pending_detector_crops if item[0] <= now]
+                pending_detector_crops = [
+                    item for item in pending_detector_crops if item[0] > now
+                ]
+                for queued_at, item in ready:
+                    ocr_buffer.add(
+                        self._make_ocr_job(
+                            camera_id=2,
+                            frame_id=item.frame_id,
+                            observed_at=item.observed_at,
+                            queued_at=queued_at,
+                            frame_value=101,
+                            track_id=17,
+                        )
+                    )
+
+                if now >= ocr_free_at:
+                    with patch(
+                        "app.plate_recognition.time.monotonic",
+                        return_value=now,
+                    ):
+                        job = ocr_buffer.take(wait=False)
+                    if job is not None:
+                        queue_waits.append(max(0.0, now - job.queued_at))
+                        ocr_free_at = now + ocr_delay
+                        candidate_times.append(ocr_free_at)
+
+                if now < detector_free_at:
+                    continue
+                with patch(
+                    "app.plate_recognition.time.monotonic",
+                    return_value=now,
+                ):
+                    if legacy_replay_policy:
+                        live = worker._take_due_frame()
+                        if live is not None:
+                            pending = ("live", live[0], live[1])
+                        else:
+                            pending = worker._take_replay_frame()
+                    else:
+                        pending = worker._take_detector_frame(replay_enabled=True)
+                if pending is None:
+                    continue
+                source, camera_id, item = pending
+                detector_delay = (
+                    live_detector_delay if source == "live" else replay_detector_delay
+                )
+                detector_free_at = now + detector_delay
+                frame_age_ms = max(0.0, now - item.observed_at) * 1000.0
+                is_exit_plate = (
+                    source == "live"
+                    and camera_id == 2
+                    and int(round(float(item.frame.mean()))) == 101
+                )
+                worker._record_detector_result(
+                    camera_id,
+                    item.direction,
+                    is_exit_plate,
+                    detector_delay * 1000.0,
+                    frame_age_ms,
+                    None,
+                    source,
+                )
+                if source == "live":
+                    live_frame_ages.append(frame_age_ms)
+                if is_exit_plate:
+                    temporal_opportunities += 1
+                    pending_detector_crops.append((detector_free_at, item))
+
+            health = worker.runtime_health()
+            live_by_direction = {
+                item.direction: item.live_detector_frames_processed
+                for item in health.direction_metrics
+            }
+            ordered_live_ages = sorted(live_frame_ages)
+            live_age_p95_ms = (
+                ordered_live_ages[
+                    max(0, (95 * len(ordered_live_ages) + 99) // 100 - 1)
+                ]
+                if ordered_live_ages
+                else 0.0
+            )
+            return {
+                "ingested": health.frames_ingested,
+                "live_processed": health.live_detector_frames_processed,
+                "live_by_direction": live_by_direction,
+                "replay_processed": health.replay_detector_frames_processed,
+                "superseded": sum(
+                    item.live_frames_superseded_before_detector
+                    for item in health.direction_metrics
+                ),
+                "live_age_mean_ms": (
+                    sum(live_frame_ages) / len(live_frame_ages)
+                    if live_frame_ages
+                    else 0.0
+                ),
+                "live_age_p95_ms": live_age_p95_ms,
+                "live_age_max_ms": max(live_frame_ages, default=0.0),
+                "temporal_opportunities": temporal_opportunities,
+                "candidate_times": tuple(candidate_times),
+                "queue_waits": tuple(queue_waits),
+            }
+
+        before = run(legacy_replay_policy=True)
+        after = run(legacy_replay_policy=False)
+
+        self.assertEqual(before["ingested"], after["ingested"])
+        self.assertGreater(after["live_processed"], before["live_processed"])
+        self.assertLess(after["replay_processed"], before["replay_processed"])
+        self.assertLess(after["superseded"], before["superseded"])
+        self.assertLess(after["live_age_mean_ms"], before["live_age_mean_ms"])
+        self.assertLess(after["live_age_p95_ms"], before["live_age_p95_ms"])
+        self.assertLessEqual(after["live_age_max_ms"], before["live_age_max_ms"])
+        self.assertGreater(after["live_by_direction"][Direction.ENTRY], 0)
+        self.assertGreater(after["live_by_direction"][Direction.EXIT], 0)
+        self.assertGreater(
+            after["temporal_opportunities"],
+            before["temporal_opportunities"],
+        )
+        self.assertGreaterEqual(len(after["candidate_times"]), 2)
+        self.assertLessEqual(after["candidate_times"][1], crossing_end + ocr_delay * 2)
+        self.assertTrue(after["queue_waits"])
+        self.assertLess(max(after["queue_waits"]), max(before["queue_waits"]))
 
     def test_pending_exit_live_frame_blocks_entry_expensive_recovery(self) -> None:
         class GuardRecordingDetector:
@@ -6443,7 +6901,15 @@ class RecognitionPipelineTests(unittest.TestCase):
             (detection,),
             10.0,
             direction=Direction.ENTRY.value,
+            detector_frame_id=100,
         ).assignments[0].track_id
+        tracker.update(
+            1,
+            (detection,),
+            10.2,
+            direction=Direction.ENTRY.value,
+            detector_frame_id=101,
+        )
         processor = PlateRecognitionProcessor(
             SequencedOcrProvider(
                 [[OcrSegment("23AFP779", 0.95, (0, 0, 10, 10), 0)]]
@@ -6477,12 +6943,15 @@ class RecognitionPipelineTests(unittest.TestCase):
         )
         self.assertIs(finalized.state, RecognitionState.AMBIGUOUS_DISCARDED)
         self.assertIn("direction=ENTRY", terminal_line)
-        self.assertIn("detector_updates=1", terminal_line)
+        self.assertIn("detector_updates=2", terminal_line)
+        self.assertIn("distinct_detector_frames=2", terminal_line)
+        self.assertIn("detector_frame_ids=100,101", terminal_line)
         self.assertIn("ocr_scheduled=1", terminal_line)
         self.assertIn("ocr_completed=1", terminal_line)
         self.assertIn("ocr_dropped=0", terminal_line)
         self.assertIn("valid_ocr_results=1", terminal_line)
         self.assertIn("distinct_valid_ocr_frames=1", terminal_line)
+        self.assertIn("valid_ocr_frame_ids=100", terminal_line)
         self.assertIn("best_text=23AFP779", terminal_line)
         self.assertIn("confirmation=1/2", terminal_line)
         self.assertIn("final_state=AMBIGUOUS_DISCARDED", terminal_line)
